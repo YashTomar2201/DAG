@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "paths": {
+      "@dag/graph-core": ["../../packages/graph-core/src/index.ts"],
+      "@dag/contracts": ["../../packages/contracts/src/index.ts"],
+      "@dag/db": ["../../packages/db/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

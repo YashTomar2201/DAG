@@ -1,0 +1,15 @@
+// Prisma schema — full implementation in Phase 3.
+// This stub allows `prisma generate` to run without error during Phase 0.
+
+generator client {
+  provider      = "prisma-client-js"
+  output        = "../src/generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Full schema (Tenant, Workflow, WorkflowVersion, Run, NodeRun, RunEvent)
+// implemented in Phase 3 per PROJECT_GUIDE.md §6

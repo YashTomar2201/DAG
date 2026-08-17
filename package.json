@@ -1,0 +1,23 @@
+{
+  "name": "dag-engine",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
+    "dev": "pnpm -r --parallel dev",
+    "check:infra": "tsx scripts/check-infra.ts"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "eslint": "^8.57.0",
+    "ioredis": "^5.4.1",
+    "pg": "^8.12.0",
+    "@types/pg": "^8.11.6",
+    "prettier": "^3.3.2",
+    "tsx": "^4.16.0",
+    "typescript": "^5.4.5"
+  }
+}

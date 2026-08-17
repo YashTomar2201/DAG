@@ -1,0 +1,52 @@
+version: '3.9'
+
+# ─── Distributed DAG Engine — Local Infrastructure ────────────────────────────
+#
+# Starts:
+#   postgres  — primary datastore (workflows, runs, audit log)
+#   redis     — message broker + in-degree counters + pub/sub
+#
+# Workers and API are added in later phases.
+# Run:  docker compose -f infra/docker-compose.yml up -d
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dag
+      POSTGRES_PASSWORD: dag_secret
+      POSTGRES_DB: dag_engine
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dag -d dag_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly yes: persists the AOF log so queued jobs survive a container
+    # restart. Without this, a redis restart would silently drop all pending jobs.
+    command: redis-server --appendonly yes --save 60 1
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  # Named volumes so data persists across container restarts
+  postgres_data:
+  redis_data:
