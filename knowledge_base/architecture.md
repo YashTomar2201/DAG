@@ -75,12 +75,38 @@ Default RDB snapshots lose all writes between snapshot intervals. For a job queu
 
 ---
 
+## Wire Contracts (`packages/contracts`) — Phase 1
+
+All wire formats are Zod schemas; types are inferred with `z.infer<>`. Nothing is hand-typed.
+
+| Schema | What it describes |
+|--------|-------------------|
+| `NodeDefSchema` | Discriminated union on `type` — each node type has its own typed `config` |
+| `EdgeDefSchema` | A directed edge between two node keys (`from`, `to`) |
+| `GraphSchema` | `{ nodes, edges }` with 4 structural refinements via `.superRefine()` |
+| `NodeStatusSchema` | 7-value enum: PENDING→QUEUED→RUNNING→SUCCEEDED/FAILED/SKIPPED/CANCELLED |
+| `RunStatusSchema` | 5-value enum for the overall run |
+| `JobPayloadSchema` | BullMQ queue message: runId, nodeKey, nodeRunId, type, config, input, attempt |
+| `RunEventSchema` | SSE + pub/sub envelope: runId, nodeKey?, type, payload, ts |
+| `ErrorTaxonomySchema` | retryable vs. unrecoverable error classification |
+
+**Structural Rules Enforced in `GraphSchema`:**
+- ✅ Node keys unique within the graph
+- ✅ Every edge endpoint refers to an existing node (no dangling edges)
+- ✅ No self-loops (from ≠ to)
+- ✅ No duplicate edges
+- ✅ Node count ≤ 200
+- ❌ Cycle detection — deferred to Phase 2 (`detectCycle`); requires graph traversal, not schema validation
+
+---
+
+
 ## Phase Status
 
 | Phase | Status | Summary |
-|-------|--------|---------|
+|-------|--------|--------|
 | 0 — Monorepo scaffold | ✅ Complete | pnpm workspace, tsconfig, ESLint, Docker, Zod env |
-| 1 — Wire contracts | ⏳ Pending | Zod schemas for all wire formats |
+| 1 — Wire contracts | ✅ Complete | Zod schemas for all wire formats, 18 tests passing |
 | 2 — Graph algorithms | ⏳ Pending | Iterative DFS, Kahn's algorithm |
 | 3 — Persistence layer | ⏳ Pending | Prisma schema, repositories |
 | 4 — Control plane API | ⏳ Pending | Express routes, validation |

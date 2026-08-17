@@ -49,3 +49,32 @@
 ### Decision: Docker Compose for local infrastructure
 
 **Why:** Pins exact versions (`postgres:16`, `redis:7-alpine`), eliminates local-install version skew, provides health checks for `depends_on` readiness, and is reproducible on any machine.
+
+---
+
+## Phase 1 — Wire Contracts (`packages/contracts`)
+
+### Decision: Zod as the Single Source of Truth — Types via `z.infer<>`
+
+**Why:** Defining a TypeScript interface AND a separate validator (e.g., a class-validator decorator or a hand-written guard) creates two places that can drift. If you add a field to the interface and forget the validator, invalid data silently passes at runtime. Zod schemas ARE the type — `z.infer<typeof NodeDefSchema>` produces the TypeScript type directly. One change in one place. No drift.
+
+**Trade-off:** Zod's TypeScript error messages for complex schemas (especially discriminated unions) can be verbose. Acceptable cost given the correctness guarantee.
+
+---
+
+### Decision: Discriminated Union on `NodeDef.type` for per-type Config
+
+**Why:** A naive approach would be `config: z.record(z.unknown())` — completely untyped. With a discriminated union, TypeScript narrows the type when you switch on `node.type`. In the worker's executor registry, this means adding a new node type without a corresponding executor causes a TypeScript compile error (not a runtime surprise). The discriminant field `type` is a string literal in each union branch, which Zod's `z.discriminatedUnion()` uses for O(1) lookup (not linear scan through all branches).
+
+---
+
+### Decision: Cycle Detection Deferred to Phase 2 (Not in Zod)
+
+**Why:** Zod's `.superRefine()` callback runs once per object and has access to the object's fields. Cycle detection requires a depth-first traversal of the entire graph — DFS with a stack, visiting nodes by following edges. Zod has no mechanism for this kind of stateful, multi-pass traversal. It also runs synchronously per field, not across the graph as a whole. Cycle detection belongs in `graph-core` as a pure function: `detectCycle(graph): { hasCycle: boolean; path? }`.
+
+---
+
+### Decision: Structural Graph Rules in `GraphSchema.superRefine()`
+
+**Why:** Rules like "no duplicate node keys" and "no dangling edges" ARE structural and can be checked in a single pass over the parsed data — they require no traversal. Putting them in Zod means they are checked on every `GraphSchema.parse()` call, including the browser's live validation as the user draws edges. The error messages include the exact path (`['edges', 2, 'to']`), enabling the UI to highlight the offending edge precisely.
+
