@@ -100,6 +100,20 @@ All wire formats are Zod schemas; types are inferred with `z.infer<>`. Nothing i
 
 ---
 
+## Graph Algorithms (`packages/graph-core`) — Phase 2
+
+This package has **zero runtime dependencies** and exports pure functions for graph traversal. It operates purely on the `Graph` contract.
+
+| Algorithm | Function | Purpose |
+|-----------|----------|---------|
+| **Adjacency Builder** | `buildAdjacencyMap(graph)` | Single-pass helper that returns `adj: Map<node, children[]>` and `inDegree: Map<node, count>`. |
+| **Cycle Detection** | `detectCycle(graph)` | Iterative 3-state (WHITE/GRAY/BLACK) DFS. Returns `{ hasCycle: boolean, path?: string[] }`. |
+| **Topological Sort** | `topologicalSort(graph)` | Kahn's algorithm. Returns `{ order, tiers }`. Evaluates nodes with 0 in-degree, grouping them into concurrent tiers. |
+
+**Key Properties:**
+- `detectCycle` uses an explicit stack (`[nodeKey, childIndex][]`) to prevent call stack overflows on extremely deep linear graphs.
+- `topologicalSort` groups nodes into `tiers` — arrays of nodes that have no interdependencies and can be safely dispatched to BullMQ simultaneously.
+
 
 ## Phase Status
 
@@ -107,7 +121,7 @@ All wire formats are Zod schemas; types are inferred with `z.infer<>`. Nothing i
 |-------|--------|--------|
 | 0 — Monorepo scaffold | ✅ Complete | pnpm workspace, tsconfig, ESLint, Docker, Zod env |
 | 1 — Wire contracts | ✅ Complete | Zod schemas for all wire formats, 18 tests passing |
-| 2 — Graph algorithms | ⏳ Pending | Iterative DFS, Kahn's algorithm |
+| 2 — Graph algorithms | ✅ Complete | Iterative DFS cycle detection, Kahn's topological sort, 0 runtime deps |
 | 3 — Persistence layer | ⏳ Pending | Prisma schema, repositories |
 | 4 — Control plane API | ⏳ Pending | Express routes, validation |
 | 5 — Redis + BullMQ | ⏳ Pending | Queues, Lua atomicity |

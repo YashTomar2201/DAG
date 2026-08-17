@@ -34,3 +34,17 @@ This document contains challenging interview questions based on the new code add
 ### Q8: What is the `ErrorTaxonomySchema` and why does classifying errors as retryable vs. unrecoverable matter for correctness?
 **Answer:** The error taxonomy distinguishes between transient failures (network timeout, HTTP 429, filesystem lock) that are worth retrying versus permanent failures (invalid credentials, Python `SyntaxError`, schema validation error) that will never succeed no matter how many times you retry. If you misclassify a permanent error as retryable, BullMQ will retry it the full 3 times with exponential backoff — wasting 2+ minutes before the run finally fails, potentially hammering an external API (like Kaggle) with repeated bad requests. With `UnrecoverableError`, BullMQ skips all remaining retries immediately and moves the job directly to the failed set, giving the user faster feedback and protecting external services.
 
+---
+
+## Phase 2: Graph Algorithms
+
+### Q9: Why did you implement cycle detection using a 3-color DFS instead of just using Kahn's algorithm, which can also detect cycles?
+**Answer:** Kahn's algorithm detects *if* a cycle exists (because the final sorted array will be shorter than the total number of nodes), but it cannot easily tell you the *exact path* of the cycle. From a UX perspective, simply saying "Cycle detected" is unhelpful. The user needs to know exactly which nodes caused the loop (e.g., "Extract → Preprocess → Extract"). By using a 3-color Depth-First Search, the moment we encounter a GRAY node (a node currently on the recursion stack), we can trace the parent pointers back up the stack to construct the exact sequence of nodes that form the cycle, allowing the UI to highlight the exact edges.
+
+### Q10: Your DFS implementation is iterative rather than recursive. Why did you make this choice, and what specific error does it prevent?
+**Answer:** A recursive DFS uses the JavaScript engine's call stack to maintain state. In V8 (Node.js/Chrome), the maximum call stack size is roughly 10,000 frames. If a user builds a linear pipeline of 15,000 nodes, a recursive implementation will throw a `RangeError: Maximum call stack size exceeded`, crashing the entire Node process or the browser tab. By writing it iteratively, I use a JavaScript array (`[]`) to simulate the stack. This moves the memory allocation from the constrained call stack to the heap, which is only limited by available system RAM, making the algorithm immune to call stack overflow attacks or edge cases.
+
+### Q11: Explain how Kahn's algorithm naturally maps to distributed task concurrency in your worker architecture.
+**Answer:** Kahn's algorithm works by calculating the in-degree (number of prerequisites) for every node. It starts by finding all nodes with an in-degree of 0. Because these nodes have no pending dependencies, they can all be executed at the exact same time. My implementation groups these 0-in-degree nodes into a `tier` array. Once a tier is complete, we simulate the nodes finishing by decrementing the in-degree of their children. Any children that hit 0 become the next tier. This maps perfectly to our BullMQ worker pool: the orchestrator can take an entire tier, dispatch all of its nodes to the queue simultaneously, and let the independent worker processes chew through them in parallel.
+
+

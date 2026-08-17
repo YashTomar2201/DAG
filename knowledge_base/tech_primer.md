@@ -44,3 +44,24 @@ Most Zod validations check individual fields (e.g., "is this a valid URL?"). But
 
 These checks need to see all nodes AND all edges at the same time. `.superRefine()` gives us that power — it runs a custom function on the entire parsed object, letting us add any errors we find to Zod's issue list with precise path information (e.g., "the problem is at `edges[2].to`").
 
+---
+
+## Phase 2 Technologies
+
+### 8. What is Kahn's Algorithm?
+Imagine you are cooking dinner: you can't chop the onions until you peel them, and you can't cook them until they are chopped. Kahn's Algorithm sorts these tasks so you always do the prerequisites first.
+It works by finding tasks that have **zero prerequisites** (in-degree of 0). It puts those tasks in the "do this now" bucket, then effectively removes them from the list, checking if any other tasks now have zero prerequisites.
+We use it to group our graph into "tiers". If two nodes are in the same tier, it means neither depends on the other, so we can run them at the exact same time (concurrently).
+
+### 9. What is a 3-Color DFS?
+DFS (Depth-First Search) is a way to explore a graph by going as deep as possible before backtracking. We use it to detect **cycles** (e.g., A depends on B, B depends on A).
+We color the nodes as we go:
+- **WHITE**: Unvisited.
+- **GRAY**: We are currently visiting this node or its children. It's on our "active" path.
+- **BLACK**: We have fully explored this node and all its children. It's safe.
+If we ever try to visit a node that is currently **GRAY**, we know we've looped back onto our active path — meaning we found a cycle!
+
+### 10. Iterative vs. Recursive Algorithms
+A **recursive** function is one that calls itself. It's very easy to write DFS recursively. However, every time a function calls itself, it takes up a slot on the computer's "call stack." If the graph is 10,000 nodes deep, the call stack gets too large and crashes the program.
+An **iterative** function uses a simple `while` loop and stores its state in an array (a manual stack) instead of relying on the computer's call stack. This is slightly harder to write but is infinitely safer for large data.
+

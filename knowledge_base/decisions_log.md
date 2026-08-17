@@ -78,3 +78,19 @@
 
 **Why:** Rules like "no duplicate node keys" and "no dangling edges" ARE structural and can be checked in a single pass over the parsed data — they require no traversal. Putting them in Zod means they are checked on every `GraphSchema.parse()` call, including the browser's live validation as the user draws edges. The error messages include the exact path (`['edges', 2, 'to']`), enabling the UI to highlight the offending edge precisely.
 
+---
+
+## Phase 2 — Graph Algorithms (`packages/graph-core`)
+
+### Decision: Iterative DFS over Recursive DFS for Cycle Detection
+
+**Why:** A recursive Depth-First Search (DFS) adds a new frame to the V8 JavaScript call stack for every node in the current path. If a user builds a linear pipeline of 15,000 nodes, a recursive DFS will throw `RangeError: Maximum call stack size exceeded`. By using an explicit array as a stack (`const stack = [[startNode, 0]]`), we move the memory usage from the constrained call stack to the heap, which can handle millions of items. Even though we currently cap nodes at 200, building safe, iterative algorithms is a robust library design choice.
+
+### Decision: 3-Color DFS instead of Kahn's for Cycle Detection
+
+**Why:** Kahn's algorithm *can* detect cycles (if the final sorted list length < total nodes), but it cannot easily identify the **exact path** of the cycle. To provide the user with actionable feedback ("Cycle detected: A → B → C → A"), we need the current traversal path. The 3-color DFS (WHITE=unvisited, GRAY=on-stack, BLACK=done) immediately flags a cycle when it encounters a GRAY node, and the cycle path is simply the trail of parent pointers back to the first GRAY node.
+
+### Decision: Kahn's Algorithm for Topological Sort & Concurrency Tiers
+
+**Why:** While DFS can also produce a topological sort (by recording nodes as they turn BLACK and reversing the list), Kahn's algorithm relies on in-degrees. It naturally processes nodes tier-by-tier: all nodes with in-degree 0 are processed, then their outgoing edges are removed, creating a new set of in-degree 0 nodes. This tiering exactly maps to our execution concurrency model — all nodes in a tier can be dispatched to the Redis queue simultaneously. DFS produces a flat list and makes it harder to determine parallel execution boundaries.
+

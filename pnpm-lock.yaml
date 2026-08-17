@@ -193,6 +193,9 @@ importers:
 
   packages/graph-core:
     devDependencies:
+      '@dag/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@types/node':
         specifier: ^20.14.9
         version: 20.19.43
