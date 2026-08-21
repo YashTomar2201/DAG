@@ -4,6 +4,9 @@ packages:
 allowBuilds:
   '@prisma/client': true
   '@prisma/engines': true
+  cpu-features: true
   esbuild: true
   msgpackr-extract: true
   prisma: true
+  protobufjs: true
+  ssh2: true

@@ -1,0 +1,214 @@
+/**
+ * Phase 4 — Control Plane API acceptance tests
+ *
+ * Acceptance check (from build-dag-engine.md):
+ *   1. POST a cyclic graph → 422 whose body contains the offending cycle path.
+ *   2. POST the 5-node ML pipeline → 201 with a persisted topoOrder of
+ *      [extract, preprocess, train, evaluate, deploy].
+ *
+ * These tests mock the DB layer so they run without a real Postgres instance.
+ * Integration tests against a real DB are in Phase 12 (Testcontainers).
+ */
+
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import request from 'supertest';
+import { createApp } from './app';
+
+// ─── Mock @dag/db ─────────────────────────────────────────────────────────────
+// We test the control-plane logic (validation, cycle detection, topo sort) in
+// isolation. DB persistence is verified in Phase 12's integration tests.
+
+vi.mock('@dag/db', () => ({
+  prisma: {
+    workflow: {
+      findUnique: vi.fn().mockResolvedValue({ id: 'wf-1' }),
+    },
+  },
+  createWorkflow: vi.fn().mockResolvedValue({ workflowId: 'wf-1', versionId: 'v-1' }),
+  createWorkflowVersion: vi.fn().mockImplementation(async (_wfId: string, graph: unknown, topoOrder: unknown) => ({
+    id: 'v-2',
+    workflowId: 'wf-1',
+    version: 2,
+    graph,
+    topoOrder,
+    createdAt: new Date(),
+  })),
+  createRun: vi.fn(),
+  getRunEvents: vi.fn().mockResolvedValue([]),
+}));
+
+// ─── Test fixtures ────────────────────────────────────────────────────────────
+
+/** The 5-node ML pipeline from PROJECT_GUIDE.md §1 */
+const ML_PIPELINE_GRAPH = {
+  nodes: [
+    { key: 'extract',    type: 'kaggle.download',   label: 'Extract',    position: { x: 0, y: 0 }, config: { datasetSlug: 'my/dataset', outputDir: 'data/' } },
+    { key: 'preprocess', type: 'pandas.preprocess', label: 'Preprocess', position: { x: 1, y: 0 }, config: { scriptPath: 'python/preprocess.py' } },
+    { key: 'train',      type: 'torch.train',       label: 'Train',      position: { x: 2, y: 0 }, config: { scriptPath: 'python/train.py', epochs: 10 } },
+    { key: 'evaluate',   type: 'model.evaluate',    label: 'Evaluate',   position: { x: 3, y: 0 }, config: { scriptPath: 'python/evaluate.py' } },
+    { key: 'deploy',     type: 'registry.deploy',   label: 'Deploy',     position: { x: 4, y: 0 }, config: { registryUrl: 'https://docker.io', modelTag: 'my-model:latest' } },
+  ],
+  edges: [
+    { from: 'extract',    to: 'preprocess' },
+    { from: 'preprocess', to: 'train' },
+    { from: 'train',      to: 'evaluate' },
+    { from: 'evaluate',   to: 'deploy' },
+  ],
+};
+
+/** A graph with a cycle: deploy → extract */
+const CYCLIC_GRAPH = {
+  nodes: ML_PIPELINE_GRAPH.nodes,
+  edges: [
+    ...ML_PIPELINE_GRAPH.edges,
+    { from: 'deploy', to: 'extract' }, // ← introduces the cycle
+  ],
+};
+
+/** A graph with a duplicate node key */
+const DUPLICATE_KEY_GRAPH = {
+  nodes: [
+    { key: 'a', type: 'pandas.preprocess', label: 'A', position: { x: 0, y: 0 }, config: { scriptPath: 'p.py' } },
+    { key: 'a', type: 'pandas.preprocess', label: 'A-dup', position: { x: 1, y: 0 }, config: { scriptPath: 'p.py' } },
+  ],
+  edges: [],
+};
+
+/** A graph with a dangling edge */
+const DANGLING_EDGE_GRAPH = {
+  nodes: [
+    { key: 'a', type: 'pandas.preprocess', label: 'A', position: { x: 0, y: 0 }, config: { scriptPath: 'p.py' } },
+  ],
+  edges: [{ from: 'a', to: 'ghost' }],
+};
+
+/** A graph with a self-loop */
+const SELF_LOOP_GRAPH = {
+  nodes: [
+    { key: 'a', type: 'pandas.preprocess', label: 'A', position: { x: 0, y: 0 }, config: { scriptPath: 'p.py' } },
+  ],
+  edges: [{ from: 'a', to: 'a' }],
+};
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe('Phase 4 — Control Plane API', () => {
+  const app = createApp();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // ── Health check ────────────────────────────────────────────────────────────
+
+  it('GET /health → 200', async () => {
+    const res = await request(app).get('/health');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+  });
+
+  // ── POST /workflows — acceptance check 2 ───────────────────────────────────
+
+  it('POST /workflows with the 5-node ML pipeline → 201 with workflowId + versionId', async () => {
+    const res = await request(app)
+      .post('/workflows')
+      .send({ tenantId: 'tenant-1', name: 'ML Pipeline', graph: ML_PIPELINE_GRAPH });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ workflowId: 'wf-1', versionId: 'v-1' });
+  });
+
+  it('POST /workflows with missing tenantId → 400', async () => {
+    const res = await request(app)
+      .post('/workflows')
+      .send({ name: 'No Tenant', graph: ML_PIPELINE_GRAPH });
+    expect(res.status).toBe(400);
+    expect(res.body.issues).toBeDefined();
+  });
+
+  // ── POST /workflows/:id/versions — acceptance check 1 & 2 ─────────────────
+
+  it('POST /workflows/:id/versions with a cyclic graph → 422 with cyclePath', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/versions')
+      .send({ graph: CYCLIC_GRAPH });
+
+    expect(res.status).toBe(422);
+    expect(res.body.cyclePath).toBeDefined();
+    expect(Array.isArray(res.body.cyclePath)).toBe(true);
+    // The cycle path must start and end at the same node
+    const path: string[] = res.body.cyclePath;
+    expect(path[0]).toBe(path[path.length - 1]);
+  });
+
+  it('POST /workflows/:id/versions with a valid graph → 201 with correct topoOrder', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/versions')
+      .send({ graph: ML_PIPELINE_GRAPH });
+
+    expect(res.status).toBe(201);
+    // The mock returns the topoOrder passed to createWorkflowVersion
+    const topoOrder = res.body.topoOrder as { order: string[]; tiers: string[][] };
+    expect(topoOrder.order).toEqual(['extract', 'preprocess', 'train', 'evaluate', 'deploy']);
+    expect(topoOrder.tiers).toEqual([
+      ['extract'],
+      ['preprocess'],
+      ['train'],
+      ['evaluate'],
+      ['deploy'],
+    ]);
+  });
+
+  // ── POST /workflows/:id/validate ───────────────────────────────────────────
+
+  it('POST /workflows/:id/validate with valid graph → 200 { valid: true }', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/validate')
+      .send({ graph: ML_PIPELINE_GRAPH });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(true);
+    expect(res.body.topoOrder).toBeDefined();
+  });
+
+  it('POST /workflows/:id/validate with cyclic graph → 200 { valid: false, cyclePath }', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/validate')
+      .send({ graph: CYCLIC_GRAPH });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(res.body.cyclePath).toBeDefined();
+  });
+
+  it('POST /workflows/:id/validate with duplicate node key → 200 { valid: false, zodIssues }', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/validate')
+      .send({ graph: DUPLICATE_KEY_GRAPH });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(res.body.zodIssues).toBeDefined();
+    expect(res.body.zodIssues[0].message).toContain('Duplicate node key');
+  });
+
+  it('POST /workflows/:id/validate with dangling edge → 200 { valid: false, zodIssues }', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/validate')
+      .send({ graph: DANGLING_EDGE_GRAPH });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(res.body.zodIssues?.some((i: { message: string }) => i.message.includes('ghost'))).toBe(true);
+  });
+
+  it('POST /workflows/:id/validate with self-loop → 200 { valid: false, zodIssues }', async () => {
+    const res = await request(app)
+      .post('/workflows/wf-1/validate')
+      .send({ graph: SELF_LOOP_GRAPH });
+
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(false);
+    expect(res.body.zodIssues?.some((i: { message: string }) => i.message.includes('Self-loop'))).toBe(true);
+  });
+});

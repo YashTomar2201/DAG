@@ -1,4 +1,4 @@
-import type { Graph, EdgeDef } from '@dag/contracts';
+import type { Graph } from '@dag/contracts';
 
 export interface AdjacencyStructures {
   /** Map from a nodeKey to an array of its children's nodeKeys (out-edges) */

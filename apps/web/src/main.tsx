@@ -1,10 +1,10 @@
-/**
- * React entry point — placeholder for Phase 0.
- * Visual graph editor (React Flow + Zustand) is implemented in Phase 11.
- */
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import { App } from './App';
+import './index.css';
 
-// Phase 11 will replace this with the full DAG editor
-const root = document.getElementById('root');
-if (root) {
-  root.textContent = 'DAG Engine — React Flow editor coming in Phase 11';
-}
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);

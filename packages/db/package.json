@@ -16,7 +16,9 @@
     "db:push": "prisma db push --schema=./prisma/schema.prisma"
   },
   "dependencies": {
-    "@prisma/client": "^5.16.1"
+    "@prisma/client": "^5.16.1",
+    "@dag/contracts": "workspace:*",
+    "@dag/graph-core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^20.14.9",

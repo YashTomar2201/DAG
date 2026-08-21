@@ -1,5 +1,17 @@
 # Python Executor Scripts
 
+> **Note (Phase 12):** despite this directory's presence in PROJECT_GUIDE.md §3's
+> repository layout diagram, the scripts the worker actually spawns live at
+> **`apps/worker/python/`**, not here. `python-bridge.ts` resolves the script
+> directory as `path.resolve(process.cwd(), 'python')`, and `process.cwd()` is
+> `apps/worker` whenever the worker runs — via `pnpm --filter @dag/worker dev`,
+> `pnpm --filter @dag/worker exec tsx src/index.ts` (what the Phase 12
+> integration tests spawn), and the `apps/worker` Docker image's `WORKDIR` in
+> Phase 13. This directory is kept only as a pointer; see
+> `knowledge_base/decisions_log.md` ("Phase 12 — python/ vs
+> apps/worker/python/ location drift") for the full write-up. Do not add
+> scripts here — add them to `apps/worker/python/`.
+
 Scripts spawned by `apps/worker` via `child_process.spawn` for the reference ML pipeline.
 
 | Script | Node type | Invoked by |

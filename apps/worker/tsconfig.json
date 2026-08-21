@@ -2,10 +2,10 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src",
     "paths": {
       "@dag/contracts": ["../../packages/contracts/src/index.ts"],
-      "@dag/db": ["../../packages/db/src/index.ts"]
+      "@dag/db": ["../../packages/db/src/index.ts"],
+      "@dag/queue": ["../../packages/queue/src/index.ts"]
     }
   },
   "include": ["src"]

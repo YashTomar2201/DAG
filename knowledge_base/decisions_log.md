@@ -94,3 +94,367 @@
 
 **Why:** While DFS can also produce a topological sort (by recording nodes as they turn BLACK and reversing the list), Kahn's algorithm relies on in-degrees. It naturally processes nodes tier-by-tier: all nodes with in-degree 0 are processed, then their outgoing edges are removed, creating a new set of in-degree 0 nodes. This tiering exactly maps to our execution concurrency model — all nodes in a tier can be dispatched to the Redis queue simultaneously. DFS produces a flat list and makes it harder to determine parallel execution boundaries.
 
+---
+
+## Phase 3 — Persistence Layer (`packages/db`)
+
+### Decision: WorkflowVersion is Immutable
+
+**Why:** A `WorkflowVersion` is a point-in-time snapshot of the graph. When a `Run` is created it pins `workflowVersionId`. If users could mutate the graph in place, a run that is 3 nodes deep could suddenly have different edges — the scheduler would try to dispatch a node that no longer exists in the graph, or skip a node that was added. Immutability guarantees that the graph the scheduler reads at dispatch time is byte-for-byte identical to the graph the user saw when they clicked "Run". Adding/editing nodes creates version N+1; the old run is unaffected.
+
+**Trade-off:** Storage grows with every save. Acceptable — workflow graphs are small JSON objects.
+
+---
+
+### Decision: `@@unique([runId, nodeKey])` at the DB Level
+
+**Why:** Redis's Lua script is the primary dispatch guard (atomic decrement + SADD). But Redis is an external process — it can restart, the Lua script could have a bug, or a network partition could cause two API instances to race. The DB constraint is the last line of defence. Postgres will reject the second `INSERT` with a unique violation, preventing a second `NodeRun` row from ever existing for the same `(runId, nodeKey)` pair, making double-execution structurally impossible at the storage layer regardless of what the broker does.
+
+**Trade-off:** A unique constraint adds a small overhead to every `NodeRun` insert. With 200 nodes per run this is negligible.
+
+---
+
+### Decision: Conditional UPDATE (`WHERE status = from`) — Never Read-Then-Write
+
+**Why:** A read-then-write (read status → check it's RUNNING → write SUCCEEDED) has a window between the read and the write where another actor can also read `RUNNING`. Both see `RUNNING`, both write `SUCCEEDED`, both then trigger downstream effects (dispatching children, closing the run). This is the classic lost-update race condition. The fix: collapse read + write into a single atomic SQL statement. `UPDATE NodeRun SET status='SUCCEEDED' WHERE id=$id AND status='RUNNING'` — Postgres takes a row-level lock for the duration of the write. Only one caller gets `count=1`; the other gets `count=0` and aborts.
+
+**Pattern used:** `tryTransitionNodeRun(id, from, to, extra?)` → returns `boolean`. Every single status write in the codebase goes through this function.
+
+---
+
+### Decision: Prisma over Raw SQL / Knex
+
+**Why:**
+1. **Type safety:** Schema → generated client → TypeScript types. No string-typed queries.
+2. **Migration management:** `prisma migrate dev` generates SQL migration files and applies them. The history is committed to the repo and can be replayed on any environment.
+3. **`updateMany` row count:** Prisma's `updateMany` returns `{ count: number }`, which is exactly what the conditional-update pattern needs to detect "did anyone else win?"
+4. **Monorepo-friendly:** The generated client path (`output = "../src/generated/client"`) can be set per package, so `@dag/db` owns its client and other packages never import from the generated path directly.
+
+**Trade-off:** Prisma's query engine binary adds ~10 MB to the Docker image. Acceptable.
+
+---
+
+### Decision: `RunEvent` is Append-Only
+
+**Why:** `RunEvent` serves two roles simultaneously: (1) an audit trail for post-mortem debugging and (2) the replay source for SSE reconnects. If events could be mutated or deleted, both guarantees break. A reconnecting browser client asks for events `WHERE id > lastSeenId` — if an event was deleted, the client would miss it and show a gap in the node status timeline. The `BigInt @default(autoincrement())` id provides a monotonically increasing cursor that clients can safely use across reconnects.
+
+**Pattern:** Only `appendRunEvent()` is exposed — no update or delete helpers exist in the repository layer.
+
+---
+
+## Phase 4 — Control Plane API (`apps/api`)
+
+### Decision: Separate `createApp()` Factory from `src/index.ts` Server Startup
+
+**Why:** If `app.listen()` were called at the module level in `app.ts`, then `import { app } from './app'` in a test file would bind a real TCP port and attempt to connect to PostgreSQL. By exporting `createApp()` as a factory and calling `listen()` only in `index.ts`, test files call `createApp()` and pass the result directly to Supertest — zero ports opened, zero network connections. This is the standard Express testing pattern.
+
+**Trade-off:** Slightly more indirection (two files instead of one). Entirely worth the test ergonomics.
+
+---
+
+### Decision: Route Handlers Have Zero Business Logic
+
+**Why:** Express route handlers that contain business logic are hard to test (you must make HTTP calls), hard to reuse (you cannot call the logic without Express), and hard to read (HTTP boilerplate is mixed with domain logic). By delegating immediately to a service function (`createWorkflowService(req.body)`), the handler becomes trivial. The service function can be unit-tested directly without any HTTP machinery.
+
+**Rule enforced:** If a route handler needs more than one `await`, something is wrong — that logic belongs in the service.
+
+---
+
+### Decision: `POST /workflows/:id/validate` Always Returns HTTP 200
+
+**Why:** This endpoint is called by the browser editor on every edge draw operation to provide instant feedback. If it returned 422 on a cyclic graph, the client would need two code paths: one for HTTP errors (network, 5xx) and one for validation results (4xx). By always returning 200 with `{ valid: boolean, ...details }`, the client has a single response shape to handle regardless of outcome. HTTP error codes are reserved for truly exceptional conditions (server crash, auth failure) — "this graph has a cycle" is a normal, expected response.
+
+---
+
+### Decision: Central Error Handler with Typed Error Classes
+
+**Why:** Without a central handler, every route would need its own try/catch with repeated `if (err instanceof ZodError) res.status(400)...` logic. More critically, a bug where an untyped `new Error()` reaches the client would leak a stack trace. The central handler guarantees:
+1. Every error type maps to exactly one HTTP status (defined once, not repeated per route).
+2. Unknown errors get a `correlationId` in the response (for log lookup) but no stack trace in the body.
+3. Adding a new error type means adding one `if` block in one file — the rest of the codebase is unchanged.
+
+---
+
+### Decision: `validateBody()` Middleware Replaces `req.body` with Parsed Data
+
+**Why:** After `validateBody(Schema)` runs, `req.body` contains the Zod-parsed, type-coerced value. The route handler receives fully typed data without needing to call `.parse()` itself. This means the handler never sees raw `unknown` from Express — it only ever processes data that has already been validated. Any validation failure is handled before the handler is called, forwarded to the error handler via `next(zodError)`.
+
+---
+
+## Phase 5 — Message Broker (`packages/queue`)
+
+### Decision: Redis + BullMQ vs Kafka or RabbitMQ
+
+**Why:** Redis provides more than just queues — it provides distributed atomic counters (via Lua) and a fast pub/sub mechanism. For a DAG engine, we strictly require a globally atomic operation for in-degree tracking to prevent double dispatch, which Redis Lua scripts can do in one round trip. Kafka is designed for high-throughput streaming (append-only log), not for point-to-point job scheduling with complex backoff and retry policies. RabbitMQ supports retries, but lacks the shared atomic hash map that we need for dependency resolution. BullMQ over Redis gives us retries, deduplication (`jobId`), pub/sub, and custom Lua script capabilities in one dependency.
+
+### Decision: Resource-Specific Queues (`queue:io`, `queue:cpu`, `queue:gpu`)
+
+**Why:** If we used a single global queue, a 40-minute GPU training job would block a simple 2-second dataset download job. By partitioning queues by resource profile, workers can scale and process tasks independently. For instance, an IO worker can process 10 concurrent network tasks while a GPU worker processes exactly 1 task at a time, ensuring fair distribution and no head-of-line blocking.
+
+### Decision: Exponential Backoff with Jitter
+
+**Why:** If an external API (like Kaggle) goes down or rate-limits requests, 50 running IO tasks might fail simultaneously. With standard exponential backoff, all 50 workers will retry exactly 2 seconds later, then 4 seconds later, generating a "thundering herd" that guarantees they will get rate-limited again. Adding random jitter (e.g., `random() * backoff_time`) spreads the retries over a time window, allowing the external service to recover.
+
+### Decision: Separate Pub/Sub Redis Connection
+
+**Why:** In Redis, when a connection enters `SUBSCRIBE` mode, it is locked into that mode. It can no longer issue standard commands like `SET`, `GET`, or `HINCRBY`. Therefore, the architecture provisions one `ioredis` connection strictly for BullMQ and regular operations, and a completely separate connection reserved exclusively for `subscribeToRun` event listeners.
+
+### Decision: Deterministic `jobId` for Deduplication
+
+**Why:** The `jobId` is constructed as `${runId}:${nodeKey}:${attempt}`. If a network partition causes the control plane to retry a dispatch, BullMQ natively checks the `jobId`. If a job with this ID already exists (in any state: waiting, active, or delayed), the duplicate is silently ignored. This gives us at-least-once delivery from the API and exactly-once processing in the queue.
+
+---
+
+### Decision: Per-Call Subscriber Connection in `subscribeToRun` (Not a Shared Global)
+
+**Why:** The first version of `pubsub.ts` reused the global `pubsub` connection exported from `redis.ts`. That works for *one* subscriber but breaks at N. Three concrete failures:
+
+1. **Channel accumulation.** A subscriber connection accumulates subscriptions across every `subscribeToRun` call it serves. If browser tab 1 subscribes to `run:42:events` and never disconnects (page reload, lost socket), tab 2 calling `subscribeToRun('run:99', ...)` will *also* receive run 42's events because both channels are on the same connection. The shared `pubsub` connection becomes a leak.
+2. **Cross-stream message bleed.** A subscriber connection receives every message from every subscribed channel on a single stream. The `onMessage` handler must filter by channel name. If the filter has a bug, events for run 99 surface in tab 1's UI.
+3. **Back-pressure coupling.** A slow JSON.parse on one channel stalls delivery for every other channel on the same connection. One misbehaving SSE client freezes every connected client.
+
+The fix (`packages/queue/src/pubsub.ts:36–73`): each `subscribeToRun` call constructs its own `Redis` instance, subscribes to exactly one channel, registers one `message` listener, and returns a cleanup function that unsubscribes + `quit()`s the connection. The cleanup is idempotent (`closed` flag) so caller-side `try/finally` is safe to call multiple times. Per-call connections are cheap — Redis is single-threaded and the per-tab overhead is one TCP socket, not one thread.
+
+`publishRunEvent()` deliberately does **not** open its own connection — publishing does not enter subscriber mode, so it reuses the shared `connection`.
+
+**Trade-off:** More TCP sockets in `TIME_WAIT` on the API box. Acceptable — Redis is on a private network, not over the public internet, and the connection count is bounded by the number of connected SSE clients (typically dozens, not thousands).
+
+---
+
+### Decision: Pipeline-Based `seedInDegrees` (Single Round-Trip for N Nodes)
+
+**Why:** `seedInDegrees` (`packages/queue/src/lua.ts:66–94`) initialises the in-degree hash for every node in a run. Without a pipeline, a 200-node graph would require 200 sequential `HSET` round-trips — at 1 ms RTT that's 200 ms of dead time before the orchestrator can dispatch anything. Using `connection.pipeline()` batches every `HSET` and the two `EXPIRE` calls into one TCP write, which Redis executes serially and replies to in a single batch. Total cost: 1 RTT regardless of graph size.
+
+The pipeline also opportunistically sets `EXPIRE run:{runId}:indegree 604800` and `EXPIRE run:{runId}:dispatched 604800` (7 days) — see the next entry.
+
+**Trade-off:** Pipelined commands are not atomic in the Redis sense (other commands from other clients can interleave between them). For `seedInDegrees` that's fine: nothing else touches the run's in-degree hash until the run is fully seeded. For the decrement path we use Lua instead, because Lua *is* atomic.
+
+---
+
+### Decision: 7-Day TTL on `run:{runId}:indegree` and `run:{runId}:dispatched`
+
+**Why:** Each run creates two Redis hash/set keys that live as long as the run. Without a TTL, a run that crashes mid-execution and is never resumed will leak its keys forever — Redis memory grows monotonically with abandoned runs. A 7-day `EXPIRE` (`packages/queue/src/lua.ts:90–91`) covers two cases:
+
+1. **Recovery window.** If the orchestrator restarts within 7 days, the in-degree and dispatched state is still there — it can re-evaluate `NodeRun.status` rows against `dispatched` and resume without re-seeding.
+2. **Housekeeping.** After 7 days with no activity, the keys auto-delete. Redis stays bounded regardless of how many abandoned runs exist.
+
+**Trade-off:** A user who resumes a run after 8 days of downtime loses the in-degree state and must re-seed (the orchestrator reads `NodeRun.status` and rebuilds from scratch). Acceptable — 7 days is far longer than any plausible restart window.
+
+---
+
+**Why:** The first version of `pubsub.ts` defined a local `RunEventPayload` interface that duplicated the `RunEvent` schema from `packages/contracts/src/events.ts`. Two definitions of the same wire format means they will drift — a new `nodeKey?` field added to the contract would not appear in the subscriber's type, causing a silent SSE event-shape mismatch. The fix (`packages/queue/src/pubsub.ts:3,17,49`) imports `RunEvent` directly from `@dag/contracts` and parses inbound messages with `JSON.parse(...) as RunEvent`. Validation of the wire bytes is the SSE/control-plane's job; the queue layer just forwards typed envelopes.
+
+---
+
+## Phase 6 — Orchestrator Loop (`apps/api`)
+
+### Decision: Control Plane Owns Scheduling (Dumb Workers)
+
+**Why:** We could have designed the system so that when a worker finishes `preprocess`, it looks up the graph, sees that `train` is next, and enqueues the `train` job itself. We didn't do this. Instead, workers strictly execute tasks and report completion to the queue. The API (control plane) listens to these completions and decides what runs next. 
+If workers enqueued their own children, every worker would need:
+1. Full access to the Postgres DB to read the graph.
+2. Full knowledge of the orchestration state machine (Lua decrements).
+3. The ability to push to any other queue.
+By keeping workers "dumb", they can be scaled horizontally infinitely without requiring DB access. The control plane remains the single authoritative source of truth for the DAG's progression.
+
+### Decision: In-Degree Lua Counter as the Runtime Implementation of Kahn's Algorithm
+
+**Why:** Kahn's topological sort is great for static validation, but during runtime, nodes complete asynchronously and dynamically. The orchestrator maps Kahn's in-degree logic to Redis. When a run starts, every node's incoming edges are counted and stored in the Redis hash. When a node succeeds, it triggers an atomic Lua decrement on its children. When a child's counter hits `0`, it means all its dependencies are satisfied, and it is dispatched. This ensures strict topological ordering at runtime across distributed workers.
+
+### Decision: `tryTransitionNodeRun` Checked *Before* Enqueueing
+
+**Why:** The `dispatchNode` function first attempts to update the Postgres `NodeRun` row from `PENDING` to `QUEUED`. If the update fails (returns `false`), the function immediately aborts. If we queued the job first and *then* updated the DB, a concurrent orchestrator process might also queue the job, leading to a double-enqueue. The conditional SQL update acts as a distributed lock — only the actor that successfully changes the DB state is allowed to push to BullMQ.
+
+### Decision: Failures Propagate as `SKIPPED` Rather Than `FAILED`
+
+**Why:** When node A fails, its children (B and C) cannot execute because their inputs will never be produced. If we marked B and C as `FAILED`, it implies they were attempted and errored out, which is untrue and ruins retry metrics. Instead, the orchestrator traverses descendants via BFS and marks them as `SKIPPED`. This clearly differentiates between nodes that genuinely failed and nodes that were preempted by an ancestor's failure.
+
+### Decision: Idempotency Key in `startRun`
+
+**Why:** Network failures happen. A client might hit `POST /runs`, the control plane might successfully start the run and enqueue jobs, but the HTTP response drops. The client will retry. If `startRun` weren't idempotent, the second request would create a duplicate run. By providing an `idempotencyKey` that maps to a `UNIQUE` constraint in Postgres, the API safely returns the existing run on a retry, preventing duplicate orchestration loops.
+
+### Decision: API Process Consumes `QueueEvents`
+
+**Why:** BullMQ provides a `QueueEvents` stream (`completed`, `failed`). Instead of requiring workers to make HTTP callbacks to the API (e.g., `POST /internal/node/complete`), the orchestrator directly consumes the Redis event stream. This reduces moving parts, removes the need for internal API authentication for workers, and keeps the completion-handling logic fully reactive.
+
+---
+
+## Phase 7 — Context Passing (`apps/api/src/context-resolver.ts`)
+
+### Decision: Worker Outputs Bounded to 64 KB; Large Data Travels by Reference
+
+**Why:** If a worker returns a 2 GB trained model or a 500 MB dataset as inline JSON in `NodeRun.output`, several things break simultaneously:
+1. **Postgres row bloat.** Every `SELECT * FROM NodeRun WHERE runId=...` would transfer gigabytes per query. The `GET /runs/:id` endpoint would become unusable.
+2. **Redis pub/sub saturation.** The `NODE_SUCCEEDED` event is published to `run:{runId}:events` via Redis pub/sub. Redis messages have a practical size limit of a few MB. A 2 GB message would never deliver.
+3. **Memory pressure.** The orchestrator holds the full output in memory while dispatching children. With concurrent runs, this leads to OOM crashes.
+
+The fix: workers write large data to a shared artifact volume and return a reference object: `{ "path": "artifacts/{runId}/{nodeKey}/model.pt", "rows": 48213, "checksum": "sha256:..." }`. These references are typically < 1 KB. The 64 KB limit is enforced by `assertOutputSize()` before any DB write.
+
+### Decision: Template Resolution at Dispatch Time (Not at Run-Start Time or Worker Time)
+
+**Why:** There are three possible resolution points:
+1. **Run-start time.** Templates could be resolved once when `startRun` is called and stored on the `WorkflowVersion`. But parent outputs don't exist yet — `preprocess` hasn't run, so `{{ nodes.preprocess.output.metadataPath }}` has nothing to resolve against.
+2. **Worker execution time.** The worker could receive the raw templates and call back to the API to resolve them at execution time. This couples the worker to the control plane's internal state, violates the "workers stay dumb" principle, and introduces a network round-trip inside the worker's hot path.
+3. **Dispatch time (chosen).** When `dispatchNode` is called for `train`, the parent `preprocess` has already been marked `SUCCEEDED` (that's what triggered the dispatch). Its output is available in Postgres. Resolution is immediate, in-process, and requires no extra network calls.
+
+Dispatch time is the only window where: (a) the parent's output exists, and (b) we haven't yet committed to running the child.
+
+### Decision: Unresolved Template = Hard Failure (Not `undefined`)
+
+**Why:** If `{{ nodes.preprocess.output.metadataPath }}` resolves to `undefined` and we pass it to the worker as `undefined` (or worse, omit it entirely), the worker will crash with a confusing `TypeError: cannot read property of undefined` pointing at its own code. The actual bug is the misspelled template in the workflow definition — a problem in the control plane, not in the worker. By throwing `UnresolvedTemplateError` at dispatch time with the offending template string in the message, the failure is attributed correctly and the user sees an actionable error instead of a cryptic worker crash.
+
+### Decision: Resolved Input Persisted on `NodeRun.input` Before Enqueueing
+
+**Why:** Reproducibility and auditability. A worker may be retried weeks after the original run. If we only stored the template (e.g. `{{ nodes.preprocess.output.metadataPath }}`), a later audit or replay would need to re-run the resolver — which assumes the parent's output is still in Postgres and hasn't been purged. By persisting the literal resolved value (e.g. `"artifacts/run-123/preprocess/metadata.csv"`) on `NodeRun.input` before the job is pushed, every past execution is self-contained: a forensic engineer can look at any NodeRun row and see exactly what the worker received.
+
+---
+
+## Phase 8 — Worker Data Plane (`apps/worker`)
+
+### Decision: `Record<NodeType, ExecutorFn>` Not `Partial<Record<...>>`
+
+**Why:** Using `Partial` would make every executor optional, meaning a missing `"torch.train"` executor compiles fine and only crashes at runtime when the first GPU job is dequeued. `Record<NodeType, ExecutorFn>` (non-partial) forces all keys to be present at compile time. Adding a new `NodeType` in `packages/contracts` without a corresponding executor becomes a compile error, not a runtime crash. This is the TypeScript exhaustiveness pattern: the discriminated union on `NodeType` propagates its exhaustiveness check all the way to the executor registry.
+
+### Decision: JSON over stdio for the Node↔Python Bridge (Not REST or Shared DB)
+
+**Why:** There are three candidate IPC mechanisms:
+
+1. **REST callback.** The Python script would call `POST /internal/result` to return its output. This requires the script to know the API URL, carry an auth token, handle retries if the API is temporarily unavailable, and introduces a network dependency into every executor. It also means the worker can't run in an air-gapped environment.
+
+2. **Shared database table.** The script writes a row to a Postgres table. This couples every Python script to the Prisma schema and requires a DB connection (and driver) inside each script. Schema migrations would need to be coordinated with the Python layer.
+
+3. **JSON over stdio (chosen).** The script reads from stdin and writes to stdout. Zero network dependency, zero auth tokens, zero DB connections. The protocol is testable with `echo '{"msg":"hello"}' | python3 preprocess.py`. The `::RESULT::` sentinel is unambiguous — no collisions with log output. Stderr is fully preserved for debugging without any extra plumbing.
+
+### Decision: Write to `*.tmp` then `fs.renameSync` (Atomic Write)
+
+**Why:** A crash (SIGKILL, OOM, power loss) mid-write leaves a partial file. If `result.json` is 50% written and the worker restarts, the idempotency check sees `result.json` exists and returns the corrupted half-file as the "cached" result. The downstream node receives malformed JSON.
+
+`fs.renameSync` on the same filesystem is atomic at the OS level: the inode swap is a single system call. The `.tmp` file may be left behind on a crash, but the target file only ever contains complete data. On restart, the executor sees `result.json` does not exist (only the orphaned `.tmp` does) and re-runs cleanly.
+
+### Decision: Heartbeats via `job.extendLock()` for Long-Running Tasks
+
+**Why:** BullMQ uses a Redis lock with a TTL (`lockDuration`) to detect stalled workers. If a worker grabs a job and then crashes (SIGKILL), no one releases the lock — BullMQ waits for the TTL to expire before re-delivering. This is by design. But for long-running jobs (`torch.train` taking 2 hours), the lock TTL (60 s) expires while the job is still running normally, causing BullMQ to falsely re-deliver it to a second worker. Two workers now train in parallel on the same data — duplicating GPU cost and potentially creating corrupted state if both write to the same weights file. `startHeartbeat()` calls `job.extendLock()` every 15 s (well within the 60 s TTL), keeping the lock alive for exactly as long as the job is genuinely running.
+
+---
+
+## Phase 9 — Fault Tolerance (`apps/worker`, `packages/queue`)
+
+### Decision: Two Error Classes — `RetryableError` vs `UnrecoverableError`
+
+**Why:** The retry budget is finite and expensive. Retrying a Kaggle `403 Unauthorized` (bad API key) three times with exponential backoff takes ~14 seconds, burns API quota on three doomed requests, and still ends in failure. Worse, if the user has set `attempts: 10`, it retries ten times. The fix is not to retry at all. BullMQ's `UnrecoverableError` is a special subclass that signals the queue to move the job directly to the failed set, skipping all remaining attempts. Classifying each error as retryable or unrecoverable at the throw site — rather than at the caller — keeps the policy close to the knowledge of what went wrong.
+
+### Decision: Full Jitter Over Exponential Backoff (Thundering Herd Prevention)
+
+**Why:** Standard exponential backoff (wait 2 s, 4 s, 8 s …) is deterministic. If Kaggle's rate-limit window resets at exactly T+0, all 50 retrying jobs wake up at T+2 and hammer the API simultaneously, triggering another rate-limit. They all wait 4 s and try again. This thundering herd repeats until the cap. Full jitter (`random(0, min(cap, base * 2^attempt))`) desynchronises the retries. The expected wait is half of the deterministic case, but the key property is that each job's wake-up time is independent. The load spreads across the window and the external service has room to recover between individual requests.
+
+### Decision: Per-Run Redis Semaphore (`semaphore.ts`)
+
+**Why:** A single graph with 200 parallel nodes would enqueue all 200 jobs instantly. With 10 workers at concurrency 8 (80 slots), that's 80 simultaneous Kaggle downloads, S3 reads, and GPU jobs from a single user's run. This would starve all other runs in the cluster. The semaphore uses a Redis SET (atomic via Lua) as a counter: before dispatching a node, the orchestrator calls `acquireConcurrencySlot()`. If the run already holds `maxSlots` (default: 10), dispatch is deferred. The slot is released in the worker's completion handler, allowing the next queued node to proceed.
+
+### Decision: `retry-failed` Resets Attempt Counter on FAILED Nodes
+
+**Why:** When a node fails on attempt 3 (the final attempt), its `NodeRun.attempt` is 3. If we reset it to PENDING without incrementing, the deterministic `jobId` `${runId}:${nodeKey}:3` already exists in BullMQ's failed set. Enqueuing with the same ID would either be deduplicated (silently no-op) or collide. By incrementing `attempt` to 4 before re-dispatching, the new `jobId` is `${runId}:${nodeKey}:4` — guaranteed unique. The existing failed job record at attempt 3 remains in BullMQ's failed set as a permanent audit trail.
+
+---
+
+## Phase 10 — SSE Streaming (`apps/api/src/services/sse.service.ts`)
+
+### Decision: SSE Over WebSockets
+
+**Why:** The run status stream is strictly server→client. WebSockets are a full-duplex protocol; using them here adds an HTTP upgrade handshake, custom message framing, explicit ping/pong, and a larger surface area in the proxy config. SSE uses plain HTTP/1.1 chunked transfer, passes through nginx/ALB/CloudFront with a single `proxy_read_timeout` setting, and uses the browser's native `EventSource` API — which handles reconnection automatically, including sending `Last-Event-ID`. When would we flip to WebSockets? If the client needed to push data back — live terminal input, collaborative graph editing, graph position sync — the bidirectionality of WebSockets would become necessary.
+
+### Decision: Write Events to BOTH Postgres and Redis Pub/Sub
+
+**Why:** Redis pub/sub is fire-and-forget. A message published to `run:{runId}:events` while a subscriber is disconnected is permanently discarded. Without Postgres persistence, a client reconnecting after a 5-second network blip would re-subscribe to pub/sub but all events from the disconnect window are gone. The client has no way to know whether `RUN_SUCCEEDED` fired during the gap — it would display the run as permanently in-progress. Persisting every event to `RunEvent` and replaying on reconnect (using `Last-Event-ID` as the cursor) gives the client a complete, ordered, gapless view of history, regardless of how many times it disconnects.
+
+### Decision: Dedicated Redis Subscriber Connection Per SSE Client
+
+**Why:** A Redis connection that has called `SUBSCRIBE` enters subscriber mode — it can no longer issue regular commands. If we shared one Redis connection across all SSE clients, issuing `PUBLISH` (required by the orchestrator) on that connection would fail. Worse, sharing one subscriber connection across 100 clients means all 100 receive every message and must filter by channel in userland — messages for run A are delivered to the handler for run B and silently discarded. By spawning a dedicated `new Redis(REDIS_URL)` per `subscribeToRun()` call, each client has a clean, isolated subscriber with no interference from other clients or the main connection.
+
+### Decision: 200 ms Log Buffer for `NODE_LOG` Events
+
+**Why:** Without buffering, a chatty training loop emitting 200 lines/s creates 200 SSE frames/s. Each frame is a `res.write()` call, a TCP segment, and a browser DOM event. Node.js's event loop spends more time on I/O plumbing than on actual request handling. The browser's `EventSource` callback fires 200 times per second, each time updating the log pane — causing 200 DOM mutations/s on a single element, which overwhelms the browser's layout engine. Buffering at 200 ms collapses these into ≤5 `NODE_LOG_BATCH` frames per second, reducing both server write overhead and browser layout cost by 40×, while keeping apparent log latency below human perception threshold (~200 ms).
+
+---
+
+## Phase 11 — Visual Graph Editor (`apps/web`)
+
+### Decision: Zustand over React Context for Live State
+
+**Why:** SSE events arrive continuously during a run. If `runSlice` state (node statuses, logs) were placed in React Context, every tick would trigger a top-down re-render of all components consuming that context. In a 50-node graph, this means 50+ unnecessary DOM reconciliations per second. Zustand supports **selector granularity**, meaning `useRunStore(s => s.nodeStatuses[id])` specifically subscribes to that exact node's status. When a tick updates node "train", only the "train" `CustomNode` component re-renders. The rest of the canvas remains completely untouched.
+
+### Decision: Bridging React Flow to Zustand via the Store
+
+**Why:** React Flow's `onNodesChange` and `onEdgesChange` provide diffs for user interactions (drags, selections, edge creation). Instead of applying these diffs to local component state, we route them through `useGraphStore.getState().onNodesChange`. This enforces Zustand as the single source of truth for the entire graph topology, allowing us to accurately serialize `toGraph()` at any time for the API, and keeping validation and save logic perfectly decoupled from React Flow's render cycle.
+
+### Decision: Client-Side Cycle Detection using `@dag/graph-core`
+
+**Why:** Instead of rewriting cycle detection in the frontend or calling an API endpoint on every edge drop, we directly import `detectCycle` from `@dag/graph-core`. Because we strictly adhered to the zero-dependency rule in Phase 2, this package compiles natively for the browser. This allows the UI to reject cycles instantly during `onConnect` operations, flashing a red highlight on the cycle path, providing zero-latency UX feedback while the backend maintains the same logic for ultimate validation.
+
+### Decision: Schema-Driven Dynamic Configuration Forms
+
+**Why:** Hardcoding React form templates for `Kaggle Node`, `Train Node`, etc., scales poorly as the platform adds executors. By building a generic `ConfigPanel` that loops over a predefined list of schema fields (derived directly from the node's Zod schema in a production setup), adding a new executor type to the UI becomes a purely declarative change. The form automatically renders text inputs, numbers, or dropdowns based on the schema's field type.
+
+---
+
+## Phase 12 — Testing, Observability, and Load Proof
+
+### Decision: Testcontainers, Not Mocking, for the Integration Suite
+
+**Why:** The fast unit suite (Phases 0–11) mocks `@dag/db`/`@dag/queue` at the module boundary — correct for testing business logic in isolation, but structurally incapable of catching bugs that live in the boundary itself: whether a Postgres conditional `UPDATE` actually serializes two concurrent writers, whether the Lua script is actually atomic under load, whether BullMQ's lock/stall machinery actually re-delivers a job. A mock returns whatever the test tells it to return; it cannot disagree with the test the way real infrastructure can. Testcontainers gives every test run a real, disposable `postgres:16` + `redis:7-alpine` — the same images `infra/docker-compose.yml` uses — so a passing test is evidence about the real system, not about the mock's fidelity to the tester's mental model.
+
+**Trade-off:** An integration test run costs real wall-clock time (tens of seconds to boot two containers, push the schema, spawn worker processes) versus milliseconds for the mocked suite. This is why it's a separate `pnpm test:integration` command and `vitest.integration.config.ts`, not folded into the default `pnpm test`.
+
+### Decision: `globalSetup` + JSON Handoff File, Not `process.env` in `beforeAll`
+
+**Why:** `@dag/db`'s `prisma` and `@dag/queue`'s `connection`/`ioQueue`/`cpuQueue`/`gpuQueue` are module-level singletons constructed at import time from `process.env.DATABASE_URL`/`REDIS_URL`. Testcontainers only knows the mapped port after the container starts — but a static `import` at the top of a test file is hoisted and evaluates before `beforeAll` ever runs, so by the time `beforeAll` could set `process.env`, the wrong (or absent) URL has already been baked into the singleton. Two alternatives were considered and rejected:
+1. **Vitest's `provide`/`inject` context API** — the officially "correct" mechanism, but its exact signature has shifted across Vitest minor versions, and getting it wrong fails silently in ways that are hard to diagnose from a Testcontainers boot log.
+2. **One Testcontainers instance per test file** — simplest to reason about, but multiplies the ~10s container-boot cost by five files for zero isolation benefit (nothing in this suite needs isolation stronger than a unique `runId`, which `cuid()` already guarantees).
+
+The chosen fix: `global-setup.ts` starts the containers once, writes `{ databaseUrl, redisUrl, artifactDir }` to a JSON file in the OS temp directory, and every test file's `bootstrapTestEnv()` reads that file synchronously, sets `process.env`, and only *then* performs a **dynamic** `import('@dag/db')` / `import('@dag/queue')`. Dynamic imports are not hoisted — they run exactly where they're written, after the env is set. Vitest's default `test.isolate: true` gives each test file a fresh module registry, so this pattern is safe to repeat per file without cross-file leakage.
+
+### Decision: Two Shared Worker Processes, Spawned Once in `global-setup.ts`
+
+**Why:** The first version of this suite spawned worker process(es) per test file (matching Phase 8's "2 worker processes" framing literally, once per file). On this project's Windows dev machine that meant 5+ separate `tsx`-plus-`python3` process trees forked over the lifetime of one `vitest run` — slow enough to occasionally blow past a test's own wait budget, and on at least one run, severe enough to crash the entire suite with a native access violation (Windows exit code `3221225477` / `0xC0000005`). Spawning exactly two worker processes once, in `global-setup.ts`, and leaving them running for every test file removed the flakiness in repeated testing and is arguably *more* representative of production: a real deployment has a standing fleet of workers serving many runs, not one worker spun up and torn down per run.
+
+**Consequence this forced elsewhere:** the race-condition test can no longer dispatch `a`/`b`/`c` through the real `startRun`/`dispatchNode` path, because the now-always-on shared workers would race to execute them before the test's own deterministic `Promise.all` gets a turn. See the next entry.
+
+### Decision: `pool: 'forks'` for the Integration Vitest Config
+
+**Why:** Vitest's default `'threads'` pool runs each test file inside a worker *thread*, tearing down and re-creating a V8 isolate within the same OS process between files. Every integration test file opens real `ioredis`/BullMQ/Prisma connections; a native callback firing after its owning isolate had already been destroyed is the leading suspect for the access-violation crash described above (it appeared specifically at file-transition boundaries, never mid-file). `pool: 'forks'` gives each file a genuinely separate OS process instead of a thread inside a shared one — the standard fix for exactly this class of native-module-plus-worker-threads instability. Four consecutive clean runs followed this change; zero followed the switch to `singleFork` alone (still one process for everything) or `threads` (the original config).
+
+**Trade-off:** Forking an OS process per file is slower to start than spinning up a thread. Acceptable here — the containers themselves already dominate the suite's wall-clock cost.
+
+### Decision: Race-Condition Test Seeds `b`/`c` Directly, Not via `startRun`
+
+**Why:** With two shared worker processes always polling the queues (see above), any *real* `dispatchNode` call puts a real BullMQ job where those workers will race to grab and execute it — including the two nodes (`b`, `c`) whose *simultaneous completion* is the entire point of the test. If the shared workers execute them first, the test's own `Promise.all([onNodeSucceeded('b'), onNodeSucceeded('c')])` either double-processes an already-terminal node (silently no-ops, per the conditional-update guard) or races something that already happened, defeating the deterministic setup. The fix: seed `a`, `b`, `c`'s `NodeRun` rows and the Redis in-degree hash directly via Postgres/Redis writes — no BullMQ job is ever created for them, so nothing else can touch them before the test's own forced interleaving does. Only `d` — the actual subject of the assertion — goes through the real `dispatchNode` → `queue.add()` path, so the thing being proven (`d` dispatches exactly once) is still fully real, only the unrelated setup steps are hand-rolled.
+
+### Decision: `/metrics` Gauges Are Recomputed Per Scrape, the Duration Histogram Is Observed at Transition Time
+
+**Why:** Two different kinds of metric need two different collection strategies. "How many NodeRuns are currently RUNNING" is a *snapshot* of current DB state — it can be answered correctly at any moment by asking Postgres directly (`groupBy` on `status`), and doing so guarantees the number is always exactly right, immune to any call site anywhere in the codebase forgetting to increment/decrement a counter. "What was the p95 node execution duration" is a *time series* — the DB doesn't retain a history of past durations anywhere, only the latest `startedAt`/`finishedAt` on each row, so there is no scrape-time query that could reconstruct it after the fact. That number can only be captured by observing it at the moment it's known, inside `onNodeSucceeded`/`onNodeFailed`, into a `prom-client` `Histogram`. Using the wrong strategy for either would either (a) require invasive counter-increment code at five call sites for the gauges, with real drift risk, or (b) be structurally impossible for the histogram.
+
+### Decision: The Scale Test Is a Standalone Script, Not a `pnpm test` Suite Member
+
+**Why:** `pnpm -r test` (and even `pnpm test:integration`) are meant to run on every change and fail fast — they need to be fast and deterministic. A load test that fires 200 concurrent runs of a 10-node graph across real worker processes takes on the order of a minute or more by design (that's what makes it a *load* test), and its purpose is to produce a **result** (a throughput/latency/queue-depth table for the README), not a pass/fail signal. Making it a `test` file would either slow down every CI run for no correctness benefit, or get skip-guarded into irrelevance the way `orchestrator.test.ts`'s real-infra tests were before Testcontainers existed. `scripts/scale-test.ts` is deliberately a benchmark, run by a human (or a scheduled job) when evidence is wanted, following the same convention as `scripts/check-infra.ts`.
+
+### Decision: The Scale-Test Graph Is a Fan-Out/Fan-In Shape, Not a Chain
+
+**Why:** The acceptance check needs to stress queue depth and worker concurrency, and a straight 10-node chain cannot do that: at any instant, at most `RUNS` nodes (one per run) can possibly be ready to dispatch, since every node in a chain has exactly one predecessor. A `root → 8 parallel branches → sink` shape means, the moment every run's `root` completes, up to `RUNS × 8` nodes become ready near-simultaneously — with 200 runs, up to 1,600 nodes racing for `queue:cpu` slots at once. That burst, and how differently 1 worker versus 4 workers absorb it, is precisely the horizontal-scaling signal the benchmark exists to produce; a chain would only ever show a mild, hard-to-interpret difference.
+
+### Decision: Prisma's `connection_limit` Is Bounded Per Process, Sized Differently for Workers vs. the Control Plane
+
+**Why:** Running the scale test's 4-worker pass hit real Postgres exhaustion (`FATAL: sorry, too many clients already`) — not a simulated failure, an actual limit. Each worker *process* constructs its own `PrismaClient`, and Prisma's default pool size (`num_cpus * 2 + 1`) is sized as if that client owned the whole connection budget; it doesn't know four other processes made the same assumption. `packages/db/src/client.ts` now appends `connection_limit`/`pool_timeout` to the connection string it actually uses (`DB_POOL_SIZE` env var, default 5). The default is deliberately small — worker processes mostly issue one conditional `UPDATE` at a time (`tryTransitionNodeRun`), not wide parallel fan-out — but the scale test's control-plane process (the script driving all 200 concurrent runs' `startRun`/`onNodeSucceeded` calls through one `PrismaClient`) needs far more concurrency than that, so it explicitly overrides `DB_POOL_SIZE=30` for itself while pinning `DB_POOL_SIZE=5` in the env it hands to spawned workers — an explicit override was necessary because `spawnWorkerProcess` otherwise inherits the parent's `process.env`, which would have handed workers the control-plane's oversized pool too.
+
+**Trade-off:** A fixed default requires a human to reason about the arithmetic (`N processes × connection_limit < Postgres max_connections`) rather than something that self-tunes. Acceptable for a project of this scope; a production deployment at real scale would put PgBouncer or Prisma Accelerate in front of Postgres instead of hand-sizing per-process pools (the Prisma CLI's own error output points at exactly this).
+
+### Decision: Kill the Whole Process Tree on Windows, Not Just the Immediate Child
+
+**Why:** Every worker process in this suite is spawned with `shell: true` (the resolved `tsx` binary is a `.CMD` shim on Windows, which can only be executed through a shell). On Windows, the `ChildProcess` object returned by `spawn()` in that case refers to the **shell** (`cmd.exe`), not the `node.exe` process the shim eventually execs. Calling `proc.kill('SIGTERM')` signals only that shell — which may have already exited by the time the real worker is up and running — leaving the actual worker process **orphaned**: still alive, still holding its Postgres connection pool and Redis connections, invisible to anything tracking the original `ChildProcess` handle. This was a real, repeatable bug: every "stopped" worker from every prior test/benchmark run in this session was, in fact, still running, and by the fourth or fifth accumulated run, Postgres's `max_connections` was exhausted before a new pass even started — the exact failure this section's connection-pool fix was originally written to explain, until process-tree leakage turned out to be compounding it. Fixed with `taskkill /PID <pid> /T /F` on `win32` (`/T` recurses through Windows' own recorded parent-PID chain, which persists even after an intermediate shell has exited) and the POSIX equivalent, a negative-PID `process.kill(-pid, 'SIGKILL')` targeting the whole process group — the same technique `python-bridge.ts` already uses to kill a timed-out Python child's descendants.
+
+### Known gap: `pnpm -r lint` has pre-existing failures outside Phase 12's scope
+
+Running `pnpm -r lint` across the whole repository while closing out Phase 12 surfaced ~30 pre-existing errors in `apps/api` and `apps/worker` — mostly `@typescript-eslint/no-explicit-any` in code written in Phases 4–10 (`orchestrator.service.ts`, `sse.service.ts`, `worker.ts`, several test files) and a handful of unused imports/variables. None of them are in files this phase created; `pnpm -r lint` had apparently never actually been run clean before. Phase 12's own new files (`apps/api/src/integration/*`, `metrics.ts`, `scripts/scale-test.ts`) and the frontend's Phase 11 lint errors (14, all trivial — unused imports/vars, a few `any`s) were fixed as part of this phase's own cleanup, since they were small and low-risk to touch. The ~30 remaining errors in `apps/api`/`apps/worker` were **not** fixed: correcting them means touching orchestrator/SSE/worker logic written and reviewed in earlier phases, which is real surface area outside Phase 12's stated scope (testing, observability, load proof) and carries real risk of introducing a behavioral regression in code this phase didn't otherwise need to change. Silently fixing them in passing would also hide that they existed at all. Recorded here, honestly, as a backlog item for whichever phase picks it up — most likely worth a dedicated pass before or during Phase 14's consolidation, alongside the "no committed Prisma migrations" gap already on record.
+
+### Decision: `startRun`/`retryFailedNodesService` Bugs Found by Testing, Fixed in Place
+
+**Why:** Writing the integration suite surfaced two real defects (detailed in architecture.md's Phase 12 section): `startRun` returned a stale pre-transition object, and `retryFailedNodesService` never re-dispatched the nodes it reset. Both were fixed directly in `orchestrator.service.ts`/`run.service.ts` rather than worked around in the test. The workflow's own guardrail is explicit here — "if an acceptance check fails, stop and report; do not soften the check" — and softening would have meant either relaxing the test's assertions (masking a real bug from every future reader) or leaving the bug undocumented. Both are exactly the kind of defect a mocked test cannot surface: a mock of `tryTransitionRun` would have returned whatever the test told it to, never exposing that the *caller* ignored its own return value.

@@ -1,9 +1,16 @@
-// Prisma schema — full implementation in Phase 3.
-// This stub allows `prisma generate` to run without error during Phase 0.
+// =============================================================================
+// DAG Engine — Prisma Schema
+// Canonical data model per PROJECT_GUIDE.md §6.
+//
+// Key invariants enforced at the DB level:
+//   @@unique([runId, nodeKey]) on NodeRun — makes double-execution impossible
+//   WorkflowVersion is immutable — edits create a new version, runs pin a version
+//   RunEvent is append-only — never update or delete; it is the audit trail
+// =============================================================================
 
 generator client {
-  provider      = "prisma-client-js"
-  output        = "../src/generated/client"
+  provider = "prisma-client-js"
+  output   = "../src/generated/client"
 }
 
 datasource db {
@@ -11,5 +18,141 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Full schema (Tenant, Workflow, WorkflowVersion, Run, NodeRun, RunEvent)
-// implemented in Phase 3 per PROJECT_GUIDE.md §6
+// ─── Enums ──────────────────────────────────────────────────────────────────
+
+/// Maps to NodeStatusSchema in @dag/contracts.
+/// Only legal transitions: PENDING→QUEUED→RUNNING→SUCCEEDED|FAILED|QUEUED(retry)
+///                         PENDING|QUEUED→CANCELLED, PENDING→SKIPPED
+enum NodeStatus {
+  PENDING
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+  CANCELLED
+}
+
+/// Maps to RunStatusSchema in @dag/contracts.
+enum RunStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+// ─── Models ─────────────────────────────────────────────────────────────────
+
+/// Top-level namespace for isolating workflows per customer/team.
+model Tenant {
+  id        String     @id @default(cuid())
+  name      String
+  workflows Workflow[]
+}
+
+/// A named workflow container. Mutable (name can change). Graph versions are
+/// immutable snapshots stored on WorkflowVersion.
+model Workflow {
+  id        String            @id @default(cuid())
+  tenantId  String
+  name      String
+  createdAt DateTime          @default(now())
+  tenant    Tenant            @relation(fields: [tenantId], references: [id])
+  versions  WorkflowVersion[]
+}
+
+/// An immutable snapshot of a graph at a point in time.
+/// Runs always reference a version, never the mutable Workflow — this ensures
+/// the control plane can replay or inspect any historical run exactly as it ran.
+///
+/// `graph`     — raw { nodes, edges } JSON snapshot (NodeDef[], EdgeDef[])
+/// `topoOrder` — { order: string[], tiers: string[][] } cached from Kahn's.
+///               Pre-computing at version-creation time means the scheduler
+///               never has to recompute topology under load.
+model WorkflowVersion {
+  id         String   @id @default(cuid())
+  workflowId String
+  version    Int
+  graph      Json     // { nodes: NodeDef[], edges: EdgeDef[] }
+  topoOrder  Json     // { order: string[], tiers: string[][] }
+  createdAt  DateTime @default(now())
+
+  workflow Workflow @relation(fields: [workflowId], references: [id])
+  runs     Run[]
+
+  /// Composite unique prevents two versions with the same number for one workflow
+  @@unique([workflowId, version])
+}
+
+/// One execution of a WorkflowVersion.
+///
+/// `idempotencyKey` — caller-supplied key so retried HTTP requests return the
+///                    existing run rather than spawning a duplicate.
+model Run {
+  id                String      @id @default(cuid())
+  workflowVersionId String
+  status            RunStatus   @default(PENDING)
+  idempotencyKey    String?     @unique
+  triggeredBy       String      // userId, 'schedule', 'api', etc.
+  startedAt         DateTime?
+  finishedAt        DateTime?
+
+  workflowVersion WorkflowVersion @relation(fields: [workflowVersionId], references: [id])
+  nodeRuns        NodeRun[]
+  events          RunEvent[]
+}
+
+/// One execution of one node inside a Run. This is the atomic unit of work
+/// that a BullMQ job maps to.
+///
+/// Critical invariants:
+///   @@unique([runId, nodeKey])  — DB-level backstop against double-execution.
+///     Even if the Redis dispatch guard misbehaves, Postgres will reject a
+///     second INSERT for the same (runId, nodeKey) pair.
+///
+///   `attempt` — incremented on each retry so the deterministic jobId
+///     `{runId}:{nodeKey}:{attempt}` is unique across retries.
+///
+///   `input` / `output` — small JSON ≤ 64 KB. Large data goes to ARTIFACT_DIR
+///     and is referenced by URI in the output object.
+model NodeRun {
+  id             String     @id @default(cuid())
+  runId          String
+  nodeKey        String     // stable user-facing key, e.g. "preprocess"
+  status         NodeStatus @default(PENDING)
+  attempt        Int        @default(0)
+  input          Json?      // fully-resolved inputs (set at dispatch time)
+  output         Json?      // executor output (set on SUCCEEDED)
+  error          Json?      // { message, stack, retryable } (set on FAILED)
+  workerId       String?    // which worker process handled this execution
+  leaseExpiresAt DateTime?  // BullMQ lock expiry — used for stalled detection
+  startedAt      DateTime?
+  finishedAt     DateTime?
+
+  run Run @relation(fields: [runId], references: [id])
+
+  /// The anti-duplicate-execution invariant — see PROJECT_GUIDE.md §6
+  @@unique([runId, nodeKey])
+  /// Hot query for the orchestrator: "which nodes in run X are still pending?"
+  @@index([runId, status])
+}
+
+/// Append-only audit log. Every state transition and log chunk lands here.
+/// Also the replay source for SSE reconnects (via Last-Event-ID cursor).
+///
+/// `id` BigInt autoincrement — monotonically increasing, safe to use as a cursor.
+/// `nodeKey` nullable — run-level events (RUN_STARTED, RUN_SUCCEEDED) omit it.
+model RunEvent {
+  id        BigInt   @id @default(autoincrement())
+  runId     String
+  nodeKey   String?
+  type      String   // matches RUN_EVENT_TYPES in @dag/contracts
+  payload   Json
+  createdAt DateTime @default(now())
+
+  run Run @relation(fields: [runId], references: [id])
+
+  /// Efficient tail query for SSE: WHERE runId = ? AND id > cursor ORDER BY id
+  @@index([runId, id])
+}
