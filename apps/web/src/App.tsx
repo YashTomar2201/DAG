@@ -122,14 +122,22 @@ export function App() {
         zIndex: 100,
         flexShrink: 0
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 24, fontWeight: 'bold', fontFamily: 'var(--font-display)' }}>
-            <span style={{ color: 'var(--color-primary)' }}>✦</span> Claude DAG
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          {/* Anthropic-style radial spike mark */}
+          <svg width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M16 0L18.4 13.6L32 16L18.4 18.4L16 32L13.6 18.4L0 16L13.6 13.6L16 0Z" fill="var(--color-ink)"/>
+            <path d="M6 6L14.5 14.5L16 12L7.5 3.5L6 6Z" fill="var(--color-ink)"/>
+            <path d="M26 6L17.5 14.5L16 12L24.5 3.5L26 6Z" fill="var(--color-ink)"/>
+            <path d="M26 26L17.5 17.5L16 20L24.5 28.5L26 26Z" fill="var(--color-ink)"/>
+            <path d="M6 26L14.5 17.5L16 20L7.5 28.5L6 26Z" fill="var(--color-ink)"/>
+          </svg>
+          <span style={{ fontSize: 26, fontWeight: 400, fontFamily: 'var(--font-display)', letterSpacing: '-0.5px', color: 'var(--color-ink)', transform: 'translateY(1px)' }}>
+            Claude DAG
           </span>
-          <nav style={{ display: 'flex', gap: 24, marginLeft: 32 }}>
-            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Product</a>
-            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Solutions</a>
-            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Pricing</a>
+          <nav style={{ display: 'flex', gap: 28, marginLeft: 40 }}>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-ink)' }}>Design Analysis</a>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-muted)' }}>Workflows</a>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-muted)' }}>Settings</a>
           </nav>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>

@@ -4,11 +4,11 @@
  */
 
 const PALETTE_ITEMS = [
-  { type: 'kaggle.download',   label: 'Kaggle Download', icon: '📥', color: '#4f46e5' },
-  { type: 'pandas.preprocess', label: 'Preprocess',      icon: '🐼', color: '#0891b2' },
-  { type: 'torch.train',       label: 'Train',           icon: '🔥', color: '#ea580c' },
-  { type: 'model.evaluate',    label: 'Evaluate',        icon: '📊', color: '#16a34a' },
-  { type: 'registry.deploy',   label: 'Deploy',          icon: '🚀', color: '#7c3aed' },
+  { type: 'kaggle.download',   label: 'Kaggle Download', icon: '📥', color: 'var(--color-accent-teal)' },
+  { type: 'pandas.preprocess', label: 'Preprocess',      icon: '🐼', color: 'var(--color-primary)' },
+  { type: 'torch.train',       label: 'Train',           icon: '🔥', color: 'var(--color-accent-amber)' },
+  { type: 'model.evaluate',    label: 'Evaluate',        icon: '📊', color: 'var(--color-success)' },
+  { type: 'registry.deploy',   label: 'Deploy',          icon: '🚀', color: 'var(--color-primary-active)' },
 ];
 
 export function NodePalette() {

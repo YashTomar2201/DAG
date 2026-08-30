@@ -145,13 +145,6 @@ export function ConfigPanel() {
   );
 }
 
-const labelStyle: React.CSSProperties = {
-  display: 'block',
-  color: 'var(--color-muted)',
-  fontSize: 11,
-  marginBottom: 4,
-  fontWeight: 600,
-};
 
 const inputStyle: React.CSSProperties = {
   width: '100%',
@@ -165,17 +158,6 @@ const inputStyle: React.CSSProperties = {
   boxSizing: 'border-box',
 };
 
-const saveBtn: React.CSSProperties = {
-  background: 'var(--color-primary)',
-  color: 'var(--color-on-primary)',
-  border: 'none',
-  borderRadius: 'var(--radius-md)',
-  padding: '8px 0',
-  cursor: 'pointer',
-  fontWeight: 600,
-  fontSize: 13,
-  marginTop: 8,
-};
 
 const closeBtn: React.CSSProperties = {
   background: 'none',

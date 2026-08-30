@@ -11,11 +11,11 @@ import type { CSSProperties } from 'react';
 // ─── Node type metadata ───────────────────────────────────────────────────────
 
 const NODE_META: Record<string, { icon: string; color: string; label: string }> = {
-  'kaggle.download':    { icon: '📥', color: '#4f46e5', label: 'Kaggle Download' },
-  'pandas.preprocess':  { icon: '🐼', color: '#0891b2', label: 'Preprocess' },
-  'torch.train':        { icon: '🔥', color: '#ea580c', label: 'Train' },
-  'model.evaluate':     { icon: '📊', color: '#16a34a', label: 'Evaluate' },
-  'registry.deploy':    { icon: '🚀', color: '#7c3aed', label: 'Deploy' },
+  'kaggle.download':    { icon: '📥', color: 'var(--color-accent-teal)', label: 'Kaggle Download' },
+  'pandas.preprocess':  { icon: '🐼', color: 'var(--color-primary)', label: 'Preprocess' },
+  'torch.train':        { icon: '🔥', color: 'var(--color-accent-amber)', label: 'Train' },
+  'model.evaluate':     { icon: '📊', color: 'var(--color-success)', label: 'Evaluate' },
+  'registry.deploy':    { icon: '🚀', color: 'var(--color-primary-active)', label: 'Deploy' },
 };
 
 const STATUS_RING: Record<string, string> = {
@@ -52,10 +52,10 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
     minWidth: 160,
     cursor: 'pointer',
     boxShadow: selected
-      ? `0 0 0 3px ${meta.color}44`
+      ? `0 0 0 2px var(--color-surface-dark-elevated), 0 0 0 4px ${meta.color}`
       : isCycleNode
-      ? '0 0 12px var(--color-error)aa'
-      : '0 2px 8px #0004',
+      ? '0 0 0 2px var(--color-surface-dark-elevated), 0 0 0 4px var(--color-error)'
+      : '0 2px 8px rgba(0,0,0,0.4)',
     transition: 'box-shadow 0.2s, border-color 0.2s',
     position: 'relative',
   };
@@ -82,10 +82,10 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         <span style={{ fontSize: 20 }}>{meta.icon}</span>
         <span style={{
           fontSize: 10,
-          background: meta.color + '33',
+          border: `1px solid ${meta.color}`,
           color: meta.color,
           borderRadius: 'var(--radius-xs)',
-          padding: '1px 6px',
+          padding: '2px 6px',
           fontFamily: 'var(--font-code)',
           fontWeight: 600,
         }}>
