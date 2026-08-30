@@ -108,74 +108,88 @@ export function App() {
   }
 
   return (
-    <div style={{ display: 'flex', width: '100vw', height: '100vh', background: '#020617', overflow: 'hidden' }}>
-      <NodePalette />
-      
-      <main style={{ flex: 1, position: 'relative' }}>
-        {/* Top Toolbar */}
-        <div style={{
-          position: 'absolute',
-          top: 16,
-          left: 16,
-          zIndex: 10,
-          display: 'flex',
-          gap: 12,
-          background: '#0f172a',
-          padding: 8,
-          borderRadius: 8,
-          border: '1px solid #1e293b'
-        }}>
-          <button onClick={handleSave} style={btnStyle('#4f46e5')} disabled={!isDirty && !!workflowId}>
-            {isDirty ? 'Save (Unsaved Changes)' : 'Saved'}
+    <div style={{ display: 'flex', flexDirection: 'column', width: '100vw', height: '100vh', background: 'var(--color-canvas)', overflow: 'hidden' }}>
+      {/* Top Navigation */}
+      <header style={{
+        height: '64px',
+        backgroundColor: 'var(--color-canvas)',
+        color: 'var(--color-ink)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '0 32px',
+        borderBottom: '1px solid var(--color-hairline)',
+        zIndex: 100,
+        flexShrink: 0
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 24, fontWeight: 'bold', fontFamily: 'var(--font-display)' }}>
+            <span style={{ color: 'var(--color-primary)' }}>✦</span> Claude DAG
+          </span>
+          <nav style={{ display: 'flex', gap: 24, marginLeft: 32 }}>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Product</a>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Solutions</a>
+            <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500 }}>Pricing</a>
+          </nav>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <button className="btn-secondary" onClick={handleSave} disabled={!isDirty && !!workflowId}>
+            {isDirty ? 'Save Changes' : 'Saved'}
           </button>
-          <button onClick={handleRun} style={btnStyle('#10b981')} disabled={isDirty || !versionId}>
+          <button className="btn-primary" onClick={handleRun} disabled={isDirty || !versionId}>
             ▶ Run Pipeline
           </button>
-          
+        </div>
+      </header>
+
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
+        <NodePalette />
+
+        <main style={{ flex: 1, position: 'relative', background: 'var(--color-canvas)' }}>
+          {/* Run Status Indicator */}
           {activeRunId && (
             <div style={{
-              display: 'flex', alignItems: 'center', padding: '0 12px',
-              color: runStatus === 'RUNNING' ? '#facc15' : runStatus === 'SUCCEEDED' ? '#4ade80' : '#f87171',
-              fontWeight: 600, fontSize: 13, background: '#1e293b', borderRadius: 4
+              position: 'absolute',
+              top: 24,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 10,
+              display: 'flex', alignItems: 'center', padding: '6px 16px',
+              color: runStatus === 'RUNNING' ? 'var(--color-warning)' : runStatus === 'SUCCEEDED' ? 'var(--color-success)' : 'var(--color-error)',
+              fontWeight: 600, fontSize: 13, background: 'var(--color-surface-dark)', borderRadius: 'var(--radius-pill)',
+              border: '1px solid var(--color-surface-dark-elevated)',
+              boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
             }}>
               Status: {runStatus}
             </div>
           )}
-        </div>
 
-        <RunHistory workflowId={workflowId} />
+          <RunHistory workflowId={workflowId} />
 
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          nodeTypes={nodeTypes}
-          onDragOver={onDragOver}
-          onDrop={onDrop}
-          fitView
-        >
-          <Background color="#334155" gap={16} />
-          <Controls style={{ background: '#0f172a', border: '1px solid #1e293b' }} />
-        </ReactFlow>
+          {/* Product Surface: DAG Canvas */}
+          <div style={{ width: '100%', height: '100%', background: 'var(--color-surface-dark)', borderRadius: 'var(--radius-lg)', margin: '24px', overflow: 'hidden', border: '1px solid var(--color-surface-dark-elevated)' }}>
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onConnect={onConnect}
+              nodeTypes={nodeTypes}
+              onDragOver={onDragOver}
+              onDrop={onDrop}
+              fitView
+            >
+              <Background color="var(--color-surface-dark-soft)" gap={16} />
+              <Controls style={{ background: 'var(--color-surface-dark)', border: '1px solid var(--color-surface-dark-elevated)' }} />
+            </ReactFlow>
+          </div>
 
-        <LogDrawer />
-      </main>
+          <LogDrawer />
+        </main>
 
-      <ConfigPanel />
+        <ConfigPanel />
+      </div>
     </div>
   );
 }
 
-const btnStyle = (bg: string): React.CSSProperties => ({
-  background: bg,
-  color: '#fff',
-  border: 'none',
-  padding: '6px 16px',
-  borderRadius: 6,
-  fontWeight: 600,
-  fontSize: 13,
-  cursor: 'pointer',
-  opacity: 1
-});

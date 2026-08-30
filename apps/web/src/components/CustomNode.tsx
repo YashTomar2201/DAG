@@ -20,12 +20,12 @@ const NODE_META: Record<string, { icon: string; color: string; label: string }> 
 
 const STATUS_RING: Record<string, string> = {
   PENDING:   'transparent',
-  QUEUED:    '#a78bfa',
-  RUNNING:   '#facc15',
-  SUCCEEDED: '#4ade80',
-  FAILED:    '#f87171',
-  SKIPPED:   '#94a3b8',
-  CANCELLED: '#6b7280',
+  QUEUED:    'var(--color-muted-soft)',
+  RUNNING:   'var(--color-warning)',
+  SUCCEEDED: 'var(--color-success)',
+  FAILED:    'var(--color-error)',
+  SKIPPED:   'var(--color-muted-soft)',
+  CANCELLED: 'var(--color-muted-soft)',
 };
 
 const STATUS_PULSE: Record<string, boolean> = {
@@ -38,23 +38,23 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
   const cycleHighlight = useGraphStore((s) => s.cycleHighlight);
   const selectNode = useGraphStore((s) => s.selectNode);
 
-  const meta = NODE_META[String(data.nodeType)] ?? { icon: '⚙️', color: '#64748b', label: String(data.nodeType) };
+  const meta = NODE_META[String(data.nodeType)] ?? { icon: '⚙️', color: 'var(--color-muted)', label: String(data.nodeType) };
   const status = String(nodeStatus?.status ?? data.status ?? 'PENDING');
   const ringColor = STATUS_RING[status] ?? 'transparent';
   const isPulsing = STATUS_PULSE[status] ?? false;
   const isCycleNode = cycleHighlight.includes(id);
 
   const nodeStyle: CSSProperties = {
-    background: '#1e293b',
-    border: `2px solid ${isCycleNode ? '#ef4444' : selected ? meta.color : '#334155'}`,
-    borderRadius: 12,
+    background: 'var(--color-surface-dark-elevated)',
+    border: `2px solid ${isCycleNode ? 'var(--color-error)' : selected ? meta.color : 'var(--color-surface-dark-soft)'}`,
+    borderRadius: 'var(--radius-md)',
     padding: '10px 16px',
     minWidth: 160,
     cursor: 'pointer',
     boxShadow: selected
       ? `0 0 0 3px ${meta.color}44`
       : isCycleNode
-      ? '0 0 12px #ef4444aa'
+      ? '0 0 12px var(--color-error)aa'
       : '0 2px 8px #0004',
     transition: 'box-shadow 0.2s, border-color 0.2s',
     position: 'relative',
@@ -71,11 +71,11 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         height: 14,
         borderRadius: '50%',
         background: ringColor,
-        border: '2px solid #1e293b',
+        border: '2px solid var(--color-surface-dark-elevated)',
         animation: isPulsing ? 'pulse 1.2s ease-in-out infinite' : 'none',
       }} />
 
-      <Handle type="target" position={Position.Left} style={{ background: '#64748b' }} />
+      <Handle type="target" position={Position.Left} style={{ background: 'var(--color-muted-soft)' }} />
 
       {/* Icon + type badge */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
@@ -84,9 +84,9 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
           fontSize: 10,
           background: meta.color + '33',
           color: meta.color,
-          borderRadius: 4,
+          borderRadius: 'var(--radius-xs)',
           padding: '1px 6px',
-          fontFamily: 'monospace',
+          fontFamily: 'var(--font-code)',
           fontWeight: 600,
         }}>
           {String(data.nodeType)}
@@ -94,7 +94,7 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
       </div>
 
       {/* Label */}
-      <div style={{ color: '#f1f5f9', fontWeight: 600, fontSize: 13 }}>{String(data.label)}</div>
+      <div style={{ color: 'var(--color-on-dark)', fontWeight: 600, fontSize: 13 }}>{String(data.label)}</div>
 
       {/* Status badge */}
       {status !== 'PENDING' && (
@@ -102,7 +102,7 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
           marginTop: 4,
           fontSize: 10,
           color: ringColor,
-          fontFamily: 'monospace',
+          fontFamily: 'var(--font-code)',
           fontWeight: 600,
           letterSpacing: '0.05em',
         }}>
@@ -116,7 +116,7 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         <div style={{
           marginTop: 4,
           fontSize: 10,
-          color: '#fca5a5',
+          color: 'var(--color-error)',
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
@@ -126,7 +126,7 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         </div>
       )}
 
-      <Handle type="source" position={Position.Right} style={{ background: '#64748b' }} />
+      <Handle type="source" position={Position.Right} style={{ background: 'var(--color-muted-soft)' }} />
     </div>
   );
 }

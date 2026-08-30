@@ -21,31 +21,31 @@ export function GanttChart({ nodeRuns }: { nodeRuns: NodeRunSummary[] }) {
   const durationMs = Math.max(maxTime - minTime, 1000); // at least 1s
 
   return (
-    <div style={{ marginTop: 12, padding: 8, background: '#020617', borderRadius: 6 }}>
+    <div style={{ marginTop: 12, padding: 8, background: 'var(--color-surface-dark)', borderRadius: 'var(--radius-md)' }}>
       {validRuns.map(nr => {
         const start = new Date(nr.startedAt!).getTime();
         const end = nr.finishedAt ? new Date(nr.finishedAt).getTime() : Date.now();
         const leftPercent = ((start - minTime) / durationMs) * 100;
         const widthPercent = Math.max(((end - start) / durationMs) * 100, 1); // min 1% width
 
-        let color = '#3b82f6'; // RUNNING
-        if (nr.status === 'SUCCEEDED') color = '#22c55e';
-        else if (nr.status === 'FAILED') color = '#ef4444';
-        else if (nr.status === 'CANCELLED') color = '#6b7280';
+        let color = 'var(--color-primary)'; // RUNNING
+        if (nr.status === 'SUCCEEDED') color = 'var(--color-success)';
+        else if (nr.status === 'FAILED') color = 'var(--color-error)';
+        else if (nr.status === 'CANCELLED') color = 'var(--color-muted-soft)';
 
         return (
           <div key={nr.nodeKey} style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
-            <div style={{ width: 100, fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            <div style={{ width: 100, fontSize: 11, color: 'var(--color-on-dark-soft)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
               {nr.nodeKey}
             </div>
-            <div style={{ flex: 1, position: 'relative', height: 16, background: '#1e293b', borderRadius: 4 }}>
+            <div style={{ flex: 1, position: 'relative', height: 16, background: 'var(--color-surface-dark-soft)', borderRadius: 'var(--radius-xs)' }}>
               <div style={{
                 position: 'absolute',
                 left: `${leftPercent}%`,
                 width: `${widthPercent}%`,
                 height: '100%',
                 background: color,
-                borderRadius: 4,
+                borderRadius: 'var(--radius-xs)',
                 opacity: 0.8
               }} />
             </div>

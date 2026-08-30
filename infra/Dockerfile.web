@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build for the visual editor (apps/web).
+#
+# Unlike api/worker, this produces a genuinely static build: Vite bundles
+# everything (React, Zustand, React Flow, @dag/graph-core, @dag/contracts)
+# into plain JS/CSS/HTML — no Node.js process needed at runtime, no tsx
+# workaround required. The runtime stage is nginx serving static files,
+# about as slim as this gets.
+#
+# VITE_API_URL is a BUILD-time argument, not a runtime env var: Vite inlines
+# `import.meta.env.VITE_API_URL` into the bundled JS at build time (see
+# apps/web/src/api/client.ts) because the code that reads it runs in the
+# user's browser, not in this container — there is no running Node process
+# here to read a runtime environment variable from. Changing the API URL
+# means rebuilding this image with a different --build-arg, not editing an
+# env var on a running container.
+
+FROM node:22-alpine AS base
+RUN corepack enable && corepack prepare pnpm@11.6.0 --activate
+WORKDIR /app
+ENV CI=true
+
+FROM base AS fetch
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm fetch
+
+FROM fetch AS build
+COPY . .
+RUN pnpm install --offline --frozen-lockfile
+ARG VITE_API_URL=http://localhost:3001
+ENV VITE_API_URL=${VITE_API_URL}
+RUN pnpm --filter @dag/web build
+
+FROM nginx:1.27-alpine AS runtime
+COPY --from=build /app/apps/web/dist /usr/share/nginx/html
+COPY infra/nginx.web.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80

@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build for the control plane (apps/api).
+#
+# Stages: fetch (pnpm store, cached by lockfile only) -> build (full source +
+# Prisma client codegen + `pnpm deploy`) -> runtime (fresh, slim base +
+# only the deployed, prod-only, self-contained package).
+#
+# Why `tsx` at runtime instead of a `tsc`-compiled `dist/`:
+#   packages/contracts, graph-core, db, and queue are pure TypeScript source —
+#   each one's package.json points "main" straight at "./src/index.ts" (see
+#   packages/db/package.json). That's deliberate: `workspace:*` resolves to
+#   real TS source with no publish/build step, so a change to graph-core is
+#   instantly visible to every consumer (see ADR-001 in
+#   knowledge_base/architecture.md). The cost of that convenience is that a
+#   plain `node dist/index.js` cannot `require('@dag/db')` — Node has no
+#   idea how to execute the `.ts` file that import resolves to. `tsx` is
+#   already how every dev script, and every Phase 12 test/benchmark, runs
+#   this codebase; running it in Docker too keeps dev and prod on the exact
+#   same code path instead of introducing a second, less-exercised build
+#   pipeline. See decisions_log.md "Why tsx in production" for the full
+#   trade-off writeup.
+#
+# Why `pnpm deploy`, not `pnpm prune --prod`:
+#   `pnpm prune` (without a workspace-recursive mode — it doesn't have one)
+#   only understands the package.json of the directory it's run from. Run
+#   from the monorepo root, it decided every package apps/api's OWN
+#   package.json declares (express, tsx, bullmq, ...) was "extraneous" to
+#   the ROOT's dependencies and deleted all of it — not a selective prune,
+#   a near-total wipe of apps/api's node_modules. `pnpm deploy` is pnpm's
+#   purpose-built answer to "produce a self-contained, prod-only directory
+#   for ONE workspace package": it resolves that package's `workspace:*`
+#   dependencies into real file copies (not symlinks into a shared store
+#   the runtime image wouldn't otherwise have) and installs only
+#   `dependencies`, correctly, per-package. It's marked "Experimental" by
+#   pnpm but is the tool actually designed for this job.
+
+FROM node:22-alpine AS base
+RUN apk add --no-cache openssl && corepack enable && corepack prepare pnpm@11.6.0 --activate
+WORKDIR /app
+ENV CI=true
+
+# ── fetch: populate the pnpm store from the lockfile alone ─────────────────
+# This layer only invalidates when a dependency actually changes, not on
+# every source edit — the expensive network fetch is cached independently
+# of `COPY . .` below.
+FROM base AS fetch
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN pnpm fetch
+
+# ── build: install from the (offline) store + generate the Prisma client ───
+# This is also the stage the `migrate` compose service targets directly —
+# it needs the Prisma CLI (a devDependency `pnpm deploy --prod` below
+# deliberately excludes) and nothing this stage produces after that.
+FROM fetch AS build
+COPY . .
+RUN pnpm install --offline --frozen-lockfile
+RUN pnpm --filter @dag/db exec prisma generate --schema=./prisma/schema.prisma
+
+# ── deploy: the self-contained, prod-only package for this app alone ───────
+FROM build AS deploy
+RUN pnpm --filter @dag/api deploy --prod --legacy /out
+
+# ── runtime: fresh slim base, only the deployed package copied in ──────────
+FROM base AS runtime
+ENV NODE_ENV=production
+COPY --from=deploy /out ./
+EXPOSE 3001
+CMD ["node_modules/.bin/tsx", "src/index.ts"]

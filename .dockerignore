@@ -1,0 +1,26 @@
+# Mirrors .gitignore, plus things that are never needed inside a build context.
+node_modules
+**/node_modules
+dist
+**/dist
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+
+artifacts
+benchmarks
+
+.git
+.vscode
+.idea
+
+packages/db/src/generated
+
+*.log
+npm-debug.log*
+
+# Never send Docker's own build metadata back into itself
+Dockerfile*
+.dockerignore

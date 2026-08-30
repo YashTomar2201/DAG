@@ -54,15 +54,17 @@ export function ConfigPanel() {
   if (!node) {
     return (
       <aside style={{
-        width: 260,
-        background: '#0f172a',
-        borderLeft: '1px solid #1e293b',
-        padding: 20,
+        width: 300,
+        background: 'var(--color-canvas)',
+        borderLeft: '1px solid var(--color-hairline)',
+        padding: 32,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        color: '#334155',
-        fontSize: 13,
+        color: 'var(--color-muted)',
+        fontSize: 14,
+        textAlign: 'center',
+        fontStyle: 'italic'
       }}>
         Select a node to configure
       </aside>
@@ -81,66 +83,71 @@ export function ConfigPanel() {
 
   return (
     <aside style={{
-      width: 260,
-      background: '#0f172a',
-      borderLeft: '1px solid #1e293b',
-      padding: 16,
+      width: 300,
+      background: 'var(--color-surface-dark)',
+      color: 'var(--color-on-dark)',
+      borderLeft: '1px solid var(--color-surface-dark-soft)',
+      padding: '32px 24px',
       overflowY: 'auto',
       display: 'flex',
       flexDirection: 'column',
-      gap: 12,
+      gap: 24,
     }}>
       {/* Header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em' }}>
-          NODE CONFIG
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <div className="caption-uppercase" style={{ color: 'var(--color-on-dark-soft)' }}>
+          Node Configuration
         </div>
         <button onClick={() => selectNode(null)} style={closeBtn}>✕</button>
       </div>
 
       {/* Node label */}
-      <div>
-        <label style={labelStyle}>Label</label>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <label className="caption" style={{ color: 'var(--color-on-dark-soft)' }}>Label</label>
         <input
           value={label}
           onChange={(e) => setLabel(e.target.value)}
           onBlur={() => updateNodeConfig(node.id, { ...localConfig })}
+          className="code"
           style={inputStyle}
           placeholder="Node label"
         />
       </div>
 
-      <div style={{ color: '#334155', fontSize: 10, fontFamily: 'monospace' }}>
+      <div className="code" style={{ color: 'var(--color-on-dark-soft)', fontSize: 11, opacity: 0.6 }}>
         type: {node.data.nodeType}
       </div>
-      <div style={{ borderTop: '1px solid #1e293b' }} />
+      <div style={{ borderTop: '1px solid var(--color-surface-dark-soft)', margin: '8px 0' }} />
 
       {/* Config fields */}
-      {fields.map((field) => (
-        <div key={field.key}>
-          <label style={labelStyle}>{field.label}</label>
-          <input
-            type={field.type}
-            value={String(localConfig[field.key] ?? '')}
-            placeholder={field.placeholder}
-            onChange={(e) => handleFieldChange(field.key, e.target.value)}
-            style={inputStyle}
-          />
-        </div>
-      ))}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+        {fields.map((field) => (
+          <div key={field.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label className="caption" style={{ color: 'var(--color-on-dark-soft)' }}>{field.label}</label>
+            <input
+              type={field.type}
+              value={String(localConfig[field.key] ?? '')}
+              placeholder={field.placeholder}
+              onChange={(e) => handleFieldChange(field.key, e.target.value)}
+              className="code"
+              style={inputStyle}
+            />
+          </div>
+        ))}
+      </div>
 
       {fields.length === 0 && (
-        <div style={{ color: '#475569', fontSize: 12 }}>No configuration fields for this node type.</div>
+        <div className="body-sm" style={{ color: 'var(--color-on-dark-soft)', opacity: 0.7 }}>No configuration fields for this node type.</div>
       )}
 
-      <button onClick={handleSave} style={saveBtn}>Save Config</button>
+      <button onClick={handleSave} className="btn-primary" style={{ marginTop: 'auto' }}>Save Config</button>
     </aside>
   );
 }
 
 const labelStyle: React.CSSProperties = {
   display: 'block',
-  color: '#94a3b8',
+  color: 'var(--color-muted)',
   fontSize: 11,
   marginBottom: 4,
   fontWeight: 600,
@@ -148,21 +155,21 @@ const labelStyle: React.CSSProperties = {
 
 const inputStyle: React.CSSProperties = {
   width: '100%',
-  background: '#1e293b',
-  border: '1px solid #334155',
-  borderRadius: 6,
-  color: '#f1f5f9',
+  background: 'var(--color-surface-dark-soft)',
+  border: '1px solid var(--color-surface-dark-elevated)',
+  borderRadius: 'var(--radius-md)',
+  color: 'var(--color-on-dark)',
   fontSize: 13,
-  padding: '6px 10px',
+  padding: '8px 12px',
   outline: 'none',
   boxSizing: 'border-box',
 };
 
 const saveBtn: React.CSSProperties = {
-  background: '#4f46e5',
-  color: '#fff',
+  background: 'var(--color-primary)',
+  color: 'var(--color-on-primary)',
   border: 'none',
-  borderRadius: 8,
+  borderRadius: 'var(--radius-md)',
   padding: '8px 0',
   cursor: 'pointer',
   fontWeight: 600,
@@ -173,7 +180,7 @@ const saveBtn: React.CSSProperties = {
 const closeBtn: React.CSSProperties = {
   background: 'none',
   border: 'none',
-  color: '#64748b',
+  color: 'var(--color-on-dark-soft)',
   cursor: 'pointer',
   fontSize: 14,
   padding: 4,

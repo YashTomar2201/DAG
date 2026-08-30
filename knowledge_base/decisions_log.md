@@ -457,4 +457,125 @@ Running `pnpm -r lint` across the whole repository while closing out Phase 12 su
 
 ### Decision: `startRun`/`retryFailedNodesService` Bugs Found by Testing, Fixed in Place
 
-**Why:** Writing the integration suite surfaced two real defects (detailed in architecture.md's Phase 12 section): `startRun` returned a stale pre-transition object, and `retryFailedNodesService` never re-dispatched the nodes it reset. Both were fixed directly in `orchestrator.service.ts`/`run.service.ts` rather than worked around in the test. The workflow's own guardrail is explicit here — "if an acceptance check fails, stop and report; do not soften the check" — and softening would have meant either relaxing the test's assertions (masking a real bug from every future reader) or leaving the bug undocumented. Both are exactly the kind of defect a mocked test cannot surface: a mock of `tryTransitionRun` would have returned whatever the test told it to, never exposing that the *caller* ignored its own return value.
+**Why:** See architecture.md's Phase 12 section for the full description of both bugs. Both were fixed directly in `orchestrator.service.ts`/`run.service.ts` rather than worked around in the test. The workflow's own guardrail is explicit here — "if an acceptance check fails, stop and report; do not soften the check" — and softening would have meant either relaxing the test's assertions (masking a real bug from every future reader) or leaving the bug undocumented. Both are exactly the kind of defect a mocked test cannot surface: a mock of `tryTransitionRun` would have returned whatever the test told it to, never exposing that the *caller* ignored its own return value.
+
+---
+
+## Phase 13 — Containerisation and Horizontal Scaling
+
+### Decision: Run Production Containers via `tsx`, Not a `tsc`-Compiled `dist/`
+
+**Why:** `packages/contracts`, `graph-core`, `db`, and `queue` are pure TypeScript source — each package's `package.json` points `"main"` straight at `./src/index.ts` (see ADR-001's zero-publish-step rationale in architecture.md's Phase 0 section). That's a deliberate Phase 0 decision: `workspace:*` resolves directly to source, so a change to `graph-core` is instantly visible to every consumer with no build step and no version drift. The cost of that convenience only shows up at the very end of the pipeline, in production: a `tsc`-compiled `apps/api/dist/index.js` still contains `require('@dag/db')`, and Node's CommonJS resolution follows that straight to `packages/db/package.json`'s `"main": "./src/index.ts"` — a `.ts` file plain `node` cannot execute. Three options existed:
+
+1. **Give every package a real build step** (its own `tsc` compiling to `dist/`, `"main"` repointed there) — the textbook-correct fix, but it reopens the exact trade-off Phase 0 deliberately closed (a publish/build step between packages), touches five packages this phase didn't otherwise need to change, and risks subtly breaking the "instant visibility of a change" property the whole monorepo is built around.
+2. **Bundle each app with esbuild/ncc into one self-contained JS file** — solves the resolution problem without a build step per package, but introduces a new build tool and a new class of bug (bundler-specific resolution quirks) for a project whose whole point is depth in the parts that matter (graph algorithms, distributed dispatch), not packaging cleverness.
+3. **Run via `tsx` in production, exactly as dev already does** (chosen) — `tsx` is already how every `pnpm dev` script runs, and how every Phase 12 integration test and the scale-test benchmark spawned real worker processes. Docker just runs the identical command. No new code path gets introduced at the one moment (production) that matters most for correctness.
+
+**Trade-off:** Every container pays a small on-the-fly transpilation cost at startup (milliseconds, not seconds, in practice) instead of shipping pre-compiled JS, and `tsx` itself has to ship in the runtime image rather than being a discardable build-time-only tool. Acceptable for a project at this scale; a team optimizing cold-start latency at real production scale would eventually want option 1.
+
+### Decision: `tsx` Moved from `devDependencies` to `dependencies` in `apps/api`/`apps/worker`
+
+**Why:** Consequence of the decision above. The Dockerfile's runtime stage runs `pnpm prune --prod` to strip devDependencies out of the already-installed `node_modules` (see the `pnpm prune --prod` decision below) — if `tsx` stayed a devDependency, prune would remove the very binary the container's `CMD` needs to run, and the container would fail to start. Moving it to `dependencies` is a direct, honest reflection of reality: `tsx` is not a dev-only tool in this project, it's the production runtime interpreter.
+
+### Decision: `pnpm fetch` → full install → `pnpm prune --prod` (Not a Second Install)
+
+**Why:** The standard advice for a slim pnpm-in-Docker image is "install once with devDependencies (needed for codegen/build steps), then produce a second, prod-only install for the runtime image." The naive way to do that second install is to run `pnpm install --offline --prod` again in a fresh stage — but that requires the pnpm content-addressable store to still be present and correctly populated in that stage, adding another `pnpm fetch`-equivalent layer to keep in sync. `pnpm prune --prod` instead takes the tree that's *already installed* (from the one `pnpm install` in the `build` stage) and removes devDependency packages from it **in place** — a lighter, single-source-of-truth operation: there is only ever one `pnpm install` in the whole build, and pruning is a deterministic function of it, not a second independent resolution that could in principle disagree with the first.
+
+### Decision: `apk add python3` in the Worker Image, Deliberately Not `pip install pandas torch`
+
+**Why:** PROJECT_GUIDE.md's reference use case describes `torch.train` as running "custom architectures / hybrid loss functions" — but the actual fixture scripts (`apps/worker/python/*.py`, documented in Phase 12) are pure-stdlib stand-ins that exist to exercise the real Node↔Python bridge, idempotency, and heartbeat machinery under test and load, and deliberately never import `pandas` or `torch` (see the Phase 12 "why the fixtures avoid heavy ML dependencies" note). Installing real PyTorch wheels (typically several hundred MB to multiple GB, especially with CUDA support) into this image would be pure image bloat for code that never imports them — directly working against this phase's own "slim runtime" goal for zero functional benefit. The Dockerfile's header comment names the exact line (`RUN pip3 install -r requirements.txt`) a deployment with real ML scripts would add, so the gap is a documented, deliberate scope boundary, not an oversight.
+
+### Decision: `packageManager` Field Pinned, Base Image Bumped to `node:22-alpine`
+
+**Why:** Two related build failures, both worth recording because neither was where the error message pointed first.
+
+1. `corepack enable` with no version pin downloads whatever pnpm currently ships as "latest" — which requires Node.js ≥22.13 and refuses to run under Node 20 at all (`this version of pnpm requires at least Node.js v22.13`). Adding `packageManager: "pnpm@11.6.0"` to the root `package.json` (matching the version already used locally and in every other phase of this project) and calling `corepack prepare pnpm@11.6.0 --activate` explicitly in each Dockerfile's base stage pins the exact version — but only once `package.json` is actually present in the build context at that point, which required also adding it to the `fetch` stage's `COPY` (it was previously copied only in the later `build` stage, after the fetch step had already run).
+2. Pinning to 11.6.0 did **not** fix the underlying problem: pnpm 11.6.0 itself — the same version installed locally on this project's own dev machine, under local Node 22.14 — imports `node:sqlite`, a Node.js builtin only available from Node 22.5 onward. This was never a "corepack grabbed the wrong version" bug; pnpm 11.x genuinely requires Node 22, full stop, and the local dev environment had simply never surfaced this because it already runs Node 22. The real fix was bumping every Dockerfile's base image from `node:20-alpine` to `node:22-alpine` — which PROJECT_GUIDE.md's tech-stack table ("Node.js 20+") already permits, since "+" means 20 or newer, not exactly 20.
+
+The lesson generalizes: a Docker build is the first time a project's *actual* toolchain requirements get checked against a truly clean, minimal environment — no locally-installed Node version quietly satisfying an unstated requirement. This is the same category of value Testcontainers provided in Phase 12 (real infrastructure surfaces real bugs mocks/assumptions can't), just applied to the build environment instead of the runtime one.
+
+### Decision: `migrate` Service Builds from the `build` Target, Not `runtime`
+
+**Why:** `prisma migrate deploy` needs the Prisma CLI, which is a devDependency of `packages/db` — exactly the kind of package `pnpm prune --prod` (used to produce the slim `runtime` target) deliberately removes. Rather than add the Prisma CLI back into the runtime image (permanently paying its weight in every API/worker container, forever, for a command that only ever runs once at cluster startup), the `migrate` compose service targets Dockerfile.api's `build` stage directly — the one stage that still has every devDependency installed. This keeps the *actual* runtime images (`api`, `worker`) as slim as `pnpm prune --prod` can make them, while the migration runner — which exists for seconds per deployment, not for the cluster's lifetime — pays the (irrelevant, one-time) cost of a fuller image.
+
+### Decision: `service_completed_successfully` Gates API/Worker Startup on the Migration, Not a Fixed Sleep
+
+**Why:** The naive alternative — start API/worker after a fixed delay, or after Postgres merely reports `healthy` — races against the schema itself. `pg_isready` (Postgres's own healthcheck) only proves the database process is accepting connections; it says nothing about whether `NodeRun`, `RunEvent`, and every other table `@dag/db`'s repository helpers assume exist have actually been created yet. Docker Compose's `depends_on: { migrate: { condition: service_completed_successfully } }` makes "the schema is migrated" an explicit precondition the orchestrator enforces structurally — API and worker containers simply do not start their entrypoint process until the `migrate` container has exited with code 0. No fixed sleep to tune, no race to get unlucky with on a slower machine.
+
+### Decision: Workers Take Zero Compose-Level Per-Replica Configuration
+
+**Why:** This is the direct verification of PROJECT_GUIDE §4's "workers are stateless and replica-safe" claim, not just an assertion of it. The `worker` service definition has no `container_name` (which would collide across replicas — Compose would refuse to start a second one), no per-instance environment override, and no manual `WORKER_ID` assignment. `docker compose up --scale worker=4` creates four containers from the *identical* service definition; each one's `WORKER_ID` falls back to `worker-${process.pid}` (`apps/worker/src/worker.ts`) — a real process ID, unique per container by construction, needing no coordination between replicas. If workers held any in-process run state (a queue-position counter, a cache of "which nodes I've already seen"), this configuration would immediately break — two replicas would produce colliding or duplicate `workerId`s or worse, duplicate work. That it doesn't need to break is the whole point of the "control plane owns scheduling, workers stay dumb" decision from Phase 6: the workers have nothing distinguishing them from one another except their own process identity, so scaling them is adding interchangeable capacity, not provisioning N different things.
+
+### Decision: One Shared Named Volume for `ARTIFACT_DIR`, Mounted Only Into Workers
+
+**Why:** PROJECT_GUIDE §4's "preprocess on worker 1, train on worker 2" scenario only works if every worker container sees every other worker's output files at the identical path — with N independent container filesystems and no shared volume, `train`'s worker would look for `preprocess`'s `metadata.csv` at a path that simply doesn't exist in its own container, a guaranteed failure the moment two dependent nodes in the same run land on different worker replicas (which `docker compose up --scale worker=4` makes likely for anything beyond a trivial single-node graph). A Docker named volume (`artifact_data`) mounted at the same container path (`/data/artifacts`) in every worker replica gives every worker process an identical view of the shared filesystem, functionally equivalent to a real deployment's shared network filesystem or object store. The `api` service does **not** mount this volume: the control plane never reads or writes artifact files directly — `NodeRun.output` only ever holds the small JSON reference object (a path string, a checksum, a row count — see Phase 7's 64 KB output contract), never the artifact's actual bytes — so mounting the volume into `api` would add a dependency with no corresponding code path that uses it.
+
+---
+
+## Phase 14 — Documentation Consolidation
+
+### Decision: `KNOWN_LIMITATIONS.md` Lives at the Repo Root, Not Inside `knowledge_base/`
+
+**Why:** A limitations file buried in a subdirectory is invisible to anyone doing a quick repository
+scan. Placing it at the root, next to `README.md`, makes a deliberate statement: the authors have
+thought about what the system *doesn't* do and are not hiding it. In a hiring or code-review
+context, the ability to enumerate your own gaps precisely — and sketch what closing each one
+requires — is a stronger signal of ownership than a system that appears flawless because no one
+wrote down the edge cases.
+
+**Trade-off:** It adds one more file to the root, which is already fairly populated. Acceptable —
+`README.md`, `PROJECT_GUIDE.md`, and `KNOWN_LIMITATIONS.md` are all entry points for different
+reader types (quickstart, architecture, honest audit) and benefit from equal prominence.
+
+---
+
+### Decision: 10 Limitations Listed — What Was Included and What Was Deliberately Omitted
+
+**Included:**
+- Multi-tenancy auth gap — because it's a security boundary, not just a feature gap. An
+  interviewer asking "how would you productionise this?" will ask about auth first.
+- Shared volume vs. object storage — because it's the first thing that *silently breaks* in a
+  real Kubernetes deployment, with no error message, just a missing file.
+- Uncommitted Prisma migrations — because it's a correctness gap: `migrate deploy` in a fresh
+  environment would fail without committed migration files.
+- Lint backlog — because not recording it would be dishonest; it was already noted in
+  decisions_log Phase 12.
+
+**Omitted:**
+- "No UI authentication" — deliberately redundant with the multi-tenancy auth gap entry; listing
+  both would read as padding.
+- "No pagination on `GET /runs/:id/events`" — genuinely minor; the `Last-Event-ID` cursor already
+  gives incremental delivery and the endpoint is SSE, not a paginated REST resource.
+- "No distributed tracing (OpenTelemetry)" — a real gap in a production system, but orthogonal to
+  the architectural claims this project makes. Listing it would imply it was planned and dropped,
+  which it wasn't; it was always out of scope.
+
+---
+
+### Decision: System Design Walkthrough Format — Narrative, Not Bullet Points
+
+**Why:** An interviewer asking "walk me through your system" is not asking for a list of
+components. They want to hear you *think* — how one decision leads to the next, how the pieces
+connect, what trade-offs you made and why. A bullet-point answer ("1. User draws graph. 2. API
+validates. 3. Worker runs.") is easy to produce and easy to forget. A narrative that follows a
+single request from the browser click to the SSE frame the browser receives is:
+- Harder to fake without genuine understanding
+- Self-organising (each sentence sets up the next)
+- Interview-proven: it lets the interviewer interrupt naturally at any technical junction ("wait,
+  why a Lua script there?") and receive a complete answer without disrupting the flow
+
+The walkthrough in `system_design_walkthrough.md` is written to be spoken, not read. It is
+structured as six numbered steps that map exactly to the architecture diagram on the whiteboard,
+so the interviewer can follow along visually.
+
+---
+
+### Decision: Phase 14 Adds No Code — Only Documents What Was Built
+
+**Why:** The build-dag-engine workflow is explicit: "do not soften the check and do not skip
+ahead." Phase 14's acceptance check is "a reader who has never seen the repo can go from clone
+to a successful pipeline run using only the README, and every ADR referenced in the index exists."
+Both are already true from Phase 13. Adding new code features in a documentation phase would
+either be Phase 15 scope creep (introducing new risk right before the final deliverable) or
+cosmetic changes dressed up as features. The honest deliverable is exactly what the workflow
+specifies: consolidation, not extension.

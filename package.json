@@ -2,6 +2,7 @@
   "name": "dag-engine",
   "version": "1.0.0",
   "private": true,
+  "packageManager": "pnpm@11.6.0",
   "scripts": {
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",

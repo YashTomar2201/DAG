@@ -251,8 +251,8 @@ errorHandler(err, req, res, next) ← maps errors to HTTP codes
 | 10 — SSE streaming | ✅ Complete | Replay+pub/sub, heartbeat, log buffering, 12 tests |
 | 11 — Visual editor | ✅ Complete | React Flow UI, Zustand sliced stores, Cycle detection in browser, Config Panel |
 | 12 — Testing | ✅ Complete | Testcontainers integration suite, deterministic race test, `/metrics`, scale test |
-| 13 — Containerisation | ⏳ Pending | Docker multi-stage builds |
-| 14 — Docs consolidation | ⏳ Pending | MASTER-QA, walkthrough |
+| 13 — Containerisation | ✅ Complete | Multi-stage Dockerfiles, migrate one-shot service, shared artifact volume, replica-safe workers |
+| 14 — Docs consolidation | ✅ Complete | KNOWN_LIMITATIONS.md, system_design_walkthrough.md, architecture.md updated |
 
 ---
 
@@ -595,3 +595,47 @@ Because `@dag/graph-core` was designed with a strict zero-dependency rule, the e
 ### Dynamic Configuration Forms
 
 Instead of writing bespoke React forms for each new Node type, the right-side `ConfigPanel` derives its form structure from metadata defined alongside the schemas (in Phase 11, mocked in the frontend for simplicity, but strictly aligned with the `@dag/contracts` schemas). When a node is selected, its required fields map to generic input elements, and state is pushed to `graphSlice` on blur. This means adding a new executor type (e.g. `snowflake.query`) only requires updating backend schemas and executor logic — the UI automatically supports configuring it.
+
+---
+
+## Phase 14 — Documentation Consolidation
+
+Phase 14 produces three top-level documentation deliverables. No code changes are required — this
+phase validates and consolidates what Phases 0–13 built.
+
+### Deliverables
+
+| File | Purpose |
+|------|---------| 
+| `KNOWN_LIMITATIONS.md` (repo root) | Honest audit of 10 gaps: multi-tenancy auth, scheduled triggers, dynamic fan-out, object storage, conditional branching, real ML executors, multi-machine scale proof, lint backlog, uncommitted migrations, unprotected `/metrics`. Each entry names the gap, explains what breaks without it, and sketches the fix. |
+| `knowledge_base/system_design_walkthrough.md` | The 5-minute verbal narrative covering the full request lifecycle (canvas → edge validation → graph version → startRun → dispatch → Lua decrement → worker execution → SSE update → browser paint), the two standard follow-up questions (10k workflows, what breaks first), and a quick-reference table of every phase's core decision and one-sentence rationale. |
+| `knowledge_base/architecture.md` (this file) | Phase Status table updated; Phase 14 section added. |
+
+### Why `KNOWN_LIMITATIONS.md` Belongs at the Repo Root
+
+Limitation files that live inside `docs/` or `knowledge_base/` get skipped by reviewers scanning
+the repo. Placing it at the root alongside `README.md` makes the engineering candidacy claim
+credible: someone who can name exactly what their system doesn't do, and sketch what it would take
+to close each gap, demonstrates deeper ownership than someone who presents only what works.
+
+### ADR Cross-Reference
+
+The following ADRs were written in the course of building the system and are summarised throughout
+this file in the relevant Phase sections:
+
+| ADR | Phase | Topic |
+|-----|-------|-------|
+| ADR-001 | 0 | Monorepo structure and zero-dep `graph-core` |
+| ADR-002 | 2 | Iterative DFS cycle detection + Kahn's topological sort |
+| ADR-003 | 3 | Immutable `WorkflowVersion`, conditional update, append-only `RunEvent` |
+| ADR-004 | 5 | Redis + BullMQ choice, Lua atomic in-degree, three-queue split |
+| ADR-005 | 6 | Control plane owns scheduling (workers stay dumb) |
+| ADR-006 | 8 | Worker executor registry, Node↔Python bridge, idempotency |
+| ADR-007 | 9 | Retryable vs. unrecoverable error taxonomy, jitter backoff, semaphore |
+| ADR-008 | 11 | Zustand sliced stores, React Flow controlled model, client-side cycle detection |
+| ADR-009 | 13 | Multi-stage Dockerfiles, `tsx` in production, `migrate` one-shot service |
+
+The full rationale for every decision above is in `knowledge_base/decisions_log.md`.
+Interview Q&A for every phase is in `knowledge_base/interview_qa.md`.
+The 5-minute walkthrough and scaling answers are in `knowledge_base/system_design_walkthrough.md`.
+Honest system gaps are in `KNOWN_LIMITATIONS.md` at the repo root.

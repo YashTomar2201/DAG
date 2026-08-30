@@ -20,17 +20,17 @@ export function NodePalette() {
 
   return (
     <aside style={{
-      width: 180,
-      background: '#0f172a',
-      borderRight: '1px solid #1e293b',
-      padding: '16px 12px',
+      width: 240,
+      background: 'var(--color-canvas)',
+      borderRight: '1px solid var(--color-hairline)',
+      padding: '24px 16px',
       display: 'flex',
       flexDirection: 'column',
-      gap: 8,
+      gap: 12,
       overflowY: 'auto',
     }}>
-      <div style={{ color: '#64748b', fontSize: 11, fontWeight: 700, letterSpacing: '0.1em', marginBottom: 8 }}>
-        NODE PALETTE
+      <div className="caption-uppercase" style={{ color: 'var(--color-muted)', marginBottom: 16, textAlign: 'center' }}>
+        Node Palette
       </div>
       {PALETTE_ITEMS.map((item) => (
         <div
@@ -40,33 +40,33 @@ export function NodePalette() {
           style={{
             display: 'flex',
             alignItems: 'center',
-            gap: 10,
-            padding: '10px 12px',
-            background: '#1e293b',
-            border: `1px solid ${item.color}44`,
-            borderRadius: 8,
+            gap: 12,
+            padding: '16px',
+            background: 'var(--color-surface-card)',
+            border: '1px solid var(--color-hairline)',
+            borderRadius: 'var(--radius-lg)',
             cursor: 'grab',
-            color: '#f1f5f9',
-            fontSize: 13,
-            fontWeight: 500,
-            transition: 'background 0.15s, transform 0.1s',
+            color: 'var(--color-ink)',
+            transition: 'transform 0.1s, background-color 0.15s',
             userSelect: 'none',
           }}
           onMouseEnter={(e) => {
-            (e.currentTarget as HTMLElement).style.background = `${item.color}22`;
+            (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-cream-strong)';
+            (e.currentTarget as HTMLElement).style.transform = 'translateY(-2px)';
           }}
           onMouseLeave={(e) => {
-            (e.currentTarget as HTMLElement).style.background = '#1e293b';
+            (e.currentTarget as HTMLElement).style.background = 'var(--color-surface-card)';
+            (e.currentTarget as HTMLElement).style.transform = 'translateY(0)';
           }}
         >
-          <span style={{ fontSize: 18 }}>{item.icon}</span>
+          <span style={{ fontSize: 20 }}>{item.icon}</span>
           <div>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>{item.label}</div>
-            <div style={{ fontSize: 10, color: item.color, fontFamily: 'monospace' }}>{item.type}</div>
+            <div className="title-sm" style={{ lineHeight: 1.2 }}>{item.label}</div>
+            <div className="code" style={{ fontSize: 11, color: 'var(--color-muted)' }}>{item.type}</div>
           </div>
         </div>
       ))}
-      <div style={{ color: '#334155', fontSize: 10, marginTop: 8, lineHeight: 1.5 }}>
+      <div className="body-sm" style={{ color: 'var(--color-muted-soft)', marginTop: 24, textAlign: 'center', fontStyle: 'italic' }}>
         Drag onto canvas to add a node
       </div>
     </aside>

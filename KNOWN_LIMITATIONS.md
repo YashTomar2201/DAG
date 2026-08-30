@@ -1,0 +1,207 @@
+# Known Limitations
+
+This document is an honest audit of what this system does *not* do, and what the real cost of
+closing each gap would be. Being able to name your own limitations and sketch the fix is more
+valuable than pretending they don't exist.
+
+---
+
+## 1. Multi-Tenancy Is Namespace-Only, Not Isolated
+
+**What exists:** Every `Workflow`, `Run`, and `NodeRun` row carries a `tenantId` column, and the
+API reads `tenantId` from a request header that is passed through as-is.
+
+**What is missing:**
+- No authentication or token verification — any caller can pass any `tenantId`.
+- No row-level security (RLS) in Postgres — a bug in one API service function could query across
+  tenants.
+- Redis keys (`run:{runId}:indegree`, `run:{runId}:dispatched`) are keyed by `runId` alone, not
+  `tenantId`. Two tenants sharing a Redis instance get no namespace separation at the broker layer.
+- The per-run concurrency semaphore (`run:{id}:slots`) is likewise not tenant-scoped, so one
+  tenant's fan-out can consume the entire cluster's capacity budget.
+
+**To close it:**
+- Add JWT/API-key authentication middleware that sets `req.tenantId` from a verified token, not
+  from a raw header.
+- Enable Postgres RLS on `NodeRun`, `Run`, and `Workflow` so a leaked `tenantId` cannot read
+  another tenant's data even if the application layer fails.
+- Namespace Redis keys as `{tenantId}:{runId}:indegree` (or use Redis ACLs to restrict key
+  patterns per tenant).
+- Add a per-tenant concurrency quota (a second semaphore, or a tenant-level BullMQ rate limiter)
+  so one large tenant cannot starve others.
+
+---
+
+## 2. No Scheduled or Time-Triggered Runs
+
+**What exists:** Runs are started only via `POST /workflows/:id/runs` — an explicit HTTP call
+from the browser or an API consumer.
+
+**What is missing:** Cron-style scheduling ("run this workflow every day at 02:00 UTC"), event-
+triggered dispatch ("run when a file appears in S3"), or sensor polling ("run when a Kaggle dataset
+version changes").
+
+**To close it:**
+- Add a `Schedule` model (`{ workflowId, cron: string, timezone: string, enabled: bool }`).
+- Run a scheduler process (or an API-side `cron` job using `node-cron`) that wakes up, queries
+  due schedules, calls `startRun`, and records the next fire time.
+- For event triggers, integrate a webhook ingestion endpoint that validates a signature, matches
+  a registered trigger, and calls `startRun`.
+- Both need idempotency keys derived from the scheduled fire time / event ID to prevent double-
+  starts on crash-and-restart of the scheduler process.
+
+---
+
+## 3. No Dynamic Fan-Out (Static Graphs Only)
+
+**What exists:** The graph topology is fixed at version-creation time. Every node and edge is
+known before the run starts.
+
+**What is missing:** The ability for a node's output to determine how many downstream nodes run
+— e.g., "process each row in the dataset in parallel, with one worker per chunk." This pattern
+(map/reduce, scatter-gather, dynamic parallelism) is central to data pipeline use cases.
+
+**To close it:**
+- Extend `NodeRun` with a `parentRunId` / `fanOutIndex` so a single graph node can spawn a
+  sub-run of N clones of its downstream subgraph, one per output element.
+- The spawning node's completion handler would: (1) read `output.chunks[]`, (2) `createRun` N
+  child runs, (3) seed their in-degree counters, (4) dispatch them.
+- A collector/join node type would wait for all N child runs to reach a terminal state and merge
+  their outputs before the parent run's downstream nodes are unlocked.
+- This is a large surface-area change: it affects the schema (`Run.parentRunId`), the
+  orchestrator (`startRun` with a fan-out context), the UI (rendering nested run trees), and the
+  SSE event stream (hierarchical run events).
+
+---
+
+## 4. Artifact Storage Is a Shared Volume, Not Object Storage
+
+**What exists:** Workers write large outputs (datasets, model weights) to a shared Docker named
+volume (`artifact_data` mounted at `/data/artifacts` in every worker container). This works
+correctly for any deployment on a single host or in a Compose cluster where all replicas share
+the same physical volume.
+
+**What is missing:** On Kubernetes (where workers run on different *nodes*, not just different
+containers on one node) or across cloud regions, a host-local or Compose-local volume is not
+accessible from all workers. `preprocess` on Node A writing a file that `train` on Node B needs
+to read would fail silently — Node B simply would not have the file.
+
+**To close it:**
+- Replace the shared volume with an object-storage backend (S3, GCS, Azure Blob) as the artifact
+  store. Workers call `s3.putObject` on write and `s3.getObject` on read, with the artifact path
+  stored as the S3 key in `NodeRun.output`.
+- The `ARTIFACT_DIR` env var abstraction already exists — only the read/write implementation in
+  the executors and `python-bridge.ts` would change.
+- For a Kubernetes deployment: use a `PersistentVolumeClaim` with a `ReadWriteMany` storage class
+  (NFS, EFS, or a CSI driver) as a cheaper intermediate step, though object storage is the correct
+  long-term answer for elasticity.
+
+---
+
+## 5. No Conditional Branching
+
+**What exists:** Every node in a `GraphSchema` runs if its parents succeed; failure propagates
+all descendants to `SKIPPED`. There is no mechanism to run different branches based on a parent
+node's output value.
+
+**What is missing:** "If model accuracy > 0.95, deploy. Otherwise, trigger a retraining branch"
+— a conditional edge that only activates based on runtime data.
+
+**To close it:**
+- Add an optional `condition` field on `EdgeDef`: a JSONPath expression or a simple comparison
+  evaluated against the parent's `output` at dispatch time.
+- Extend `dispatchNode`: after template resolution, evaluate each outgoing edge's condition. Only
+  decrement in-degree for children whose edge condition is true; mark children of a false branch
+  as `SKIPPED` immediately.
+- Zod schema validation at version-creation time cannot statically verify that conditions are
+  satisfiable (that's undecidable in general), but it can validate that condition expressions are
+  syntactically valid and reference fields that exist on the parent node's declared output schema.
+
+---
+
+## 6. Worker Executors Are Mock ML — Not Real ML
+
+**What exists:** `apps/worker/python/preprocess.py`, `train.py`, and `evaluate.py` are pure
+Python-stdlib fixtures that simulate ML steps with filesystem writes and `time.sleep`. They
+exercise the Node↔Python bridge, idempotency checks, and heartbeat machinery correctly, but they
+do not perform real data processing.
+
+**What is missing:** Real Pandas, real PyTorch, real Kaggle downloads. The Docker worker image
+intentionally omits `pandas` and `torch` (see `KNOWN_LIMITATIONS.md §6` and the Dockerfile
+comment).
+
+**To close it:**
+- Add a `requirements.txt` to `apps/worker/python/` listing `pandas`, `torch`, `scikit-learn`,
+  etc., and uncomment the `RUN pip3 install -r requirements.txt` line in `infra/Dockerfile.worker`.
+- Replace the fixture scripts with real logic: real `kaggle` CLI calls in `download.py`, real
+  `pd.read_csv` + feature engineering in `preprocess.py`, real `torch.nn.Module` training in
+  `train.py`.
+- Note: the real `kaggle.download` executor already shells out to the Kaggle CLI — only the
+  Python scripts need replacement. The worker and bridge infrastructure are production-ready.
+
+---
+
+## 7. No Horizontal Scaling Proven Across Multiple Machines
+
+**What exists:** `docker compose up --scale worker=4` starts four worker containers on the *same
+Docker host* sharing the same CPU. The scale test confirms the dispatch/queue architecture is
+correct, but the throughput numbers reflect CPU-bound process-spawn contention on a 12-core dev
+machine, not true multi-machine scaling.
+
+**What is missing:** A test or deployment that puts worker containers on genuinely separate
+machines, so increasing worker count actually adds CPU capacity rather than competing for it.
+
+**To close it:**
+- Deploy the Compose cluster to a cloud provider (three separate EC2/GCE instances: one for
+  api + postgres + redis, N for workers). The `docker-compose.yml` requires only one environment-
+  variable change (`REDIS_URL` / `DATABASE_URL` pointing at the shared infra host).
+- For production scale: port the cluster to Kubernetes with a `Deployment` for workers and a
+  Kubernetes HPA (Horizontal Pod Autoscaler) targeting `queue:cpu` depth via a KEDA scaler. KEDA
+  reads BullMQ's `queue.getWaitingCount()` via a Redis metric and scales the worker `Deployment`
+  replica count automatically.
+
+---
+
+## 8. The Lint Backlog
+
+**What exists:** `apps/api` and `apps/worker` have approximately 30 pre-existing ESLint errors
+(mostly `@typescript-eslint/no-explicit-any` in orchestrator/SSE/worker code from Phases 4–10,
+plus scattered unused imports). These were not fixed during Phase 12 to avoid touching logic
+outside that phase's scope with risk of a behavioral regression.
+
+**To close it:** A dedicated lint-cleanup pass before any production hardening. The errors are
+cosmetic (`any` types, unused vars) rather than correctness issues, but they mask real new errors
+that `pnpm -r lint` would otherwise catch in CI.
+
+---
+
+## 9. No Committed Prisma Migration History
+
+**What exists:** `packages/db/prisma/migrations/` exists and is in `.gitignore`. The migration
+is applied via `prisma migrate deploy` in the Docker one-shot service, but the SQL migration
+files themselves are not committed.
+
+**What is missing:** A committed migration history means the database schema change record is
+reproducible and auditable. Without it, `prisma migrate deploy` on a fresh environment must
+reconstruct the schema from scratch via `prisma migrate dev`, which is not safe for production.
+
+**To close it:** Run `pnpm --filter @dag/db db:migrate:dev` once on a clean local database to
+generate the SQL migration file, remove `packages/db/prisma/migrations/` from `.gitignore`, and
+commit the migration directory. All future schema changes go through `migrate dev` locally →
+commit → `migrate deploy` in CI/CD.
+
+---
+
+## 10. No Access Control on the `/metrics` Endpoint
+
+**What exists:** `GET /metrics` is public — any caller can read internal throughput, queue
+depth, and worker count data.
+
+**What is missing:** Authentication on the scrape endpoint. In a real deployment, exposing queue
+depth and worker counts to unauthenticated callers leaks information about cluster capacity and
+current load.
+
+**To close it:** Add a shared-secret bearer token check on the `/metrics` route (Prometheus
+supports configuring a `bearer_token` in its scrape config), or restrict the endpoint to an
+internal network interface only (not the public-facing port). The latter is the simpler fix for
+a Kubernetes deployment where the Prometheus scraper already runs on the internal cluster network.

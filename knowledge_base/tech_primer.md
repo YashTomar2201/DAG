@@ -352,3 +352,148 @@ Why bother with p95/p99 instead of just the average? An average can hide a bad t
 When one program starts another — a "parent" starting a "child" process — the operating system tracks that relationship. On Windows, if you spawn a program *through a shell* (like `cmd.exe`), the process handle you get back refers to that shell, not to whatever program the shell went on to run. Asking the shell to stop doesn't necessarily stop the program it launched — the shell can exit on its own, leaving its child running with nobody watching it anymore. This is called an **orphaned process**: still alive, still using resources (like a database connection), but invisible to whatever spawned it if you only kept a handle to the immediate shell.
 
 `taskkill /PID <id> /T /F` tells Windows: find this process ID, find every process Windows recorded as a *descendant* of it (the `/T` flag, for "tree"), and force-kill (`/F`) all of them. Because Windows records that parent-child relationship at the moment a process is created — independent of whether the parent is still alive — this reliably reaches an orphaned grandchild process even after the immediate shell in between has already exited.
+
+---
+
+## Phase 13 Technologies
+
+### 48. What is a Docker image, and what is a "multi-stage build"?
+
+A Docker **image** is a snapshot of a filesystem plus some metadata (what command to run, what port it expects, etc.) — think of it as a portable, self-contained box that has everything a program needs to run: the OS files, the language runtime, the app's own code, its dependencies. A **container** is just a running instance of an image.
+
+Building an image the naive way — install your build tools, compile your code, done — leaves all those build tools sitting in the final image even though nothing needs them once the app is built, making the image bigger than it needs to be. A **multi-stage build** solves this by describing several images in one `Dockerfile`, each one a "stage." Early stages can have compilers, package managers, everything needed to prepare the code. The *final* stage starts fresh from a clean, minimal base and copies over only the finished result from the earlier stages — the compiler itself never makes it into what actually ships.
+
+### 49. What is `pnpm fetch`, and why is it a separate step from `pnpm install`?
+
+`pnpm fetch` downloads every package a project's lockfile says it needs into pnpm's local cache — but it does *not* need your actual source code to do that, only the lockfile. `pnpm install --offline` afterward links those already-downloaded packages into `node_modules`, using only what's already in the cache (no network needed).
+
+Splitting it this way matters for Docker's caching. Docker re-runs a build starting from the *first* step that changed since the last build; everything before that point is reused instantly from cache. If you copy your lockfile and run `pnpm fetch` (which only depends on the lockfile) *before* copying your actual source code, then editing a source file doesn't invalidate the expensive "download every package from the internet" step — Docker sees the lockfile is unchanged and reuses that cached layer, only re-running the fast steps that come after.
+
+### 50. What does `pnpm prune --prod` do, and why is it different from just running `pnpm install --prod`?
+
+Every `package.json` can list two kinds of dependencies: `dependencies` (needed to actually run the program) and `devDependencies` (needed only while building/testing it — a test framework, a linter, a compiler). `pnpm install --prod` installs only the first kind, from scratch.
+
+`pnpm prune --prod` does something related but different: it takes a `node_modules` folder that's *already fully installed* (both kinds) and deletes the devDependency packages out of it, in place. The end result — a `node_modules` with only production packages — is the same, but there's only ever been one `pnpm install` in the whole build. This matters in a multi-stage Docker build: you install everything once (because you need the devDependencies to run a build/codegen step), then prune afterward for the final slim image, instead of installing twice and hoping both installs agree.
+
+### 51. What is `corepack`, and why does it matter which version of a package manager you're using?
+
+Modern Node.js ships with a tool called `corepack` that can download and run a *specific* version of package managers like `pnpm` or `yarn`, based on a `packageManager` field in your `package.json` (e.g. `"packageManager": "pnpm@11.6.0"`). Without a pin, `corepack enable` grabs whatever the latest version currently is — which can silently be a version with different (and sometimes incompatible) requirements than the one you tested with locally. This project hit exactly that: `corepack enable` alone pulled in a pnpm release that flatly requires a newer Node.js version than the Docker base image had, and the fix was pinning the *exact* version already used everywhere else in the project (`corepack prepare pnpm@11.6.0 --activate`), so the version running in a clean Docker build is guaranteed to be the same one already tested on every developer's machine.
+
+### 52. What is a Docker Compose "healthcheck," and what does `depends_on: { condition: service_healthy }` actually guarantee?
+
+A container can be *running* (the process started) without being *ready* (the process is still booting up, still connecting to its database, still warming up). A **healthcheck** is a command Docker runs periodically inside a container to ask "are you actually ready to do useful work?" — for Postgres, that might be "can I open a connection and query it"; for a web API, "does `GET /health` return 200?"
+
+Plain `depends_on: [postgres]` in Compose only waits for the postgres *container to start* — which can be well before Postgres has actually finished initializing and is ready to accept connections. `depends_on: { postgres: { condition: service_healthy } }` waits for postgres's *healthcheck* to pass first. This is the difference between "the database process began starting a moment ago" and "the database has confirmed it can actually serve queries" — and in a system with a startup race (an API server that tries to query a table the second it boots), that difference is the difference between a flaky failure on a slow machine and a reliable startup every time.
+
+### 53. What is a "one-shot" container, and what does `service_completed_successfully` mean?
+
+Most containers in a cluster are meant to run forever (a web server, a worker) — if one exits, something's usually wrong. A **one-shot container** is the opposite: it's designed to do one job and then exit, on purpose, with a success or failure code. Database migrations are a classic example — you want "apply any pending schema changes" to run exactly once per deployment, not stay running afterward.
+
+`condition: service_completed_successfully` in a Compose `depends_on` block means "don't start this other service until the one-shot container has *finished running and exited with code 0*" — as opposed to `service_started` (just began) or `service_healthy` (a long-running healthcheck is passing). It's the right condition for exactly one kind of dependency: "do this finite task first, then let everything else start."
+
+### 54. What is a named Docker volume, and why do multiple containers sometimes need to share one?
+
+By default, every container has its own private filesystem that disappears when the container is removed. A **named volume** is storage that Docker manages independently of any one container's lifecycle — you can mount the *same* named volume into multiple different containers at once, and all of them see the identical set of files, including files another container just wrote.
+
+This matters whenever two separate processes need to hand a large file to each other without going through the network. In this project, one worker container might clean and save a dataset file that a *different* worker container (running a later step of the same pipeline) needs to read — without a shared volume, the second container's filesystem simply wouldn't have that file, because the first container wrote it into its own private, invisible-to-others storage.
+
+### 55. What does `docker compose up --scale worker=4` actually do, and why doesn't it need any extra configuration in this project?
+
+Normally, one `service:` entry in a `docker-compose.yml` file produces exactly one container. The `--scale <service>=<N>` flag tells Compose to instead start N containers from that *same* service definition — same image, same environment variables, same everything, just multiple copies running in parallel.
+
+For this to work well, the thing being scaled has to be genuinely interchangeable — no copy can assume it's "the only one" or hold private state another copy needs to know about. This project's worker containers qualify: each one just asks a shared queue "do you have any work for me?", does the work, and reports back — it never needs to coordinate with, or even be aware of, any other worker container. That's why scaling from 1 worker to 4 requires editing nothing except the number after `--scale`.
+
+---
+
+## Phase 14 Technologies
+
+### 56. What is an Architecture Decision Record (ADR)?
+
+An **ADR** is a short document that captures one significant technical decision made during a
+project. It records: what was decided, what alternatives were considered and rejected, and why
+the chosen option was better for *this specific context*. ADRs do not advocate for a decision in
+general — they explain why it made sense *here, now, given these constraints*.
+
+In this project, ADRs live conceptually in `knowledge_base/decisions_log.md` (every entry is an
+ADR in narrative form) and are referenced by a numbered label (ADR-001 through ADR-009). They
+map one-to-one with major structural decisions: why a monorepo, why iterative DFS, why Lua
+atomicity, why `tsx` in production containers. Reading the ADRs in order is equivalent to
+reading the build history of the system — you understand not just *what* was built but *why*.
+
+Why bother? Two reasons:
+1. **Onboarding.** A new engineer asking "why isn't this code using recursive DFS like the
+   textbook example?" can find the answer in under a minute instead of needing to track down
+   the person who wrote it.
+2. **Change management.** Before reversing a decision, engineers check the ADR for the original
+   reasoning. If the constraint that drove the decision no longer applies, reverting is justified.
+   If it still applies, reverting is probably wrong.
+
+---
+
+### 57. What is a "Known Limitations" document, and why write one?
+
+A known-limitations document is an explicit, honest list of what a system *cannot* do, paired
+with an explanation of what closing each gap would require.
+
+Writing it serves three purposes:
+
+**1. Interview credibility.** Any sufficiently detailed system has gaps. An interviewer asking
+"what would you improve?" after a demo is checking whether you've thought critically about your
+own work. "Nothing, it's complete" is the worst possible answer. A prepared list of real gaps —
+with real remediation plans — shows engineering maturity.
+
+**2. Scope definition.** A limitations document is the honest complement to a README. The README
+says "here's what this does"; the limitations file says "here's what it doesn't do and why that
+choice was made." Together they fully define the scope of the project.
+
+**3. Future-proofing.** When a future engineer considers extending the system — adding
+multi-tenancy, or scheduled triggers — the limitations file tells them whether that extension
+was deliberately deferred or simply never considered. This prevents both "we already thought
+about this and decided not to" conversations and "nobody knew this was a problem" surprises.
+
+---
+
+### 58. What is a "system design walkthrough," and how is it different from a list of components?
+
+A **system design walkthrough** is a narrative that follows a single real action through an
+entire system from start to finish — a request lifecycle, not a component inventory. It answers
+the question "how does this thing actually work?" rather than "what pieces does this system have?"
+
+The difference matters in an interview. Listing components ("we have a Redis queue, a Postgres
+database, and some workers") is easy to produce from reading a README and proves nothing about
+understanding. A request lifecycle narrative — "when the user clicks Run, here's exactly what
+happens at each step and why" — requires you to hold the full dataflow in your head and show how
+each decision connects to the next.
+
+A good walkthrough has two properties:
+- **It is interruptible.** The interviewer can stop you at any sentence ("wait, why a Lua script
+  there?") and you can answer completely without losing your place, then continue.
+- **It explains decisions, not just facts.** Not "the API writes to Postgres" but "the API writes
+  to Postgres *and* publishes to Redis pub/sub, because pub/sub is fire-and-forget and we need a
+  durable source for SSE reconnection."
+
+---
+
+### 59. What does "p95 latency got worse with more workers" actually mean? Is that a bug?
+
+In this project's scale test, adding 3 more workers (from 1 to 4) improved throughput by only
+1.12x but made p95 latency *worse* (908ms → 4097ms). This sounds counterintuitive — more
+workers should be faster, right?
+
+Here's what actually happened: all four workers shared the same 12-core machine. Worker
+concurrency was 8 per worker, so 4 workers = 32 concurrent `python3` processes competing for 12
+CPU cores. When more processes are running than there are cores to run them, the OS constantly
+switches between them (context-switching). Each process gets less CPU time per unit of wall-clock
+time, so jobs take longer even though more of them are nominally "in progress." This is CPU
+contention, not a flaw in the dispatch architecture.
+
+**p95** (the 95th-percentile latency) is especially sensitive to this because it measures the
+*tail* — the slowest 5% of jobs. Those jobs were already slower to begin with (perhaps they got
+unlucky with core scheduling), and CPU contention made them even slower. The average (p50) would
+tell a more optimistic story; p95 tells the honest one.
+
+**Is it a bug?** No. The four-layer dispatch machinery (Lua atomicity, SADD guard, deterministic
+jobId, DB unique constraint) behaved identically in both passes — zero duplicate executions, zero
+correctness errors. The bottleneck is the deployment environment (4 workers on 1 machine), not
+the software. Four workers on four *separate* machines would have four independent CPU budgets
+and would show close to linear throughput scaling.

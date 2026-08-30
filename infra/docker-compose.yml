@@ -1,13 +1,16 @@
-version: '3.9'
-
-# ─── Distributed DAG Engine — Local Infrastructure ────────────────────────────
+# ─── Distributed DAG Engine — Full Cluster ─────────────────────────────────────
 #
-# Starts:
-#   postgres  — primary datastore (workflows, runs, audit log)
-#   redis     — message broker + in-degree counters + pub/sub
+# postgres  — primary datastore (workflows, runs, audit log)
+# redis     — message broker + in-degree counters + pub/sub
+# migrate   — one-shot: applies Prisma migrations, then exits (see below)
+# api       — control plane (Express, orchestration, SSE, /metrics)
+# worker    — data plane (BullMQ consumers). Scale this one: `--scale worker=4`
+# web       — the visual editor (static build, served by nginx)
 #
-# Workers and API are added in later phases.
-# Run:  docker compose -f infra/docker-compose.yml up -d
+# Quickstart:
+#   docker compose -f infra/docker-compose.yml up --build --scale worker=4 -d
+#   open http://localhost:5173
+#
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
@@ -46,7 +49,106 @@ services:
       retries: 10
       start_period: 5s
 
+  # ── One-shot migration runner ─────────────────────────────────────────────
+  # Runs `prisma migrate deploy`, applies any pending migrations, exits 0.
+  # Built from Dockerfile.api's `build` stage (not the pruned `runtime`
+  # stage) because it needs the Prisma CLI itself, a devDependency that
+  # `pnpm prune --prod` deliberately strips out of the runtime image.
+  #
+  # Why a separate one-shot service instead of running `migrate deploy` on
+  # API boot: with N API replicas (this project runs one, but the pattern
+  # matters at real scale), every replica booting would race to alter the
+  # schema simultaneously — `migrate deploy` is not designed for concurrent
+  # callers. A single one-shot service that must exit 0 before anything else
+  # starts (via `service_completed_successfully`) makes "the schema is
+  # migrated" a precondition the rest of the cluster can rely on, not a race.
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+      target: build
+    command: ["pnpm", "--filter", "@dag/db", "run", "db:migrate:deploy"]
+    environment:
+      DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
+      REDIS_URL: redis://redis:6379
+      API_PORT: 3001
+      ARTIFACT_DIR: /data/artifacts
+      NODE_ENV: production
+    volumes:
+      - artifact_data:/data/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+    environment:
+      DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
+      REDIS_URL: redis://redis:6379
+      ARTIFACT_DIR: /data/artifacts
+      NODE_ENV: production
+    volumes:
+      # Shared across every worker replica: PROJECT_GUIDE.md §4's
+      # "preprocess on worker 1, train on worker 2" case only works if every
+      # worker sees every other worker's output files at the same path.
+      - artifact_data:/data/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # No `container_name`, no per-replica config: `docker compose up
+    # --scale worker=4` creates 4 interchangeable containers from this one
+    # definition. Each falls back to `WORKER_ID = worker-${process.pid}`
+    # (apps/worker/src/worker.ts) — a real PID, unique per container — so
+    # replicas never collide on identity without any compose-level
+    # bookkeeping. This is the "workers are stateless and replica-safe"
+    # claim, verified structurally: there is nothing here TO configure per
+    # replica.
+
+  web:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.web
+      args:
+        # Baked in at BUILD time — see Dockerfile.web's header comment for why.
+        VITE_API_URL: http://localhost:3001
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+
 volumes:
-  # Named volumes so data persists across container restarts
+  # Named volumes so data persists across container restarts.
   postgres_data:
   redis_data:
+  artifact_data:
