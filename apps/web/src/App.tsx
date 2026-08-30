@@ -132,7 +132,7 @@ export function App() {
             <path d="M6 26L14.5 17.5L16 20L7.5 28.5L6 26Z" fill="var(--color-ink)"/>
           </svg>
           <span style={{ fontSize: 26, fontWeight: 400, fontFamily: 'var(--font-display)', letterSpacing: '-0.5px', color: 'var(--color-ink)', transform: 'translateY(1px)' }}>
-            Claude DAG
+            NexusFlow
           </span>
           <nav style={{ display: 'flex', gap: 28, marginLeft: 40 }}>
             <a href="#" className="text-link" style={{ fontSize: '14px', fontWeight: 500, color: 'var(--color-ink)' }}>Design Analysis</a>
