@@ -53,8 +53,24 @@ export const TorchTrainConfigSchema = z.object({
 
 export const ModelEvaluateConfigSchema = z.object({
   scriptPath: z.string().min(1).default('evaluate.py'),
-  /** Minimum accuracy threshold; evaluation fails if not met */
+  /** Minimum accuracy threshold; the executor fails the node if not met */
   minAccuracy: z.number().min(0).max(1).optional(),
+  /**
+   * Template ref to the trained model, e.g.
+   * "{{ nodes.train.output.weightsPath }}". Resolved by the control plane.
+   */
+  weightsPath: z.string().min(1).optional(),
+  /**
+   * Template ref to the held-out split, e.g.
+   * "{{ nodes.preprocess.output.testPath }}".
+   */
+  testPath: z.string().min(1).optional(),
+  /**
+   * Template ref to the label column, e.g.
+   * "{{ nodes.preprocess.output.targetColumn }}". Falls back to the parquet's
+   * last column.
+   */
+  targetColumn: z.string().min(1).optional(),
   kwargs: z.record(z.unknown()).optional(),
 });
 

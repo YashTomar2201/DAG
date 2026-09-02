@@ -118,7 +118,10 @@ function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
         trainPath: '{{ nodes.node-2.output.trainPath }}',
         targetColumn: '{{ nodes.node-2.output.targetColumn }}' }, 520, 120),
     mk('node-4', 'Evaluate', 'model.evaluate',
-      { scriptPath: 'evaluate.py', minAccuracy: 0.8 }, 780, 120),
+      { scriptPath: 'evaluate.py', minAccuracy: 0.6,
+        weightsPath: '{{ nodes.node-3.output.weightsPath }}',
+        testPath: '{{ nodes.node-2.output.testPath }}',
+        targetColumn: '{{ nodes.node-2.output.targetColumn }}' }, 780, 120),
   ];
 
   const edge = (from: string, to: string): Edge => ({

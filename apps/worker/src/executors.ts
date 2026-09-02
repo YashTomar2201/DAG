@@ -205,31 +205,37 @@ async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
   const resultPath = path.join(destDir, 'result.json');
 
+  // Idempotency: reuse the metrics from a prior attempt in this run so a retry
+  // (e.g. after the quality gate below rejected the run) doesn't re-load the
+  // model and re-score the test set. The gate is re-applied to the cached
+  // metrics below — a cache hit must never let a sub-threshold model through.
+  let output: Record<string, unknown>;
   if (fs.existsSync(resultPath)) {
-    logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'model.evaluate: cache hit');
-    return JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'model.evaluate: cache hit — re-checking gate');
+    output = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+  } else {
+    fs.mkdirSync(destDir, { recursive: true });
+    output = (await runPython({
+      scriptPath: config.scriptPath ?? 'evaluate.py',
+      input: { ...ctx.input, kwargs: config.kwargs ?? {} },
+      onLog: ctx.onLog,
+    })) as Record<string, unknown>;
+    // Persist BEFORE the gate so a rejected run still leaves the real metrics
+    // on disk for the retry short-circuit and for debugging.
+    atomicWriteJson(resultPath, output);
   }
 
-  fs.mkdirSync(destDir, { recursive: true });
-
-  const output = (await runPython({
-    scriptPath: config.scriptPath ?? 'evaluate.py',
-    input: { ...ctx.input, kwargs: config.kwargs ?? {} },
-    onLog: ctx.onLog,
-  })) as Record<string, unknown>;
-
-  // Enforce minimum accuracy threshold if configured
+  // Quality gate — enforced on every execution, cache hit or not.
   if (
     config.minAccuracy !== undefined &&
     typeof output['accuracy'] === 'number' &&
     output['accuracy'] < config.minAccuracy
   ) {
     throw new UnrecoverableError(
-      `Model accuracy ${output['accuracy']} is below required threshold ${config.minAccuracy}`,
+      `Model accuracy ${output['accuracy']} is below the required minAccuracy ${config.minAccuracy}`,
     );
   }
 
-  atomicWriteJson(resultPath, output);
   return output;
 }
 

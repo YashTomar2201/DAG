@@ -5,6 +5,75 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.4: real evaluation + a working quality gate
+
+**Phase:** roadmap A1.4 — the payoff. `model.evaluate` now loads the trained
+model and the held-out test split and computes genuine metrics; the
+`minAccuracy` gate in `executors.ts` fails runs for a real reason.
+
+### Changes
+
+- **`apps/worker/python/evaluate.py`** — rewritten. When `weightsPath` /
+  `testPath` are wired: `joblib.load` the model, `pd.read_parquet` the test
+  split, align feature columns to `model.feature_names_in_`, and report
+  `accuracy`, weighted `f1` / `precision` / `recall`, `confusionMatrix`,
+  `labels`, `nTest`. If a ref is present but evaluation fails, the script exits
+  non-zero (a wired-but-broken pipeline fails loudly). If neither ref is wired
+  (an un-wired graph or the hermetic integration fixtures), it returns fixed
+  reference metrics marked `"synthetic": true` so those pipelines still run
+  green — the exact behaviour `fixtures.ts` documents.
+- **`packages/contracts/src/node-types.ts`** — `ModelEvaluateConfigSchema` gains
+  optional `weightsPath`, `testPath`, `targetColumn` (template-ref strings).
+- **`apps/worker/src/executors.ts`** — `modelEvaluate` restructured:
+  - `result.json` is written **before** the `minAccuracy` gate, so a rejected
+    run still leaves the real metrics on disk.
+  - the gate is applied on **every** execution, cache hit or not — a retry
+    short-circuits the model load + scoring but can't sneak a sub-threshold
+    model through.
+  - gate error message now names the field: `… below the required minAccuracy 0.99`.
+- **`apps/web/src/components/ConfigPanel.tsx`** — Model Ref / Test Data Ref /
+  Target Column Ref inputs for `model.evaluate`; `minAccuracy` placeholder → 0.6.
+- **`apps/web/src/store/graphSlice.ts`** — starter graph's Evaluate node wires
+  `weightsPath: '{{ nodes.node-3.output.weightsPath }}'`,
+  `testPath: '{{ nodes.node-2.output.testPath }}'`,
+  `targetColumn: '{{ nodes.node-2.output.targetColumn }}'`, `minAccuracy: 0.6`.
+
+### Verification
+
+End-to-end on the live 4-worker stack (preprocess → train → evaluate → deploy,
+all templates wired):
+
+- **`minAccuracy: 0.6`** → run **SUCCEEDED**. evaluate output: real
+  `accuracy 0.7486`, `f1 0.7302`, `confusionMatrix [[110,12],[33,24]]`,
+  `synthetic: false`. deploy SUCCEEDED.
+- **`minAccuracy: 0.99`** → evaluate **FAILED**
+  (`Model accuracy 0.7486033519553073 is below the required minAccuracy 0.99`),
+  deploy **SKIPPED**, run **FAILED** — a real failure for a real reason.
+- **modelType change**: `randomforest` → accuracy 0.7486, cm `[[110,12],[33,24]]`;
+  `logreg` → accuracy 0.6592, cm `[[118,4],[57,0]]`. Different metrics, different
+  matrix.
+- **retry short-circuit**: `POST /runs/:id/retry-failed` on the 0.99 run →
+  worker log `model.evaluate: cache hit — re-checking gate` at `attempt: 1`,
+  run FAILED again without re-loading the model or re-scoring.
+- Fallback path (no refs) still returns `accuracy 0.923`, `synthetic: true`.
+- `pnpm -r typecheck` clean; contracts 18 / worker 12 / api 35 unit tests green;
+  contracts + web lint clean (the pre-existing `apps/worker` lint backlog is
+  untouched — A5).
+
+### Deferred
+
+Surfacing the confusion matrix in the run-detail UI (roadmap "consider"): the
+web run store doesn't hold node `output` yet, so this needs that plumbing first.
+The matrix is already visible in the live log drawer.
+
+### Files
+
+`apps/worker/python/evaluate.py`, `apps/worker/src/executors.ts`,
+`packages/contracts/src/node-types.ts`, `apps/web/src/components/ConfigPanel.tsx`,
+`apps/web/src/store/graphSlice.ts`.
+
+---
+
 ## 2026-09-03 — A1.3: real training
 
 **Phase:** roadmap A1.3 — third of the A1 arc. `torch.train` now fits a real

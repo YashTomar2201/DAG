@@ -31,8 +31,11 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'outputWeightsPath',  label: 'Weights Output Path',    type: 'text',   placeholder: 'model.joblib' },
   ],
   'model.evaluate': [
-    { key: 'scriptPath',  label: 'Script Path',      type: 'text',   placeholder: 'evaluate.py' },
-    { key: 'minAccuracy', label: 'Min Accuracy (0–1)', type: 'number', placeholder: '0.8' },
+    { key: 'scriptPath',   label: 'Script Path',         type: 'text',   placeholder: 'evaluate.py' },
+    { key: 'weightsPath',  label: 'Model Ref',           type: 'text',   placeholder: '{{ nodes.<train>.output.weightsPath }}' },
+    { key: 'testPath',     label: 'Test Data Ref',       type: 'text',   placeholder: '{{ nodes.<preprocess>.output.testPath }}' },
+    { key: 'targetColumn', label: 'Target Column Ref',   type: 'text',   placeholder: '{{ nodes.<preprocess>.output.targetColumn }}' },
+    { key: 'minAccuracy',  label: 'Min Accuracy (0–1)',  type: 'number', placeholder: '0.6' },
   ],
   'registry.deploy': [
     { key: 'registryUrl', label: 'Registry URL', type: 'text', placeholder: 'https://registry.example.com' },
