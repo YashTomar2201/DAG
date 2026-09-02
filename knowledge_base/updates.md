@@ -5,6 +5,50 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A2: commit the migration history
+
+**Phase:** roadmap A2. Goal: a fresh clone rebuilds the database
+deterministically.
+
+### Finding
+
+The roadmap's premise was already stale — `packages/db/prisma/migrations/` is
+**not** in `.gitignore`, and `20260821193005_init/migration.sql` +
+`migration_lock.toml` are committed (landed in an earlier phase). So the core
+deliverable existed; this phase verified it and closed the loop.
+
+- `prisma migrate diff --from-migrations … --to-schema-datamodel …` →
+  **"No difference detected"** (exit 0). The committed migration reproduces the
+  current `schema.prisma` exactly — no drift.
+- `prisma migrate deploy` against a throwaway virgin `postgres:16` → exit 0,
+  applied `20260821193005_init`, created all six tables (`Tenant`, `Workflow`,
+  `WorkflowVersion`, `Run`, `NodeRun`, `RunEvent`) + `_prisma_migrations`; a
+  second `deploy` → "No pending migrations to apply."
+- Full cold path: `docker compose down -v && up -d` — the `migrate` one-shot
+  exits 0 and `api` comes up healthy on a fresh volume with zero manual steps.
+
+### Note — the live dev DB was crufty
+
+The long-running local stack's `dag_engine` had all six app tables but **no**
+`_prisma_migrations` table (set up via `prisma db push` at some point), so
+`prisma migrate status` reported `init` as unapplied and a direct
+`migrate deploy` failed `P3005` (schema not empty). `down -v` + a clean
+`migrate deploy` fixed it — and is exactly why `db push` must never touch a
+DB that isn't a scratch DB.
+
+### Changes
+
+- **`.gitignore`** — added a comment by the Prisma `src/generated/` rule
+  spelling out that `prisma/migrations/` is deliberately tracked, so it can't
+  get re-ignored by accident.
+- **`KNOWN_LIMITATIONS.md` §9** — marked CLOSED.
+
+### Files
+
+`.gitignore`, `KNOWN_LIMITATIONS.md` (migration files were already committed).
+
+---
+
 ## 2026-09-03 — A1.5: an honest data source
 
 **Phase:** roadmap A1.5 — last of the A1 arc. `kaggle.download` is gone. The

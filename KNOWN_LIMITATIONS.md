@@ -178,20 +178,19 @@ that `pnpm -r lint` would otherwise catch in CI.
 
 ---
 
-## 9. No Committed Prisma Migration History
+## 9. Committed Prisma Migration History — ✅ CLOSED (roadmap A2)
 
-**What exists:** `packages/db/prisma/migrations/` exists and is in `.gitignore`. The migration
-is applied via `prisma migrate deploy` in the Docker one-shot service, but the SQL migration
-files themselves are not committed.
+`packages/db/prisma/migrations/20260821193005_init/migration.sql` and
+`migration_lock.toml` are committed and **not** `.gitignore`d. `prisma migrate
+diff` reports no drift between that migration and `schema.prisma`, and `prisma
+migrate deploy` against a virgin PostgreSQL applies it cleanly (exit 0, all six
+tables + `_prisma_migrations` bookkeeping), then no-ops on re-run. The Docker
+`migrate` one-shot runs exactly that command before `api` starts.
 
-**What is missing:** A committed migration history means the database schema change record is
-reproducible and auditable. Without it, `prisma migrate deploy` on a fresh environment must
-reconstruct the schema from scratch via `prisma migrate dev`, which is not safe for production.
-
-**To close it:** Run `pnpm --filter @dag/db db:migrate:dev` once on a clean local database to
-generate the SQL migration file, remove `packages/db/prisma/migrations/` from `.gitignore`, and
-commit the migration directory. All future schema changes go through `migrate dev` locally →
-commit → `migrate deploy` in CI/CD.
+From here on: schema changes go `pnpm --filter @dag/db db:migrate:dev` locally →
+commit the new migration folder → `db:migrate:deploy` in CI. Never `db push`
+against anything but a scratch DB — it mutates the schema without recording a
+migration, which is how a running DB can drift out of sync with the history.
 
 ---
 
