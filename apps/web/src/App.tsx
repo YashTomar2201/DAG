@@ -59,8 +59,14 @@ function AppCanvas() {
   const activeRunId = useRunStore((s) => s.activeRunId);
   const runStatus = useRunStore((s) => s.runStatus);
   const startListening = useRunStore((s) => s.startListening);
+  const stopListening = useRunStore((s) => s.stopListening);
   const applyEvent = useRunStore((s) => s.applyEvent);
   const addRun = useRunStore((s) => s.addRun);
+
+  // A run is in flight from the moment it starts until an SSE terminal event.
+  // Starting a second run mid-flight orphans the first (the UI stops listening
+  // to it), so we block that until the current one finishes.
+  const isRunActive = !!activeRunId && runStatus === 'RUNNING';
 
   // Access the ReactFlow instance for accurate coordinate conversion
   const { screenToFlowPosition, fitView } = useReactFlow();
@@ -273,6 +279,10 @@ function AppCanvas() {
 
   async function handleRun() {
     if (isRunning) return;
+    if (isRunActive) {
+      setNotice({ kind: 'error', text: 'A run is already in progress — wait for it to finish.' });
+      return;
+    }
     if (!versionId) {
       setNotice({ kind: 'error', text: 'Save the pipeline first, then run it.' });
       return;
@@ -299,7 +309,15 @@ function AppCanvas() {
         run.id,
         undefined,
         (type, data) => applyEvent(type, data),
-        (err) => console.error('SSE Error:', err),
+        (err) => {
+          console.error('SSE Error:', err);
+          // Stream is dead — drop the lock so the user isn't stuck on "Running…".
+          stopListening();
+          setNotice({
+            kind: 'error',
+            text: 'Lost the connection to the run stream. Check Run History for the outcome, or start a new run.',
+          });
+        },
       );
       setNotice({ kind: 'success', text: 'Run started — watch the nodes light up.' });
     } catch (err) {
@@ -379,11 +397,19 @@ function AppCanvas() {
           <button
             className="btn-primary"
             onClick={handleRun}
-            disabled={isRunning || isDirty || !versionId}
-            title={!versionId ? 'Save the workflow first' : isDirty ? 'Save changes before running' : 'Run pipeline'}
+            disabled={isRunning || isRunActive || isDirty || !versionId}
+            title={
+              isRunActive
+                ? 'A run is already in progress'
+                : !versionId
+                ? 'Save the workflow first'
+                : isDirty
+                ? 'Save changes before running'
+                : 'Run pipeline'
+            }
           >
-            {isRunning ? <IconSpinner size={16} /> : <IconPlay size={15} />}
-            {isRunning ? 'Starting…' : 'Run pipeline'}
+            {isRunning || isRunActive ? <IconSpinner size={16} /> : <IconPlay size={15} />}
+            {isRunning ? 'Starting…' : isRunActive ? 'Running…' : 'Run pipeline'}
           </button>
         </div>
       </header>
