@@ -3,7 +3,7 @@
 #
 # scikit-learn, not PyTorch: sklearn is ~30 MB and trains a real model on
 # tabular data in well under a second. torch would add 800 MB+ of wheels for
-# the same demo value. See roadmap.md phase A1.
+# the same demo value. See knowledge_base/roadmap.md phase A1.
 #
 # Pinned exactly for reproducible image builds. pyarrow backs the parquet
 # round-trip that preprocess -> train use to pass the train/test split.
