@@ -120,9 +120,14 @@ export const useRunStore = create<RunState>((set, get) => ({
 
   setRuns: (runs) => set({ runs }),
 
+  /**
+   * Tear down the live stream and release the "a run is active" lock. Called
+   * when the SSE connection dies for good — the backend run may still be going,
+   * but the UI can no longer track it, so it must let the user start another.
+   */
   stopListening: () => {
     get().sseCleanup?.();
-    set({ sseCleanup: null });
+    set({ sseCleanup: null, activeRunId: null, runStatus: null });
   },
 
   clearLogs: () => set({ logs: [] }),

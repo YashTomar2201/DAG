@@ -289,7 +289,8 @@ body {
   opacity: 0.6;
   transition: opacity 0.15s, background-color 0.15s;
 }
-.btn-ghost:hover { opacity: 1; background: rgba(128, 128, 128, 0.14); }
+.btn-ghost:hover:not(:disabled) { opacity: 1; background: rgba(128, 128, 128, 0.14); }
+.btn-ghost:disabled { opacity: 0.28; cursor: not-allowed; }
 
 .text-link {
   color: var(--color-primary);
