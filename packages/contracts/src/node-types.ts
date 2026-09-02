@@ -40,6 +40,12 @@ export const RegistryDeployConfigSchema = z.object({
   registryUrl: z.string().url(),
   /** Model name/tag to register the artifact under */
   modelTag: z.string().min(1),
+  /**
+   * Optional template reference to the trained weights so the deploy step can
+   * record a checksum, e.g. "{{ nodes.train.output.weightsPath }}".
+   * Resolved by the control plane's context-resolver at dispatch time.
+   */
+  weightsPath: z.string().min(1).optional(),
 });
 
 // ─── Node type discriminated union ─────────────────────────────────────────

@@ -34,6 +34,19 @@
   --color-warning: #d4a017;
   --color-error: #c64545;
 
+  /* Colors: Semantic — soft tints for banners / badges on the cream surface */
+  --color-primary-soft: #f4e6df;
+  --color-success-soft: #e6f0e4;
+  --color-warning-soft: #f7edd4;
+  --color-error-soft: #f7e3e1;
+
+  /* Per node-type accent — one source of truth for palette, canvas node, panel */
+  --node-download: #4f9d8f;
+  --node-preprocess: #cc785c;
+  --node-train: #d99a4e;
+  --node-evaluate: #5aa869;
+  --node-deploy: #7a6cc4;
+
   /* Rounding */
   --radius-xs: 4px;
   --radius-sm: 6px;
@@ -54,10 +67,38 @@
   --spacing-section: 96px;
 
   /* Font Families */
-  --font-display: "Copernicus", "Tiempos Headline", "Cormorant Garamond", "EB Garamond", Garamond, "Times New Roman", serif;
+  --font-display: "Copernicus", "Tiempos Headline", "Fraunces", "Cormorant Garamond", "EB Garamond", Garamond, "Times New Roman", serif;
   --font-body: "StyreneB", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-code: "JetBrains Mono", ui-monospace, monospace;
+  --font-code: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
 }
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+/* Visible keyboard-focus ring for accessibility (mouse clicks stay clean). */
+:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+input:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 1px;
+}
+
+/* Slim, theme-matched scrollbars for the side panels and drawers. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-muted-soft) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--color-muted-soft);
+  border-radius: var(--radius-pill);
+}
+*::-webkit-scrollbar-track { background: transparent; }
 
 body {
   margin: 0;
@@ -166,6 +207,10 @@ body {
 
 /* Component Base Styles */
 .btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   background-color: var(--color-primary);
   color: var(--color-on-primary);
   font-family: var(--font-body);
@@ -176,20 +221,31 @@ body {
   padding: 12px 20px;
   height: 40px;
   cursor: pointer;
-  transition: background-color 0.15s;
+  box-shadow: 0 1px 2px rgba(20, 20, 19, 0.12);
+  transition: background-color 0.15s, box-shadow 0.15s, transform 0.05s;
 }
 
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
   background-color: var(--color-primary-active);
+  box-shadow: 0 2px 8px rgba(204, 120, 92, 0.35);
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .btn-primary:disabled {
   background-color: var(--color-primary-disabled);
   color: var(--color-muted);
   cursor: not-allowed;
+  box-shadow: none;
 }
 
 .btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   background-color: var(--color-canvas);
   color: var(--color-ink);
   font-family: var(--font-body);
@@ -200,12 +256,40 @@ body {
   padding: 12px 20px;
   height: 40px;
   cursor: pointer;
-  transition: background-color 0.15s;
+  transition: background-color 0.15s, border-color 0.15s;
 }
 
-.btn-secondary:hover {
+.btn-secondary:hover:not(:disabled) {
   background-color: var(--color-surface-soft);
+  border-color: var(--color-muted-soft);
 }
+
+.btn-secondary:disabled {
+  color: var(--color-muted-soft);
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+.btn-primary svg,
+.btn-secondary svg { flex-shrink: 0; }
+
+/* Ghost icon button — used for close / dismiss / small actions */
+.btn-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: currentColor;
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.15s, background-color 0.15s;
+}
+.btn-ghost:hover { opacity: 1; background: rgba(128, 128, 128, 0.14); }
 
 .text-link {
   color: var(--color-primary);
@@ -217,6 +301,106 @@ body {
 
 .text-link:hover {
   text-decoration: underline;
+}
+
+/* ─── Palette cards ───────────────────────────────────────────────────────── */
+.palette-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  background: var(--color-surface-card);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-lg);
+  cursor: grab;
+  color: var(--color-ink);
+  user-select: none;
+  transition: transform 0.12s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.palette-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--card-accent, var(--color-primary)) 45%, var(--color-hairline));
+  box-shadow: 0 6px 16px rgba(20, 20, 19, 0.08);
+}
+.palette-card:active { cursor: grabbing; transform: translateY(0); }
+
+.palette-card__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  border-radius: var(--radius-md);
+  color: var(--card-accent, var(--color-primary));
+  background: color-mix(in srgb, var(--card-accent, var(--color-primary)) 14%, transparent);
+}
+.palette-card:hover .palette-card__icon { transform: scale(1.06); transition: transform 0.12s ease; }
+
+/* ─── Dark-panel form inputs ─────────────────────────────────────────────── */
+.input-dark {
+  width: 100%;
+  background: var(--color-surface-dark-soft);
+  border: 1px solid var(--color-surface-dark-elevated);
+  border-radius: var(--radius-md);
+  color: var(--color-on-dark);
+  font-family: var(--font-code);
+  font-size: 13px;
+  padding: 9px 12px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input-dark::placeholder { color: var(--color-on-dark-soft); opacity: 0.5; }
+.input-dark:focus {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 25%, transparent);
+}
+
+/* ─── Canvas node ────────────────────────────────────────────────────────── */
+.dag-node {
+  position: relative;
+  min-width: 176px;
+  padding: 12px 14px;
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-dark-elevated);
+  border: 1.5px solid var(--color-surface-dark-soft);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.dag-node:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45); }
+.dag-node__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  color: var(--node-accent, var(--color-primary));
+  background: color-mix(in srgb, var(--node-accent, var(--color-primary)) 18%, transparent);
+}
+.dag-node__del {
+  position: absolute;
+  top: -9px;
+  right: -9px;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  background: var(--color-surface-dark);
+  border: 1.5px solid var(--color-surface-dark-elevated);
+  color: var(--color-on-dark-soft);
+  cursor: pointer;
+  transition: transform 0.1s ease, color 0.12s ease, background-color 0.12s ease;
+}
+.dag-node__del:hover {
+  transform: scale(1.12);
+  color: #fff;
+  background: var(--color-error);
+  border-color: var(--color-error);
 }
 
 /* React Flow customisations for the new theme */
@@ -235,16 +419,52 @@ body {
 
 .react-flow__edge-path,
 .react-flow__connection-path {
-  stroke: var(--color-muted-soft);
+  stroke: #4a4740;
   stroke-width: 2;
 }
+.react-flow__edge.selected .react-flow__edge-path,
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--color-primary);
+}
+.react-flow__arrowhead * { fill: #4a4740; }
 
+.react-flow__controls {
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+}
 .react-flow__controls button {
   background-color: var(--color-surface-dark);
-  border: 1px solid var(--color-surface-dark-elevated);
+  border: none;
+  border-bottom: 1px solid var(--color-surface-dark-elevated);
   color: var(--color-on-dark);
+  width: 26px;
+  height: 26px;
 }
-
 .react-flow__controls button:hover {
   background-color: var(--color-surface-dark-elevated);
+}
+.react-flow__controls button svg { fill: var(--color-on-dark-soft); }
+
+/* Node status ring pulse animation (used by CustomNode for RUNNING / QUEUED) */
+@keyframes pulse {
+  0%   { opacity: 1; transform: scale(1); }
+  50%  { opacity: 0.5; transform: scale(1.35); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* Spinner for in-flight buttons */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.8s linear infinite; }
+
+/* Gentle entrance for panels / banners */
+@keyframes slide-fade-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-in { animation: slide-fade-in 0.18s ease-out; }
+
+/* Prevent the canvas div from overflowing the layout margins */
+.react-flow__renderer {
+  border-radius: var(--radius-lg);
 }

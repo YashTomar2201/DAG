@@ -26,6 +26,17 @@ export async function createWorkflow(
   topoOrder: TopologicalSortResult,
 ): Promise<{ workflowId: string; versionId: string }> {
   const result = await prisma.$transaction(async (tx) => {
+    // Ensure the owning tenant exists before we create a workflow that
+    // foreign-keys to it. The single-tenant visual editor always posts a
+    // fixed tenant id ("default"); upserting here means a freshly-migrated
+    // database needs no separate seed step and `POST /workflows` never fails
+    // with a Workflow_tenantId_fkey violation.
+    await tx.tenant.upsert({
+      where: { id: tenantId },
+      update: {},
+      create: { id: tenantId, name: tenantId === 'default' ? 'Default' : tenantId },
+    });
+
     const workflow = await tx.workflow.create({
       data: { tenantId, name },
     });

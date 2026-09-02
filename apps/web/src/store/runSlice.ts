@@ -8,7 +8,7 @@
  */
 
 import { create } from 'zustand';
-import type { RunSummary } from '../api/client';
+import type { RunRecord } from '../api/client';
 
 export interface NodeStatus {
   status: string;
@@ -29,13 +29,15 @@ export interface RunState {
   runStatus: string | null;
   nodeStatuses: Record<string, NodeStatus>; // keyed by nodeKey
   logs: LogLine[];
-  runs: RunSummary[];        // history list
+  runs: RunRecord[];       // history list — bare RunRecord; RunHistory fetches full detail on demand
   sseCleanup: (() => void) | null;
 
   // Actions
   startListening: (runId: string, cleanup: () => void) => void;
   applyEvent: (type: string, data: unknown) => void;
-  setRuns: (runs: RunSummary[]) => void;
+  addRun: (run: RunRecord) => void;       // push a newly-created run into history
+  upsertRun: (run: RunRecord) => void;    // replace one run in place by id (or prepend if new)
+  setRuns: (runs: RunRecord[]) => void;   // bulk-replace (used by RunHistory refresh)
   stopListening: () => void;
   clearLogs: () => void;
 }
@@ -88,14 +90,15 @@ export const useRunStore = create<RunState>((set, get) => ({
       // ── Log events ──────────────────────────────────────────────────────
       if (type === 'NODE_LOG' && nodeKey) {
         const line = payload['line'] as string;
-        return { logs: [...s.logs.slice(-500), { nodeKey, line, ts: payload['ts'] as number }] };
+        const ts = (payload['ts'] as number) ?? Date.now();
+        return { logs: [...s.logs.slice(-500), { nodeKey, line, ts }] };
       }
       if (type === 'NODE_LOG_BATCH') {
         const logBatch = payload['logs'] as Array<{ nodeKey?: string; payload: { line: string }; ts: number }>;
         const newLines: LogLine[] = (logBatch ?? []).map((l) => ({
           nodeKey: l.nodeKey ?? '',
           line: (l.payload?.line ?? ''),
-          ts: l.ts,
+          ts: l.ts ?? Date.now(),
         }));
         return { logs: [...s.logs.slice(-500 + newLines.length), ...newLines] };
       }
@@ -103,6 +106,17 @@ export const useRunStore = create<RunState>((set, get) => ({
       return {};
     });
   },
+
+  addRun: (run) => set((s) => ({ runs: [run, ...s.runs] })),
+
+  upsertRun: (run) =>
+    set((s) => {
+      const idx = s.runs.findIndex((r) => r.id === run.id);
+      if (idx === -1) return { runs: [run, ...s.runs] };
+      const next = s.runs.slice();
+      next[idx] = run;
+      return { runs: next };
+    }),
 
   setRuns: (runs) => set({ runs }),
 

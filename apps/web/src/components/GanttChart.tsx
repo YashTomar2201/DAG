@@ -6,7 +6,13 @@
 
 import type { NodeRunSummary } from '../api/client';
 
-export function GanttChart({ nodeRuns }: { nodeRuns: NodeRunSummary[] }) {
+export function GanttChart({
+  nodeRuns,
+  nodeLabels = {},
+}: {
+  nodeRuns: NodeRunSummary[];
+  nodeLabels?: Record<string, string>;
+}) {
   if (!nodeRuns.length) return null;
 
   const validRuns = nodeRuns.filter(nr => nr.startedAt);
@@ -35,8 +41,11 @@ export function GanttChart({ nodeRuns }: { nodeRuns: NodeRunSummary[] }) {
 
         return (
           <div key={nr.nodeKey} style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
-            <div style={{ width: 100, fontSize: 11, color: 'var(--color-on-dark-soft)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {nr.nodeKey}
+            <div
+              title={nodeLabels[nr.nodeKey] ?? nr.nodeKey}
+              style={{ width: 100, fontSize: 11, color: 'var(--color-on-dark-soft)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}
+            >
+              {nodeLabels[nr.nodeKey] ?? nr.nodeKey}
             </div>
             <div style={{ flex: 1, position: 'relative', height: 16, background: 'var(--color-surface-dark-soft)', borderRadius: 'var(--radius-xs)' }}>
               <div style={{

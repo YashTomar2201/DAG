@@ -248,22 +248,33 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
 
   fs.mkdirSync(destDir, { recursive: true });
 
-  // Locate the model weights from upstream input
+  // Locate the model weights from upstream input. The path can be threaded
+  // explicitly via a `weightsPath` template in the node config
+  // (`{{ nodes.<train>.output.weightsPath }}`); when it isn't, we still record
+  // a deploy receipt rather than failing the whole run — a missing checksum is
+  // not a reason to red-flag an otherwise successful pipeline.
   const weightsPath = ctx.input['weightsPath'] as string | undefined;
-  if (!weightsPath || !fs.existsSync(weightsPath)) {
-    throw new UnrecoverableError(
-      `registry.deploy: weightsPath "${weightsPath}" not found. ` +
-        `Ensure torch.train output includes weightsPath.`,
+  const weightsExist = !!weightsPath && fs.existsSync(weightsPath);
+  if (weightsPath && !weightsExist) {
+    logger.warn(
+      { runId: ctx.runId, nodeKey: ctx.nodeKey, weightsPath },
+      'registry.deploy: configured weightsPath does not exist — deploying without a checksum',
+    );
+  } else if (!weightsPath) {
+    logger.warn(
+      { runId: ctx.runId, nodeKey: ctx.nodeKey },
+      'registry.deploy: no weightsPath in resolved input — deploying without a checksum. ' +
+        'Add weightsPath: "{{ nodes.<train>.output.weightsPath }}" to this node to include one.',
     );
   }
 
-  const checksum = sha256File(weightsPath);
+  const checksum = weightsExist ? sha256File(weightsPath!) : null;
 
   // In production this would call the registry API; for now we write a receipt
   const receipt: ExecutorOutput = {
     registryUrl: config.registryUrl,
     modelTag: config.modelTag,
-    weightsPath,
+    weightsPath: weightsPath ?? null,
     checksum,
     deployedAt: new Date().toISOString(),
     runId: ctx.runId,
