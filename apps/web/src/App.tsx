@@ -12,7 +12,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { useGraphStore } from './store/graphSlice';
+import { useGraphStore, type GraphSnapshot } from './store/graphSlice';
 import { useRunStore } from './store/runSlice';
 import { CustomNode } from './components/CustomNode';
 import { NodePalette } from './components/NodePalette';
@@ -21,7 +21,7 @@ import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
 
 import { createWorkflow, saveWorkflowVersion, startRun, openRunEventStream, ApiError } from './api/client';
-import { LogoMark, IconPlay, IconSpinner, IconCheck, IconAlert, IconClose } from './components/icons';
+import { LogoMark, IconPlay, IconSpinner, IconCheck, IconAlert, IconClose, IconUndo, IconRedo } from './components/icons';
 
 type Notice = { kind: 'error' | 'success'; text: string };
 
@@ -50,12 +50,23 @@ function AppCanvas() {
   const addNode = useGraphStore((s) => s.addNode);
   const markSaved = useGraphStore((s) => s.markSaved);
   const toGraph = useGraphStore((s) => s.toGraph);
+  const undo = useGraphStore((s) => s.undo);
+  const redo = useGraphStore((s) => s.redo);
+  const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
+  const canUndo = useGraphStore((s) => s.past.length > 0);
+  const canRedo = useGraphStore((s) => s.future.length > 0);
 
   const activeRunId = useRunStore((s) => s.activeRunId);
   const runStatus = useRunStore((s) => s.runStatus);
   const startListening = useRunStore((s) => s.startListening);
+  const stopListening = useRunStore((s) => s.stopListening);
   const applyEvent = useRunStore((s) => s.applyEvent);
   const addRun = useRunStore((s) => s.addRun);
+
+  // A run is in flight from the moment it starts until an SSE terminal event.
+  // Starting a second run mid-flight orphans the first (the UI stops listening
+  // to it), so we block that until the current one finishes.
+  const isRunActive = !!activeRunId && runStatus === 'RUNNING';
 
   // Access the ReactFlow instance for accurate coordinate conversion
   const { screenToFlowPosition, fitView } = useReactFlow();
@@ -96,6 +107,26 @@ function AppCanvas() {
     }
   }, [notice]);
 
+  // Undo / redo keyboard shortcuts. Ignored while typing in a form field so
+  // Ctrl+Z still works normally inside the config panel inputs.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [undo, redo]);
+
   const onConnect = useCallback(
     (connection: Connection) => onConnectStore(connection),
     [onConnectStore]
@@ -110,6 +141,32 @@ function AppCanvas() {
     selectEdge(null);
     selectNode(null);
   }, [selectEdge, selectNode]);
+
+  // Node drags: capture the topology on drag-start, and only push it onto the
+  // undo stack on drag-stop if a position actually changed — so a plain click
+  // on a node never pollutes history or clears the redo stack.
+  const preDragRef = useRef<GraphSnapshot | null>(null);
+  const onNodeDragStart = useCallback(() => {
+    const { nodes, edges } = useGraphStore.getState();
+    preDragRef.current = { nodes, edges };
+  }, []);
+  const onNodeDragStop = useCallback(() => {
+    const before = preDragRef.current;
+    preDragRef.current = null;
+    if (before && before.nodes !== useGraphStore.getState().nodes) {
+      pushSnapshot(before);
+    }
+  }, [pushSnapshot]);
+
+  // Keyboard delete (Backspace/Delete): React Flow removes the node and its
+  // connected edges in separate change batches. Record ONE history snapshot of
+  // the whole graph here, before any of it is applied, so a single undo brings
+  // the node and its edges back together.
+  const onBeforeDelete = useCallback(async () => {
+    const { nodes, edges } = useGraphStore.getState();
+    pushSnapshot({ nodes, edges });
+    return true;
+  }, [pushSnapshot]);
 
   // Apply the persistent highlight to whichever edge is selected. Done here
   // (not in the store) so it's a pure view concern and never marks the graph dirty.
@@ -222,6 +279,10 @@ function AppCanvas() {
 
   async function handleRun() {
     if (isRunning) return;
+    if (isRunActive) {
+      setNotice({ kind: 'error', text: 'A run is already in progress — wait for it to finish.' });
+      return;
+    }
     if (!versionId) {
       setNotice({ kind: 'error', text: 'Save the pipeline first, then run it.' });
       return;
@@ -248,7 +309,15 @@ function AppCanvas() {
         run.id,
         undefined,
         (type, data) => applyEvent(type, data),
-        (err) => console.error('SSE Error:', err),
+        (err) => {
+          console.error('SSE Error:', err);
+          // Stream is dead — drop the lock so the user isn't stuck on "Running…".
+          stopListening();
+          setNotice({
+            kind: 'error',
+            text: 'Lost the connection to the run stream. Check Run History for the outcome, or start a new run.',
+          });
+        },
       );
       setNotice({ kind: 'success', text: 'Run started — watch the nodes light up.' });
     } catch (err) {
@@ -288,6 +357,28 @@ function AppCanvas() {
           </nav>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginRight: 4 }}>
+            <button
+              className="btn-ghost"
+              style={{ width: 32, height: 32, color: 'var(--color-body)' }}
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo"
+            >
+              <IconUndo size={17} />
+            </button>
+            <button
+              className="btn-ghost"
+              style={{ width: 32, height: 32, color: 'var(--color-body)' }}
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Shift+Z)"
+              aria-label="Redo"
+            >
+              <IconRedo size={17} />
+            </button>
+          </div>
           <button
             className="btn-secondary"
             onClick={handleSave}
@@ -306,11 +397,19 @@ function AppCanvas() {
           <button
             className="btn-primary"
             onClick={handleRun}
-            disabled={isRunning || isDirty || !versionId}
-            title={!versionId ? 'Save the workflow first' : isDirty ? 'Save changes before running' : 'Run pipeline'}
+            disabled={isRunning || isRunActive || isDirty || !versionId}
+            title={
+              isRunActive
+                ? 'A run is already in progress'
+                : !versionId
+                ? 'Save the workflow first'
+                : isDirty
+                ? 'Save changes before running'
+                : 'Run pipeline'
+            }
           >
-            {isRunning ? <IconSpinner size={16} /> : <IconPlay size={15} />}
-            {isRunning ? 'Starting…' : 'Run pipeline'}
+            {isRunning || isRunActive ? <IconSpinner size={16} /> : <IconPlay size={15} />}
+            {isRunning ? 'Starting…' : isRunActive ? 'Running…' : 'Run pipeline'}
           </button>
         </div>
       </header>
@@ -424,6 +523,9 @@ function AppCanvas() {
               onConnect={onConnect}
               onEdgeClick={onEdgeClick}
               onPaneClick={onPaneClick}
+              onNodeDragStart={onNodeDragStart}
+              onNodeDragStop={onNodeDragStop}
+              onBeforeDelete={onBeforeDelete}
               nodeTypes={nodeTypes}
               onDragOver={onDragOver}
               onDrop={onDrop}

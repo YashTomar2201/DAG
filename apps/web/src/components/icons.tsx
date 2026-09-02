@@ -166,6 +166,24 @@ export function IconRetry(p: IconProps) {
   );
 }
 
+export function IconUndo(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h11a5 5 0 0 1 0 10h-4" />
+    </svg>
+  );
+}
+
+export function IconRedo(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="m15 14 5-5-5-5" />
+      <path d="M20 9H9a5 5 0 0 0 0 10h4" />
+    </svg>
+  );
+}
+
 export function IconSpinner({ size = 18, ...props }: IconProps) {
   return (
     <svg
