@@ -144,7 +144,8 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {[...runs].reverse().map(run => (
+            {/* `runs` is stored newest-first (addRun prepends), so render as-is. */}
+            {runs.map(run => (
               <div
                 key={run.id}
                 style={{
