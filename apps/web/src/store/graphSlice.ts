@@ -39,6 +39,7 @@ export interface GraphState {
   nodes: Node<NodeData>[];
   edges: Edge[];
   selectedNodeId: string | null;
+  selectedEdgeId: string | null;
   isDirty: boolean;
   cycleHighlight: string[]; // node ids in a rejected cycle
 
@@ -50,7 +51,10 @@ export interface GraphState {
   onConnect: (connection: Connection) => boolean; // returns false if cycle detected
   addNode: (type: string, label: string, position: { x: number; y: number }) => void;
   removeNode: (id: string) => void;
+  removeEdge: (id: string) => void;
   selectNode: (id: string | null) => void;
+  /** Persistently highlight a connecting edge. Pass the same id again to clear. */
+  selectEdge: (id: string | null) => void;
   updateNodeConfig: (id: string, config: Record<string, unknown>) => void;
   updateNodeLabel: (id: string, label: string) => void;
   updateNodeStatus: (nodeKey: string, status: string) => void;
@@ -143,6 +147,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   nodes: _starter.nodes,
   edges: _starter.edges,
   selectedNodeId: null,
+  selectedEdgeId: null,
   isDirty: false,
   cycleHighlight: [],
 
@@ -173,11 +178,30 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   onEdgesChange: (changes) =>
     set((s) => {
       const makesDirty = changes.some((c) => c.type !== 'select');
+      // Drop the persistent highlight if its edge was removed.
+      const removed = changes.some((c) => c.type === 'remove' && c.id === s.selectedEdgeId);
       return {
         edges: applyEdgeChanges(changes, s.edges),
         isDirty: s.isDirty || makesDirty,
+        selectedEdgeId: removed ? null : s.selectedEdgeId,
       };
     }),
+
+  /**
+   * selectEdge: toggle a persistent highlight on a connecting edge. Unlike
+   * React Flow's built-in selection (which clears the moment you click a node
+   * or the pane), this stays lit until the same edge is clicked again, another
+   * edge is picked, or the empty canvas is clicked.
+   */
+  selectEdge: (id) =>
+    set((s) => ({ selectedEdgeId: s.selectedEdgeId === id ? null : id })),
+
+  removeEdge: (id) =>
+    set((s) => ({
+      edges: s.edges.filter((e) => e.id !== id),
+      selectedEdgeId: s.selectedEdgeId === id ? null : s.selectedEdgeId,
+      isDirty: true,
+    })),
 
   /**
    * onConnect: called when the user draws an edge between two handles.
@@ -263,12 +287,17 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * Also clears selectedNodeId if the removed node was selected.
    */
   removeNode: (id) =>
-    set((s) => ({
-      nodes: s.nodes.filter((n) => n.id !== id),
-      edges: s.edges.filter((e) => e.source !== id && e.target !== id),
-      selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId,
-      isDirty: true,
-    })),
+    set((s) => {
+      const edges = s.edges.filter((e) => e.source !== id && e.target !== id);
+      const stillHasSelectedEdge = edges.some((e) => e.id === s.selectedEdgeId);
+      return {
+        nodes: s.nodes.filter((n) => n.id !== id),
+        edges,
+        selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId,
+        selectedEdgeId: stillHasSelectedEdge ? s.selectedEdgeId : null,
+        isDirty: true,
+      };
+    }),
 
   updateNodeConfig: (id, config) =>
     set((s) => ({
