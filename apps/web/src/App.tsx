@@ -1,11 +1,14 @@
-import { useCallback, useState, useRef, useEffect, type DragEvent } from 'react';
+import { useCallback, useState, useRef, useEffect, useMemo, type DragEvent } from 'react';
 import {
   ReactFlow,
   ReactFlowProvider,
   Background,
   Controls,
+  MarkerType,
   useReactFlow,
   type Connection,
+  type Edge,
+  type EdgeMouseHandler,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
@@ -37,10 +40,13 @@ const nodeTypes = {
 function AppCanvas() {
   const nodes = useGraphStore((s) => s.nodes);
   const edges = useGraphStore((s) => s.edges);
+  const selectedEdgeId = useGraphStore((s) => s.selectedEdgeId);
+  const selectEdge = useGraphStore((s) => s.selectEdge);
   const isDirty = useGraphStore((s) => s.isDirty);
   const onNodesChange = useGraphStore((s) => s.onNodesChange);
   const onEdgesChange = useGraphStore((s) => s.onEdgesChange);
   const onConnectStore = useGraphStore((s) => s.onConnect);
+  const selectNode = useGraphStore((s) => s.selectNode);
   const addNode = useGraphStore((s) => s.addNode);
   const markSaved = useGraphStore((s) => s.markSaved);
   const toGraph = useGraphStore((s) => s.toGraph);
@@ -93,6 +99,35 @@ function AppCanvas() {
   const onConnect = useCallback(
     (connection: Connection) => onConnectStore(connection),
     [onConnectStore]
+  );
+
+  // Click an edge to keep it lit; click it again or click empty canvas to clear.
+  const onEdgeClick = useCallback<EdgeMouseHandler>(
+    (_evt, edge) => selectEdge(edge.id),
+    [selectEdge],
+  );
+  const onPaneClick = useCallback(() => {
+    selectEdge(null);
+    selectNode(null);
+  }, [selectEdge, selectNode]);
+
+  // Apply the persistent highlight to whichever edge is selected. Done here
+  // (not in the store) so it's a pure view concern and never marks the graph dirty.
+  const displayEdges = useMemo<Edge[]>(
+    () =>
+      edges.map((e) =>
+        e.id === selectedEdgeId
+          ? {
+              ...e,
+              animated: true,
+              zIndex: 10,
+              // Concrete hex, not a CSS var — SVG marker fill won't resolve var().
+              style: { ...e.style, stroke: '#cc785c', strokeWidth: 2.5 },
+              markerEnd: { type: MarkerType.ArrowClosed, color: '#cc785c' },
+            }
+          : e,
+      ),
+    [edges, selectedEdgeId],
   );
 
   const onDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -383,10 +418,12 @@ function AppCanvas() {
           >
             <ReactFlow
               nodes={nodes}
-              edges={edges}
+              edges={displayEdges}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
+              onEdgeClick={onEdgeClick}
+              onPaneClick={onPaneClick}
               nodeTypes={nodeTypes}
               onDragOver={onDragOver}
               onDrop={onDrop}
