@@ -21,6 +21,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code — local, machine-specific
+.claude/settings.local.json
+.claude/launch.json
+
 # Prisma generated client
 packages/db/src/generated/
 

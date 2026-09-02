@@ -49,8 +49,10 @@ export interface GraphState {
   onEdgesChange: (changes: EdgeChange[]) => void;
   onConnect: (connection: Connection) => boolean; // returns false if cycle detected
   addNode: (type: string, label: string, position: { x: number; y: number }) => void;
+  removeNode: (id: string) => void;
   selectNode: (id: string | null) => void;
   updateNodeConfig: (id: string, config: Record<string, unknown>) => void;
+  updateNodeLabel: (id: string, label: string) => void;
   updateNodeStatus: (nodeKey: string, status: string) => void;
   clearCycleHighlight: () => void;
   markSaved: () => void;
@@ -62,11 +64,84 @@ export interface GraphState {
 let _nodeCounter = 0;
 function nextId() { return `node-${++_nodeCounter}`; }
 
+// ─── Starter graph ────────────────────────────────────────────────────────────
+// The canvas opens with the reference ML pipeline from PROJECT_GUIDE.md §1 so a
+// first-time visitor sees a real, runnable workflow instead of a blank page.
+// It is pre-filled with valid config and marked clean (not dirty).
+
+function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
+  const mk = (
+    id: string,
+    label: string,
+    nodeType: string,
+    config: Record<string, unknown>,
+    x: number,
+    y: number,
+  ): Node<NodeData> => ({
+    id,
+    position: { x, y },
+    type: 'dagNode',
+    data: { label, nodeType, config, status: 'PENDING' },
+  });
+
+  _nodeCounter = 4;
+  const nodes: Node<NodeData>[] = [
+    mk('node-1', 'Extract dataset', 'kaggle.download',
+      { datasetSlug: 'kaggle/titanic', outputDir: 'artifacts/raw' }, 0, 120),
+    mk('node-2', 'Preprocess', 'pandas.preprocess',
+      { scriptPath: 'preprocess.py' }, 260, 120),
+    mk('node-3', 'Train model', 'torch.train',
+      { scriptPath: 'train.py', epochs: 10, outputWeightsPath: 'model.pt' }, 520, 120),
+    mk('node-4', 'Evaluate', 'model.evaluate',
+      { scriptPath: 'evaluate.py', minAccuracy: 0.8 }, 780, 120),
+  ];
+
+  const edge = (from: string, to: string): Edge => ({
+    id: `e-${from}-${to}`,
+    source: from,
+    target: to,
+    type: 'smoothstep',
+    markerEnd: { type: MarkerType.ArrowClosed },
+  });
+
+  const edges: Edge[] = [
+    edge('node-1', 'node-2'),
+    edge('node-2', 'node-3'),
+    edge('node-3', 'node-4'),
+  ];
+
+  return { nodes, edges };
+}
+
+const _starter = starterGraph();
+
+/**
+ * Drops entries whose value is empty / null / undefined so optional config
+ * fields (`z.string().min(1).optional()`) don't get rejected as empty strings,
+ * and coerces the few numeric fields the API expects as real numbers rather
+ * than the strings an <input> produces.
+ */
+const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy']);
+
+function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config ?? {})) {
+    if (value === '' || value === null || value === undefined) continue;
+    if (NUMERIC_CONFIG_KEYS.has(key) && typeof value === 'string') {
+      const n = Number(value);
+      if (!Number.isNaN(n)) out[key] = n;
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useGraphStore = create<GraphState>((set, get) => ({
-  nodes: [],
-  edges: [],
+  nodes: _starter.nodes,
+  edges: _starter.edges,
   selectedNodeId: null,
   isDirty: false,
   cycleHighlight: [],
@@ -79,18 +154,30 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * changes (move, select, remove). We must apply them through the store
    * — not directly on local component state — so Zustand stays the single
    * source of truth and any selector watching `nodes` sees the update.
+   *
+   * We only mark the canvas dirty for changes that actually mutate the graph
+   * structure or positions. `select` and `dimensions` changes are cosmetic
+   * and should NOT mark the workflow as needing a save — doing so would
+   * disable the Run button every time the user clicks a node.
    */
   onNodesChange: (changes) =>
-    set((s) => ({
-      nodes: applyNodeChanges(changes, s.nodes) as Node<NodeData>[],
-      isDirty: true,
-    })),
+    set((s) => {
+      const DIRTY_TYPES = new Set(['position', 'remove', 'add', 'reset']);
+      const makesDirty = changes.some((c) => DIRTY_TYPES.has(c.type));
+      return {
+        nodes: applyNodeChanges(changes, s.nodes) as Node<NodeData>[],
+        isDirty: s.isDirty || makesDirty,
+      };
+    }),
 
   onEdgesChange: (changes) =>
-    set((s) => ({
-      edges: applyEdgeChanges(changes, s.edges),
-      isDirty: true,
-    })),
+    set((s) => {
+      const makesDirty = changes.some((c) => c.type !== 'select');
+      return {
+        edges: applyEdgeChanges(changes, s.edges),
+        isDirty: s.isDirty || makesDirty,
+      };
+    }),
 
   /**
    * onConnect: called when the user draws an edge between two handles.
@@ -171,10 +258,36 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   selectNode: (id) => set({ selectedNodeId: id }),
 
+  /**
+   * removeNode: removes a node and all edges that reference it.
+   * Also clears selectedNodeId if the removed node was selected.
+   */
+  removeNode: (id) =>
+    set((s) => ({
+      nodes: s.nodes.filter((n) => n.id !== id),
+      edges: s.edges.filter((e) => e.source !== id && e.target !== id),
+      selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId,
+      isDirty: true,
+    })),
+
   updateNodeConfig: (id, config) =>
     set((s) => ({
       nodes: s.nodes.map((n) =>
         n.id === id ? { ...n, data: { ...n.data, config } } : n,
+      ),
+      isDirty: true,
+    })),
+
+  /**
+   * updateNodeLabel: updates the visible label on a node.
+   * Kept separate from updateNodeConfig because label is stored in
+   * data.label (shown in the node header) whereas config holds
+   * the execution parameters.
+   */
+  updateNodeLabel: (id, label) =>
+    set((s) => ({
+      nodes: s.nodes.map((n) =>
+        n.id === id ? { ...n, data: { ...n.data, label } } : n,
       ),
       isDirty: true,
     })),
@@ -205,7 +318,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         type: n.data.nodeType as any,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        config: n.data.config as any,
+        config: sanitizeConfig(n.data.config) as any,
         position: { x: n.position.x, y: n.position.y },
       })),
       edges: edges.map((e) => ({ from: e.source, to: e.target })),
