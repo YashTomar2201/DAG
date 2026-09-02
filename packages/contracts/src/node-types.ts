@@ -31,10 +31,23 @@ export const PandasPreprocessConfigSchema = z.object({
 
 export const TorchTrainConfigSchema = z.object({
   scriptPath: z.string().min(1).default('train.py'),
-  /** Number of training epochs */
+  /** Iteration budget — trees for randomforest, solver iterations for logreg */
   epochs: z.coerce.number().int().positive().default(10),
   /** Path to save model weights (relative to ARTIFACT_DIR) */
   outputWeightsPath: z.string().min(1).optional(),
+  /** Estimator to fit. Defaults to randomforest in the script. */
+  modelType: z.enum(['randomforest', 'logreg']).optional(),
+  /**
+   * Template ref to the training split from preprocess, e.g.
+   * "{{ nodes.preprocess.output.trainPath }}". Resolved by the control plane.
+   */
+  trainPath: z.string().min(1).optional(),
+  /**
+   * Template ref to the label column, e.g.
+   * "{{ nodes.preprocess.output.targetColumn }}". Falls back to the parquet's
+   * last column (which preprocess writes as the target).
+   */
+  targetColumn: z.string().min(1).optional(),
   kwargs: z.record(z.unknown()).optional(),
 });
 

@@ -5,6 +5,77 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.3: real training
+
+**Phase:** roadmap A1.3 — third of the A1 arc. `torch.train` now fits a real
+scikit-learn estimator on the preprocessed split and logs a genuine
+per-iteration train score. `model.evaluate` stays a stub for one more part
+(A1.4), so the pipeline still finishes green.
+
+### Changes
+
+- **`apps/worker/python/train.py`** — rewritten. Same stdio protocol. Reads
+  `trainPath` (the `train.parquet` from preprocess), `targetColumn`, `modelType`
+  ("randomforest" default, or "logreg"), and `epochs` from the context.
+  - **randomforest:** `warm_start=True`, `n_estimators` grown 1 → epochs, refit
+    each step — a real score progression (bootstrap noise makes it
+    non-monotonic). Deterministic (`random_state=42`) so the idempotency
+    checksum is stable.
+  - **logreg:** refit with a growing `max_iter` budget each step — a genuine
+    convergence progression. The expected `ConvergenceWarning` is silenced so
+    the log stays the score lines.
+  - Model persisted with `joblib.dump` — a real pickle (~223 KB for RF on the
+    Titanic split; `joblib.load` returns a fitted `RandomForestClassifier`),
+    not the 11 bytes `STUBWEIGHTS`. Result carries `modelType`, `trainScore`,
+    `scoreHistory`, `featureNames`, `nFeatures`, `nTrain`, and a `sha256` of
+    the weights file.
+  - Falls back to a deterministic `make_classification(400×8)` when no
+    `trainPath` is wired, so un-updated graphs and the integration fixtures
+    still train something real and stay green.
+- **`packages/contracts/src/node-types.ts`** — `TorchTrainConfigSchema` gains
+  optional `modelType` (`z.enum(['randomforest','logreg'])`), `trainPath`,
+  `targetColumn`. Templates only survive if the key is on the schema
+  (`z.object()` strips unknowns — the `registry.deploy` bug).
+- **`apps/web/src/components/ConfigPanel.tsx`** — Model / Train Data Ref /
+  Target Column Ref inputs for `torch.train`; weights placeholder → `model.joblib`.
+- **`apps/web/src/store/graphSlice.ts`** — starter graph's Train node wires
+  `trainPath: '{{ nodes.node-2.output.trainPath }}'`,
+  `targetColumn: '{{ nodes.node-2.output.targetColumn }}'`,
+  `modelType: 'randomforest'`, `outputWeightsPath: 'model.joblib'`.
+
+### Verification
+
+- `train.py` run directly on the A1.2 `train.parquet`:
+  - randomforest, epochs 8 → `scoreHistory [0.8975, 0.8947, 0.9494, 0.9424,
+    0.9733, 0.9691, 0.9803, 0.9761]` — **non-monotonic**; 178 KB joblib file;
+    identical checksum across two runs.
+  - logreg → `trainScore 0.68` vs RF `0.98` — **`modelType` changes the score**.
+- End-to-end on the live 4-worker stack (templates resolved,
+  `trainPath` threaded from preprocess): preprocess → train → evaluate all
+  SUCCEEDED for both `randomforest` (`trainScore 0.982`) and `logreg`
+  (`trainScore 0.684`, different checksum). SSE log shows real
+  `[train] iter i/10 ... train_score=…` lines. In-container
+  `joblib.load(model.joblib)` → `RandomForestClassifier n_estimators=10`.
+- `pnpm -r typecheck` clean; contracts 18 / worker 12 / api 35 unit tests
+  green; contracts + web lint clean.
+
+### Note — bundled Dockerfile layer-ordering commit
+
+This branch also carries `build(worker): install Python deps before copying app
+code` (from the spun-off background task): the runtime stage now `COPY`s only
+`requirements.txt` and runs `pip install` **before** `COPY --from=deploy /out ./`,
+so editing worker source no longer busts the ~1-minute wheel-download layer.
+Verified: `docker compose build worker` a second time reuses the pip layer
+(`#34 … CACHED`).
+
+### Files
+
+`apps/worker/python/train.py`, `packages/contracts/src/node-types.ts`,
+`apps/web/src/components/ConfigPanel.tsx`, `apps/web/src/store/graphSlice.ts`
+(+ `infra/Dockerfile.worker` from the background task).
+
+---
+
 ## 2026-09-03 — A1.2: real preprocessing on a bundled dataset
 
 **Phase:** roadmap A1.2 — second of the A1 arc. The `pandas.preprocess` node now

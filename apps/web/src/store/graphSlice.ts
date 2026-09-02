@@ -114,7 +114,9 @@ function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
     mk('node-2', 'Preprocess', 'pandas.preprocess',
       { scriptPath: 'preprocess.py', csvPath: 'python/data/titanic.csv', targetColumn: 'Survived', testSize: 0.2 }, 260, 120),
     mk('node-3', 'Train model', 'torch.train',
-      { scriptPath: 'train.py', epochs: 10, outputWeightsPath: 'model.pt' }, 520, 120),
+      { scriptPath: 'train.py', modelType: 'randomforest', epochs: 10, outputWeightsPath: 'model.joblib',
+        trainPath: '{{ nodes.node-2.output.trainPath }}',
+        targetColumn: '{{ nodes.node-2.output.targetColumn }}' }, 520, 120),
     mk('node-4', 'Evaluate', 'model.evaluate',
       { scriptPath: 'evaluate.py', minAccuracy: 0.8 }, 780, 120),
   ];

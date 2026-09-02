@@ -121,31 +121,32 @@ node's output value.
 
 ## 6. Worker Executors Are Mock ML — Not Real ML
 
-**What exists:** `apps/worker/python/train.py` and `evaluate.py` are still pure Python-stdlib
-fixtures that simulate ML steps with filesystem writes and `time.sleep`. `train.py` writes the
-literal bytes `STUBWEIGHTS`; `evaluate.py` returns a hardcoded `0.923` every time.
+**What exists:** `apps/worker/python/evaluate.py` is still a pure Python-stdlib fixture — it
+returns a hardcoded `accuracy: 0.923` every time, ignoring the model and the test split.
 
-**What is missing:** Real `scikit-learn` training and held-out-set evaluation in the scripts,
-and an honest data source (`kaggle.download` still shells out to a `kaggle` binary that is not
-in the image).
+**What is missing:** Real held-out-set evaluation in `evaluate.py`, and an honest data source
+(`kaggle.download` still shells out to a `kaggle` binary that is not in the image).
 
 **Progress:**
 - **A1.1 (done)** — the worker image can hold real ML libraries. The runtime stage is
   Debian-based (`node:22-slim`) with `pandas` / `scikit-learn` / `joblib` / `pyarrow` in a venv.
 - **A1.2 (done)** — `preprocess.py` does real work: loads a bundled CSV
   (`python/data/titanic.csv`), drops high-null and identifier columns, median/mode-imputes,
-  one-hot encodes, and writes a real `train_test_split` parquet pair. Its row/column counts,
-  feature list, and content checksum all move when the data or the `csvPath` / `targetColumn` /
-  `testSize` config changes.
+  one-hot encodes, and writes a real `train_test_split` parquet pair. Row/column counts,
+  feature list, and content checksum all move with the data or the config.
+- **A1.3 (done)** — `train.py` fits a real scikit-learn estimator (`randomforest` or `logreg`)
+  on the preprocessed split, logs a genuine per-iteration train score, and persists the model
+  with `joblib` (a real pickle, not the literal bytes `STUBWEIGHTS`). Switching `modelType`
+  changes the score and the checksum.
 
-**To close it (remaining — roadmap A1.3–A1.5):**
-- **A1.3** — real `sklearn` estimator in `train.py` with genuine per-iteration progress logs.
-- **A1.4** — real held-out-set metrics in `evaluate.py`, making the `minAccuracy` gate in
-  `executors.ts` a real quality gate instead of theatre.
+**To close it (remaining — roadmap A1.4–A1.5):**
+- **A1.4** — real held-out-set metrics in `evaluate.py` (load the joblib model + `test.parquet`,
+  compute accuracy / f1 / confusion matrix), making the `minAccuracy` gate in `executors.ts` a
+  real quality gate instead of theatre.
 - **A1.5** — replace `kaggle.download` with an honest data source (validate/copy a local CSV or
   fetch a URL), so the first node does real deterministic work with no credentials.
-- Note: the worker and Node↔Python bridge infrastructure are production-ready; only the two
-  remaining scripts and the `data.source` / `kaggle.download` node type need to change.
+- Note: the worker and Node↔Python bridge infrastructure are production-ready; only the last
+  script and the `data.source` / `kaggle.download` node type need to change.
 
 ---
 
