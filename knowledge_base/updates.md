@@ -5,6 +5,63 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.1: a Python runtime that can hold real ML libraries
+
+**Phase:** roadmap A1.1 — the first of the five-part A1 ("real ML executors")
+arc. This part ships the *capability*, not the logic: the executor scripts
+(`apps/worker/python/{preprocess,train,evaluate}.py`) are still the stdlib
+stubs, so the pipeline behaves exactly as before. A1.2+ replace the scripts.
+
+### Gap
+
+`infra/Dockerfile.worker`'s runtime stage was `node:22-alpine` (musl) and
+installed only the bare `python3` interpreter — the header comment even
+explained why pandas/torch were *deliberately* left out. There are no musl
+wheels for pandas / scikit-learn, so `pip install pandas` on that image tries
+to compile from source and fails (or takes ~40 min). The image was
+structurally incapable of running real ML, which blocks every later A1 part.
+
+### Fix
+
+- **New `apps/worker/python/requirements.txt`** — `pandas==2.2.3`,
+  `scikit-learn==1.5.2`, `joblib==1.4.2`, `pyarrow==17.0.0`, pinned exactly for
+  reproducible image builds. scikit-learn, not PyTorch: ~30 MB installed vs
+  800 MB+ of torch wheels for the same tabular-demo value.
+- **`infra/Dockerfile.worker`** — the whole `fetch → build → deploy → runtime`
+  chain moved from `node:22-alpine` to `node:22-slim` (Debian / glibc). One
+  libc across every stage on purpose: native modules compiled in `build` (the
+  Prisma query engine, msgpackr-extract) are `COPY --from=deploy`'d verbatim
+  into `runtime`, and a musl binary can't load in a glibc image.
+  - `runtime` stage installs `python3 python3-venv python3-pip`, creates
+    `/opt/venv`, and `pip install --no-cache-dir -r python/requirements.txt`
+    into it. The venv sidesteps Debian's `externally-managed-environment`
+    error that a bare `pip install` hits.
+  - `ENV PATH="/opt/venv/bin:${PATH}"` so `python-bridge.ts`'s
+    `spawn('python3', …)` resolves to the venv interpreter with **no code
+    change**.
+  - `build` stage gains `build-essential python3` so any native npm dep
+    without a prebuilt Debian binary can still compile during `pnpm install`.
+  - Header comment rewritten — the old text argued for omitting the deps; that
+    rationale is now obsolete.
+
+### Verification
+
+- `docker compose -f infra/docker-compose.yml build worker` — clean; pip
+  pulled prebuilt `manylinux` wheels for every package (no source builds).
+- `docker compose … exec worker python3 -c "import pandas, sklearn, joblib,
+  pyarrow"` — ok (pandas 2.2.3, sklearn 1.5.2); `command -v python3` →
+  `/opt/venv/bin/python3`.
+- Stub pipeline still green end-to-end: `POST /workflows` + `POST /runs` on the
+  live 4-worker stack → run **SUCCEEDED**, all 4 NodeRuns SUCCEEDED, stub
+  outputs (`accuracy 0.923`, `rows 100`) unchanged.
+- `docker images infra-worker` — **1.31 GB**, under the ~1.5 GB target.
+
+### Files
+
+`infra/Dockerfile.worker`, `apps/worker/python/requirements.txt` (new).
+
+---
+
 ## 2026-09-02 — Editor interaction & run-control fixes
 
 Follow-up round after the redesign, all in `apps/web`. Shipped as PRs #2–#4

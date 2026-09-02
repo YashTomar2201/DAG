@@ -1,0 +1,14 @@
+# Python dependencies for the worker's executor scripts (preprocess / train /
+# evaluate). Installed into a venv in infra/Dockerfile.worker's runtime stage.
+#
+# scikit-learn, not PyTorch: sklearn is ~30 MB and trains a real model on
+# tabular data in well under a second. torch would add 800 MB+ of wheels for
+# the same demo value. See roadmap.md phase A1.
+#
+# Pinned exactly for reproducible image builds. pyarrow backs the parquet
+# round-trip that preprocess -> train use to pass the train/test split.
+
+pandas==2.2.3
+scikit-learn==1.5.2
+joblib==1.4.2
+pyarrow==17.0.0

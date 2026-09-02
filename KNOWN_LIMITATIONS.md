@@ -126,18 +126,24 @@ Python-stdlib fixtures that simulate ML steps with filesystem writes and `time.s
 exercise the Node↔Python bridge, idempotency checks, and heartbeat machinery correctly, but they
 do not perform real data processing.
 
-**What is missing:** Real Pandas, real PyTorch, real Kaggle downloads. The Docker worker image
-intentionally omits `pandas` and `torch` (see `KNOWN_LIMITATIONS.md §6` and the Dockerfile
-comment).
+**What is missing:** Real Pandas / scikit-learn logic in the scripts, and an honest data source
+(`kaggle.download` still shells out to a `kaggle` binary that is not in the image).
 
-**To close it:**
-- Add a `requirements.txt` to `apps/worker/python/` listing `pandas`, `torch`, `scikit-learn`,
-  etc., and uncomment the `RUN pip3 install -r requirements.txt` line in `infra/Dockerfile.worker`.
-- Replace the fixture scripts with real logic: real `kaggle` CLI calls in `download.py`, real
-  `pd.read_csv` + feature engineering in `preprocess.py`, real `torch.nn.Module` training in
-  `train.py`.
-- Note: the real `kaggle.download` executor already shells out to the Kaggle CLI — only the
-  Python scripts need replacement. The worker and bridge infrastructure are production-ready.
+**Progress (roadmap A1.1, done):** the worker image can now hold real ML libraries. The runtime
+stage is Debian-based (`node:22-slim`) and `pandas`, `scikit-learn`, `joblib`, and `pyarrow` are
+installed into a venv from `apps/worker/python/requirements.txt`; `import pandas, sklearn`
+succeeds inside the container. The scripts themselves are still the stdlib stubs — they don't
+import those libraries yet.
+
+**To close it (remaining — roadmap A1.2–A1.5):**
+- Rewrite the fixture scripts with real logic: `pd.read_csv` + feature engineering + a real
+  train/test split in `preprocess.py`, a real `sklearn` estimator with genuine per-iteration
+  progress in `train.py`, and real held-out-set metrics in `evaluate.py` — so the `minAccuracy`
+  gate in `executors.ts` becomes a real quality gate instead of theatre.
+- Replace `kaggle.download` with an honest data source (a bundled dataset copied/validated
+  locally, or a URL fetch), so the first node does real deterministic work with no credentials.
+- Note: the worker and Node↔Python bridge infrastructure are production-ready; only the scripts
+  and the `data.source` / `kaggle.download` node type need to change.
 
 ---
 

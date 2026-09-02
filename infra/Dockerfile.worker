@@ -2,30 +2,33 @@
 #
 # Multi-stage build for the data plane (apps/worker).
 #
-# Same tsx-at-runtime and `pnpm deploy` rationale as Dockerfile.api — see
-# that file's header for both.
+# Same tsx-at-runtime and `pnpm deploy` rationale as Dockerfile.api — see that
+# file's header for both.
 #
-# Python: the executor scripts (apps/worker/python/*.py — preprocess.py,
-# train.py, evaluate.py) are pure-stdlib fixtures (no pandas/torch import —
-# see knowledge_base/decisions_log.md Phase 8/12 for why: they exist to
-# exercise the real Node<->Python bridge and the worker's idempotency/
-# heartbeat machinery under test and load, not to run real ML). Only the
-# `python3` interpreter itself is installed here. A deployment that swaps in
-# real pandas/torch-based scripts would add
-# `RUN pip3 install --no-cache-dir -r requirements.txt` right after the
-# `apk add` line below — deliberately not done here, since shipping multi-
-# gigabyte PyTorch wheels for scripts that never import torch would bloat
-# this image for zero functional benefit.
+# Python: as of roadmap phase A1 the executor scripts (apps/worker/python/*.py)
+# do real work — they import pandas / scikit-learn / joblib. Those wheels are
+# glibc-only (there are no musl builds), so this image is Debian-based
+# (node:22-slim), unlike Dockerfile.api which stays on Alpine. The Python deps
+# are installed into a venv in the runtime stage from
+# apps/worker/python/requirements.txt; PATH is prepended with the venv so
+# python-bridge.ts's `spawn('python3', ...)` resolves to it with no code change.
 #
-# process.cwd() matters here: python-bridge.ts resolves the script directory
-# as `path.resolve(process.cwd(), 'python')`. `pnpm --filter @dag/worker
-# deploy` copies apps/worker's own directory contents (including python/)
-# to the deploy target's root, and the runtime stage's WORKDIR is that same
-# root — so `python/` lands exactly where the worker looks for it with no
-# extra path juggling.
+# Why the WHOLE chain (fetch -> build -> deploy -> runtime) is on one libc:
+# native modules compiled during `build` (the Prisma query engine,
+# msgpackr-extract, ...) are copied verbatim into `runtime` by
+# `COPY --from=deploy`. A musl binary cannot load in a glibc image, so runtime
+# must match the stage that built those binaries.
+#
+# process.cwd() note (unchanged): `pnpm --filter @dag/worker deploy` copies
+# apps/worker's own directory contents (including python/) to /out, and the
+# runtime WORKDIR is that same root — so python-bridge.ts finds python/ (and
+# python/requirements.txt) with no path juggling.
 
-FROM node:22-alpine AS base
-RUN apk add --no-cache openssl && corepack enable && corepack prepare pnpm@11.6.0 --activate
+FROM node:22-slim AS base
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && corepack enable && corepack prepare pnpm@11.6.0 --activate
 WORKDIR /app
 ENV CI=true
 
@@ -34,6 +37,11 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm fetch
 
 FROM fetch AS build
+# build-essential + python3 so any native dependency without a prebuilt Debian
+# binary can still compile from source during `pnpm install`.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential python3 \
+ && rm -rf /var/lib/apt/lists/*
 COPY . .
 RUN pnpm install --offline --frozen-lockfile
 RUN pnpm --filter @dag/db exec prisma generate --schema=./prisma/schema.prisma
@@ -42,7 +50,16 @@ FROM build AS deploy
 RUN pnpm --filter @dag/worker deploy --prod --legacy /out
 
 FROM base AS runtime
-RUN apk add --no-cache python3
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv python3-pip \
+ && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
 COPY --from=deploy /out ./
+# Python deps for the executor scripts, isolated in a venv (Debian blocks a
+# bare `pip install` with "externally-managed-environment"). The PATH prepend
+# makes `python3` resolve to this interpreter.
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir -r python/requirements.txt
+ENV PATH="/opt/venv/bin:${PATH}"
 CMD ["node_modules/.bin/tsx", "src/index.ts"]
