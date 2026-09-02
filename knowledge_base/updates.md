@@ -5,6 +5,83 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-02 — Editor interaction & run-control fixes
+
+Follow-up round after the redesign, all in `apps/web`. Shipped as PRs #2–#4
+(#3 was accidentally merged into the feature branch instead of `main`; #4
+re-targeted it, so all of this is on `main` as of merge commit `55147d6`).
+
+### 1. Persistent highlight when an edge is clicked  (PR #2)
+
+**Symptom:** clicking a connecting arrow lit it briefly, then the highlight
+vanished the moment you clicked a node or the canvas.
+
+**Cause:** it relied on React Flow's built-in selection, which clears on the next
+click anywhere.
+
+**Fix:**
+- `graphSlice.ts` — new `selectedEdgeId` + `selectEdge` (click again to toggle
+  off) and `removeEdge`; the id is cleared when its edge or an endpoint node is
+  removed.
+- `App.tsx` — `onEdgeClick` sets the highlight, `onPaneClick` clears it (and node
+  selection). A `displayEdges` memo applies a terracotta stroke + animated
+  marching-ants marker to the selected edge — a pure view concern, so it never
+  marks the graph dirty.
+
+### 2. Undo / redo for structural edits  (PR #3 → #4)
+
+**Why:** accidentally deleting a node or edge (or a stray drag) had no recovery.
+
+**Fix:** `graphSlice.ts` keeps `past` / `future` snapshot stacks (cap 50). A
+`withHistory()` helper is merged into every structural action — `addNode`,
+`removeNode`, `removeEdge`, `onConnect`; `undo` / `redo` swap the topology and
+clear selection. `pushSnapshot(snap)` lets the view layer record a
+caller-captured snapshot.
+
+`App.tsx`:
+- **Ctrl/Cmd+Z** = undo, **Ctrl/Cmd+Shift+Z** or **Ctrl+Y** = redo — ignored
+  while a form field is focused, so text-undo still works in the config panel.
+- Two header **↶ ↷** buttons (`IconUndo` / `IconRedo`), disabled when the stack
+  is empty.
+- Node drags snapshot on `onNodeDragStart` into a ref and only commit on
+  `onNodeDragStop` if a position actually changed — a plain click never pollutes
+  history or wipes the redo stack.
+- A keyboard **Delete** removes the node and its connected edges in *separate*
+  React Flow change batches, which would split one action into two undo steps.
+  A single snapshot is taken in `onBeforeDelete` (before anything is applied) so
+  one undo brings the node **and its edges** back together.
+
+### 3. Run History: newest run on top  (folded into PR #3)
+
+`RunHistory.tsx` rendered `[...runs].reverse()`, but `addRun` already prepends
+new runs — so the list showed oldest-first. Dropped the `.reverse()`.
+
+### 4. Can't start a run while one is in progress  (folded into PR #3)
+
+**Symptom:** starting a second run mid-flight — the new one finished but the
+previous stayed stuck on "RUNNING" in Run History.
+
+**Cause:** `handleRun` only guarded the local `isRunning` flag, which is true
+just for the `POST /runs` call, not the run's lifetime. The second run stole the
+SSE stream and orphaned the first.
+
+**Fix:** `App.tsx` derives `isRunActive` from the run store
+(`activeRunId && runStatus === 'RUNNING'`) and uses it to disable the Run button
+(label → "Running…") and hard-block `handleRun`. Safety valve: on a dead SSE
+stream, `runSlice.stopListening()` now also clears `activeRunId` / `runStatus`
+so the UI can never get permanently stuck; the user gets a notice pointing to
+Run History.
+
+### Verification
+
+`pnpm -r typecheck` · `pnpm --filter @dag/web lint` · web build — all clean.
+In-browser: edge highlight persists across node/pane clicks; delete node (panel
+and Delete key) → one undo restores node + edges; edge delete + drag undo/redo;
+Run button locks to "Running…" for the whole run, second run then records
+cleanly, both rows terminal with newest on top.
+
+---
+
 ## 2026-09-02 — Frontend redesign (de-AI-ify the UI)
 
 Goal: the editor read as "AI-generated" — emoji icons everywhere, a spiky mark
