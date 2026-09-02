@@ -35,6 +35,15 @@ export type NodeData = Record<string, unknown> & {
   status?: string;  // PENDING | QUEUED | RUNNING | SUCCEEDED | FAILED | SKIPPED
 };
 
+/** A point-in-time copy of the graph topology, used for undo / redo. */
+export interface GraphSnapshot {
+  nodes: Node<NodeData>[];
+  edges: Edge[];
+}
+
+/** How many structural edits we remember. */
+const HISTORY_LIMIT = 50;
+
 export interface GraphState {
   nodes: Node<NodeData>[];
   edges: Edge[];
@@ -42,6 +51,11 @@ export interface GraphState {
   selectedEdgeId: string | null;
   isDirty: boolean;
   cycleHighlight: string[]; // node ids in a rejected cycle
+
+  // Undo / redo history (structural edits only: add/remove node, add/remove
+  // edge, move node). `past` is oldest→newest; `future` is what redo replays.
+  past: GraphSnapshot[];
+  future: GraphSnapshot[];
 
   // Actions
   setNodes: (nodes: Node<NodeData>[]) => void;
@@ -61,6 +75,11 @@ export interface GraphState {
   clearCycleHighlight: () => void;
   markSaved: () => void;
   toGraph: () => Graph;
+
+  /** Push a caller-captured snapshot onto the undo stack (used for node drags). */
+  pushSnapshot: (snap: GraphSnapshot) => void;
+  undo: () => void;
+  redo: () => void;
 }
 
 // ─── Default positions ────────────────────────────────────────────────────────
@@ -141,6 +160,26 @@ function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown
   return out;
 }
 
+// ─── History helper ───────────────────────────────────────────────────────────
+
+/**
+ * Returns the `past` / `future` updates to merge into a `set` call that is about
+ * to make a structural edit: pushes the current topology onto the undo stack
+ * (trimmed to HISTORY_LIMIT) and discards any redo history.
+ *
+ * If the current topology is byte-for-byte the last thing we recorded (same
+ * array refs — e.g. two drag-starts with no move between them), it returns an
+ * empty patch so we don't stack redundant, no-op undo steps.
+ */
+function withHistory(s: GraphState): Partial<GraphState> {
+  const last = s.past[s.past.length - 1];
+  if (last && last.nodes === s.nodes && last.edges === s.edges) return {};
+  return {
+    past: [...s.past, { nodes: s.nodes, edges: s.edges }].slice(-HISTORY_LIMIT),
+    future: [],
+  };
+}
+
 // ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -150,6 +189,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   selectedEdgeId: null,
   isDirty: false,
   cycleHighlight: [],
+  past: [],
+  future: [],
 
   setNodes: (nodes) => set({ nodes, isDirty: true }),
   setEdges: (edges) => set({ edges, isDirty: true }),
@@ -169,6 +210,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     set((s) => {
       const DIRTY_TYPES = new Set(['position', 'remove', 'add', 'reset']);
       const makesDirty = changes.some((c) => DIRTY_TYPES.has(c.type));
+      // History for keyboard deletes is recorded once, up front, in
+      // `onBeforeDelete` (App.tsx) — a node delete + its cascading edge deletes
+      // arrive as separate change batches, so snapshotting here would split one
+      // user action into two undo steps.
       return {
         nodes: applyNodeChanges(changes, s.nodes) as Node<NodeData>[],
         isDirty: s.isDirty || makesDirty,
@@ -198,6 +243,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   removeEdge: (id) =>
     set((s) => ({
+      ...withHistory(s),
       edges: s.edges.filter((e) => e.id !== id),
       selectedEdgeId: s.selectedEdgeId === id ? null : s.selectedEdgeId,
       isDirty: true,
@@ -251,6 +297,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
 
     set((s) => ({
+      ...withHistory(s),
       edges: [
         ...s.edges,
         {
@@ -277,7 +324,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       type: 'dagNode',
       data: { label, nodeType: type, config: {}, status: 'PENDING' },
     };
-    set((s) => ({ nodes: [...s.nodes, newNode], isDirty: true }));
+    set((s) => ({ ...withHistory(s), nodes: [...s.nodes, newNode], isDirty: true }));
   },
 
   selectNode: (id) => set({ selectedNodeId: id }),
@@ -291,6 +338,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       const edges = s.edges.filter((e) => e.source !== id && e.target !== id);
       const stillHasSelectedEdge = edges.some((e) => e.id === s.selectedEdgeId);
       return {
+        ...withHistory(s),
         nodes: s.nodes.filter((n) => n.id !== id),
         edges,
         selectedNodeId: s.selectedNodeId === id ? null : s.selectedNodeId,
@@ -330,6 +378,46 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   clearCycleHighlight: () => set({ cycleHighlight: [] }),
   markSaved: () => set({ isDirty: false }),
+
+  // ── Undo / redo ────────────────────────────────────────────────────────────
+
+  pushSnapshot: (snap) =>
+    set((s) => ({
+      past: [...s.past, snap].slice(-HISTORY_LIMIT),
+      future: [],
+    })),
+
+  undo: () =>
+    set((s) => {
+      const prev = s.past[s.past.length - 1];
+      if (!prev) return {};
+      return {
+        nodes: prev.nodes,
+        edges: prev.edges,
+        past: s.past.slice(0, -1),
+        future: [{ nodes: s.nodes, edges: s.edges }, ...s.future].slice(0, HISTORY_LIMIT),
+        selectedNodeId: null,
+        selectedEdgeId: null,
+        cycleHighlight: [],
+        isDirty: true,
+      };
+    }),
+
+  redo: () =>
+    set((s) => {
+      const next = s.future[0];
+      if (!next) return {};
+      return {
+        nodes: next.nodes,
+        edges: next.edges,
+        past: [...s.past, { nodes: s.nodes, edges: s.edges }].slice(-HISTORY_LIMIT),
+        future: s.future.slice(1),
+        selectedNodeId: null,
+        selectedEdgeId: null,
+        cycleHighlight: [],
+        isDirty: true,
+      };
+    }),
 
   /**
    * Serialise the canvas to the Graph contract shape for the API.

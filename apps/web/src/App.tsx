@@ -12,7 +12,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { useGraphStore } from './store/graphSlice';
+import { useGraphStore, type GraphSnapshot } from './store/graphSlice';
 import { useRunStore } from './store/runSlice';
 import { CustomNode } from './components/CustomNode';
 import { NodePalette } from './components/NodePalette';
@@ -21,7 +21,7 @@ import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
 
 import { createWorkflow, saveWorkflowVersion, startRun, openRunEventStream, ApiError } from './api/client';
-import { LogoMark, IconPlay, IconSpinner, IconCheck, IconAlert, IconClose } from './components/icons';
+import { LogoMark, IconPlay, IconSpinner, IconCheck, IconAlert, IconClose, IconUndo, IconRedo } from './components/icons';
 
 type Notice = { kind: 'error' | 'success'; text: string };
 
@@ -50,6 +50,11 @@ function AppCanvas() {
   const addNode = useGraphStore((s) => s.addNode);
   const markSaved = useGraphStore((s) => s.markSaved);
   const toGraph = useGraphStore((s) => s.toGraph);
+  const undo = useGraphStore((s) => s.undo);
+  const redo = useGraphStore((s) => s.redo);
+  const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
+  const canUndo = useGraphStore((s) => s.past.length > 0);
+  const canRedo = useGraphStore((s) => s.future.length > 0);
 
   const activeRunId = useRunStore((s) => s.activeRunId);
   const runStatus = useRunStore((s) => s.runStatus);
@@ -96,6 +101,26 @@ function AppCanvas() {
     }
   }, [notice]);
 
+  // Undo / redo keyboard shortcuts. Ignored while typing in a form field so
+  // Ctrl+Z still works normally inside the config panel inputs.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      const key = e.key.toLowerCase();
+      if (key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((key === 'z' && e.shiftKey) || key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [undo, redo]);
+
   const onConnect = useCallback(
     (connection: Connection) => onConnectStore(connection),
     [onConnectStore]
@@ -110,6 +135,32 @@ function AppCanvas() {
     selectEdge(null);
     selectNode(null);
   }, [selectEdge, selectNode]);
+
+  // Node drags: capture the topology on drag-start, and only push it onto the
+  // undo stack on drag-stop if a position actually changed — so a plain click
+  // on a node never pollutes history or clears the redo stack.
+  const preDragRef = useRef<GraphSnapshot | null>(null);
+  const onNodeDragStart = useCallback(() => {
+    const { nodes, edges } = useGraphStore.getState();
+    preDragRef.current = { nodes, edges };
+  }, []);
+  const onNodeDragStop = useCallback(() => {
+    const before = preDragRef.current;
+    preDragRef.current = null;
+    if (before && before.nodes !== useGraphStore.getState().nodes) {
+      pushSnapshot(before);
+    }
+  }, [pushSnapshot]);
+
+  // Keyboard delete (Backspace/Delete): React Flow removes the node and its
+  // connected edges in separate change batches. Record ONE history snapshot of
+  // the whole graph here, before any of it is applied, so a single undo brings
+  // the node and its edges back together.
+  const onBeforeDelete = useCallback(async () => {
+    const { nodes, edges } = useGraphStore.getState();
+    pushSnapshot({ nodes, edges });
+    return true;
+  }, [pushSnapshot]);
 
   // Apply the persistent highlight to whichever edge is selected. Done here
   // (not in the store) so it's a pure view concern and never marks the graph dirty.
@@ -288,6 +339,28 @@ function AppCanvas() {
           </nav>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginRight: 4 }}>
+            <button
+              className="btn-ghost"
+              style={{ width: 32, height: 32, color: 'var(--color-body)' }}
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+              aria-label="Undo"
+            >
+              <IconUndo size={17} />
+            </button>
+            <button
+              className="btn-ghost"
+              style={{ width: 32, height: 32, color: 'var(--color-body)' }}
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Shift+Z)"
+              aria-label="Redo"
+            >
+              <IconRedo size={17} />
+            </button>
+          </div>
           <button
             className="btn-secondary"
             onClick={handleSave}
@@ -424,6 +497,9 @@ function AppCanvas() {
               onConnect={onConnect}
               onEdgeClick={onEdgeClick}
               onPaneClick={onPaneClick}
+              onNodeDragStart={onNodeDragStart}
+              onNodeDragStop={onNodeDragStop}
+              onBeforeDelete={onBeforeDelete}
               nodeTypes={nodeTypes}
               onDragOver={onDragOver}
               onDrop={onDrop}
