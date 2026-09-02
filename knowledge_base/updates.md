@@ -5,6 +5,76 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.2: real preprocessing on a bundled dataset
+
+**Phase:** roadmap A1.2 — second of the A1 arc. The `pandas.preprocess` node now
+does genuine work: it loads a CSV, drops mostly-empty and identifier-like
+columns, median/mode-imputes, one-hot encodes, and writes a real train/test
+parquet split. `torch.train` and `model.evaluate` stay stubs and simply ignore
+the richer upstream output, so the pipeline still finishes green.
+
+### Changes
+
+- **`apps/worker/python/data/titanic.csv`** (new, ~62 KB) +
+  **`data/make_titanic.py`** — a *synthetic* 891×12 passenger manifest,
+  deterministically generated (`numpy` seed 42). Not the Kaggle file: same column
+  shape and realistic missingness (Age ~21% null, Cabin ~76% null, Embarked a
+  few), so preprocessing has real work to do while staying reproducible and
+  credential-free. A1.5 adds an optional real source.
+- **`apps/worker/python/preprocess.py`** — rewritten. Same stdio protocol (one
+  JSON line in, log lines out, one `::RESULT::` line). Reads `csvPath` /
+  `targetColumn` / `testSize` from the context (all optional; `csvPath` falls
+  back to the bundled dataset). Real steps: drop columns with >40% nulls, drop
+  near-unique object columns (Name, Ticket), median/mode impute, `pd.get_dummies`,
+  `train_test_split(random_state=42)`, `to_parquet`. Result carries `rows`,
+  `cols`, `nTrain`, `nTest`, `nFeatures`, `features`, and a content checksum
+  (`sha256` of `hash_pandas_object(train_df)` — stable across parquet writer
+  versions, moves iff the processed data moves).
+- **`packages/contracts/src/node-types.ts`** — `PandasPreprocessConfigSchema`
+  gains optional `csvPath` (string), `targetColumn` (string), `testSize`
+  (`z.number().gt(0).lt(1)`). `z.object()` strips unknown keys, so a field only
+  reaches the worker if it's on the schema.
+- **`apps/web/src/components/ConfigPanel.tsx`** — `NODE_CONFIG_FIELDS` for
+  `pandas.preprocess` gains CSV Path / Target Column / Test Size inputs.
+- **`apps/web/src/store/graphSlice.ts`** — `testSize` added to
+  `NUMERIC_CONFIG_KEYS` (else the `<input type=number>` string is sent as a
+  string and rejected by Zod — the `minAccuracy` bug). Starter graph's Preprocess
+  node now points at `python/data/titanic.csv` with `targetColumn: 'Survived'`,
+  `testSize: 0.2`.
+
+### Gotcha
+
+`packages/contracts` is baked into **both** the `api` and `worker` images. The
+first E2E showed the new config fields silently stripped — the running `api`
+still had the old schema and `z.object()` dropped `csvPath` / `targetColumn` /
+`testSize` before persisting the version. Rebuild **both**:
+`docker compose -f infra/docker-compose.yml build api worker`.
+
+### Verification
+
+- `preprocess.py` run directly and end-to-end on the live 4-worker stack, three
+  contexts (identical checksums locally and in-container — deterministic):
+  - default `Survived` / 0.2 → 712 / 179 split, features `[PassengerId, Pclass,
+    Age, SibSp, Parch, Fare, Sex_male, Embarked_Q, Embarked_S]`,
+    checksum `…08368d5a`.
+  - `targetColumn=Pclass` → `Survived` becomes a feature, checksum `…a6445109`.
+  - `testSize=0.4` → 534 / 357 split, checksum `…6deb8a70`.
+- Live SSE `NODE_LOG_BATCH` carries the real lines: `loaded 891 rows x 12 cols`,
+  `dropped 1 high-null column(s): ['Cabin']`, `dropped 2 identifier-like
+  column(s): ['Name', 'Ticket']`, `imputed 2 column(s) …`, `one-hot encoded …`,
+  `split -> train 712 rows / test 179 rows`.
+- Full pipeline still `SUCCEEDED` (preprocess / train / evaluate all SUCCEEDED).
+- `pnpm -r typecheck` clean; contracts / graph-core / worker / api unit suites
+  green; `pnpm --filter @dag/contracts --filter @dag/web lint` clean.
+
+### Files
+
+`apps/worker/python/data/titanic.csv` (new), `apps/worker/python/data/make_titanic.py`
+(new), `apps/worker/python/preprocess.py`, `packages/contracts/src/node-types.ts`,
+`apps/web/src/components/ConfigPanel.tsx`, `apps/web/src/store/graphSlice.ts`.
+
+---
+
 ## 2026-09-03 — A1.1: a Python runtime that can hold real ML libraries
 
 **Phase:** roadmap A1.1 — the first of the five-part A1 ("real ML executors")

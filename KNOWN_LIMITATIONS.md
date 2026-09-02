@@ -121,29 +121,31 @@ node's output value.
 
 ## 6. Worker Executors Are Mock ML — Not Real ML
 
-**What exists:** `apps/worker/python/preprocess.py`, `train.py`, and `evaluate.py` are pure
-Python-stdlib fixtures that simulate ML steps with filesystem writes and `time.sleep`. They
-exercise the Node↔Python bridge, idempotency checks, and heartbeat machinery correctly, but they
-do not perform real data processing.
+**What exists:** `apps/worker/python/train.py` and `evaluate.py` are still pure Python-stdlib
+fixtures that simulate ML steps with filesystem writes and `time.sleep`. `train.py` writes the
+literal bytes `STUBWEIGHTS`; `evaluate.py` returns a hardcoded `0.923` every time.
 
-**What is missing:** Real Pandas / scikit-learn logic in the scripts, and an honest data source
-(`kaggle.download` still shells out to a `kaggle` binary that is not in the image).
+**What is missing:** Real `scikit-learn` training and held-out-set evaluation in the scripts,
+and an honest data source (`kaggle.download` still shells out to a `kaggle` binary that is not
+in the image).
 
-**Progress (roadmap A1.1, done):** the worker image can now hold real ML libraries. The runtime
-stage is Debian-based (`node:22-slim`) and `pandas`, `scikit-learn`, `joblib`, and `pyarrow` are
-installed into a venv from `apps/worker/python/requirements.txt`; `import pandas, sklearn`
-succeeds inside the container. The scripts themselves are still the stdlib stubs — they don't
-import those libraries yet.
+**Progress:**
+- **A1.1 (done)** — the worker image can hold real ML libraries. The runtime stage is
+  Debian-based (`node:22-slim`) with `pandas` / `scikit-learn` / `joblib` / `pyarrow` in a venv.
+- **A1.2 (done)** — `preprocess.py` does real work: loads a bundled CSV
+  (`python/data/titanic.csv`), drops high-null and identifier columns, median/mode-imputes,
+  one-hot encodes, and writes a real `train_test_split` parquet pair. Its row/column counts,
+  feature list, and content checksum all move when the data or the `csvPath` / `targetColumn` /
+  `testSize` config changes.
 
-**To close it (remaining — roadmap A1.2–A1.5):**
-- Rewrite the fixture scripts with real logic: `pd.read_csv` + feature engineering + a real
-  train/test split in `preprocess.py`, a real `sklearn` estimator with genuine per-iteration
-  progress in `train.py`, and real held-out-set metrics in `evaluate.py` — so the `minAccuracy`
-  gate in `executors.ts` becomes a real quality gate instead of theatre.
-- Replace `kaggle.download` with an honest data source (a bundled dataset copied/validated
-  locally, or a URL fetch), so the first node does real deterministic work with no credentials.
-- Note: the worker and Node↔Python bridge infrastructure are production-ready; only the scripts
-  and the `data.source` / `kaggle.download` node type need to change.
+**To close it (remaining — roadmap A1.3–A1.5):**
+- **A1.3** — real `sklearn` estimator in `train.py` with genuine per-iteration progress logs.
+- **A1.4** — real held-out-set metrics in `evaluate.py`, making the `minAccuracy` gate in
+  `executors.ts` a real quality gate instead of theatre.
+- **A1.5** — replace `kaggle.download` with an honest data source (validate/copy a local CSV or
+  fetch a URL), so the first node does real deterministic work with no credentials.
+- Note: the worker and Node↔Python bridge infrastructure are production-ready; only the two
+  remaining scripts and the `data.source` / `kaggle.download` node type need to change.
 
 ---
 

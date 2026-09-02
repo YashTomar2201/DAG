@@ -17,7 +17,10 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'outputDir',   label: 'Output Dir',   type: 'text', placeholder: 'artifacts/download' },
   ],
   'pandas.preprocess': [
-    { key: 'scriptPath', label: 'Script Path', type: 'text', placeholder: 'preprocess.py' },
+    { key: 'scriptPath',   label: 'Script Path',     type: 'text',   placeholder: 'preprocess.py' },
+    { key: 'csvPath',      label: 'CSV Path',        type: 'text',   placeholder: 'python/data/titanic.csv' },
+    { key: 'targetColumn', label: 'Target Column',   type: 'text',   placeholder: 'Survived' },
+    { key: 'testSize',     label: 'Test Size (0–1)', type: 'number', placeholder: '0.2' },
   ],
   'torch.train': [
     { key: 'scriptPath',         label: 'Script Path',         type: 'text',   placeholder: 'train.py' },

@@ -15,6 +15,16 @@ export const KaggleDownloadConfigSchema = z.object({
 export const PandasPreprocessConfigSchema = z.object({
   /** Path to the Python script (relative to the python/ directory) */
   scriptPath: z.string().min(1).default('preprocess.py'),
+  /**
+   * Path to the input CSV. Relative paths resolve against the worker's
+   * `python/` directory; when omitted the script falls back to the bundled
+   * `data/titanic.csv` so a graph that sets nothing still runs.
+   */
+  csvPath: z.string().min(1).optional(),
+  /** Label column held out of feature encoding (script default: "Survived"). */
+  targetColumn: z.string().min(1).optional(),
+  /** Held-out fraction for the train/test split, exclusive of 0 and 1. */
+  testSize: z.number().gt(0).lt(1).optional(),
   /** Additional keyword args forwarded to the script via stdin */
   kwargs: z.record(z.unknown()).optional(),
 });
