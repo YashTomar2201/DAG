@@ -2,26 +2,20 @@
  * Shared graph fixtures for the Phase 12 integration suite.
  *
  * `hermeticPipelineGraph()` mirrors the PROJECT_GUIDE reference ML pipeline
- * (extract → preprocess → train → evaluate → deploy) in shape and semantics,
- * but the `extract` node is `pandas.preprocess` rather than `kaggle.download`.
+ * (extract → preprocess → train → evaluate → deploy) in shape and semantics.
+ * The `extract` node is `data.source`, which copies the bundled
+ * `apps/worker/python/data/titanic.csv` into the artifact volume with zero
+ * external dependencies — no CLI shell-out, no network, no credentials. Every
+ * executor here does real local work (real files, real checksums), so the
+ * whole system — topological dispatch, template resolution, all three BullMQ
+ * queues, atomic in-degree decrement, idempotent writes — is exercised for
+ * real.
  *
- * Why the substitution: `kaggleDownload` (apps/worker/src/executors.ts)
- * shells out to the real `kaggle` CLI, which needs network access and a
- * credentialed account — neither is available (or desirable) in a hermetic
- * test/CI environment, and Testcontainers gives us a fresh `runId` only
- * *after* the run starts, so we cannot deterministically pre-seed its
- * idempotency cache file ahead of dispatch. Every other executor
- * (`pandas.preprocess`, `torch.train`, `model.evaluate`, `registry.deploy`)
- * does real local work (spawns the real fixture scripts in
- * `apps/worker/python/`, writes real files, computes a real checksum) with
- * zero external dependencies, so swapping just the entry node keeps every
- * other part of the system — topological dispatch, template resolution, all
- * three BullMQ queues, atomic in-degree decrement, idempotent writes —
- * exercised for real. See decisions_log.md for the full write-up.
- *
- * Note: `evaluate.py` always reports a fixed accuracy of 0.923 (no kwargs
- * knob) — tests that need `model.evaluate` to fail do so via `minAccuracy`
- * on the node config, not by asking the script for a different number.
+ * Note: `train`/`evaluate` are not wired with `trainPath`/`weightsPath`/
+ * `testPath` refs here, so they take their fallback paths — `train.py` fits a
+ * model on a synthetic `make_classification` set, `evaluate.py` returns fixed
+ * reference metrics (`accuracy` 0.923, `synthetic: true`). Tests that need
+ * `model.evaluate` to fail do so via `minAccuracy` on the node config.
  */
 import type { Graph } from '@dag/contracts';
 import { topologicalSort } from '@dag/graph-core';
@@ -34,10 +28,10 @@ export function hermeticPipelineGraph(): Graph {
     nodes: [
       {
         key: 'extract',
-        type: 'pandas.preprocess',
+        type: 'data.source',
         label: 'Extract (fixture)',
         position: { x: 0, y: 0 },
-        config: { scriptPath: 'preprocess.py' },
+        config: {},
       },
       {
         key: 'preprocess',

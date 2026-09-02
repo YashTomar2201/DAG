@@ -203,7 +203,7 @@ export function IconSpinner({ size = 18, ...props }: IconProps) {
 // ─── Node-type → icon map ────────────────────────────────────────────────────
 
 export const NODE_ICON: Record<string, (p: IconProps) => JSX.Element> = {
-  'kaggle.download': IconDownload,
+  'data.source': IconDownload,
   'pandas.preprocess': IconTransform,
   'torch.train': IconTrain,
   'model.evaluate': IconEvaluate,

@@ -4,10 +4,10 @@
  *
  * Why jitter matters:
  *   Standard exponential backoff (2s, 4s, 8s …) is *deterministic*. If 50
- *   `kaggle.download` jobs all fail at the same instant (e.g. a shared
- *   rate-limit window), they all wait exactly 4 s and then hit the Kaggle API
- *   at the same millisecond — immediately triggering another rate-limit. The
- *   thundering herd repeats until the backoff cap (32 s) is reached.
+ *   `data.source` jobs all fail at the same instant (e.g. a shared upstream
+ *   rate-limit window), they all wait exactly 4 s and then hit the same
+ *   endpoint at the same millisecond — immediately triggering another
+ *   rate-limit. The thundering herd repeats until the backoff cap (32 s).
  *
  *   Full-jitter replaces the fixed wait with `random(0, 2^attempt * baseDelay)`.
  *   Each retrying job picks an independent random point inside an exponentially

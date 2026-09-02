@@ -5,11 +5,15 @@ import { z } from 'zod';
 // The discriminated union on `type` gives compile-time exhaustiveness:
 // adding a new type without a matching executor case fails typecheck in the worker.
 
-export const KaggleDownloadConfigSchema = z.object({
-  /** Kaggle dataset slug, e.g. "username/dataset-name" */
-  datasetSlug: z.string().min(1),
-  /** Destination path inside the shared artifact volume */
-  outputDir: z.string().min(1),
+export const DataSourceConfigSchema = z.object({
+  /**
+   * Path to a local CSV. Relative paths resolve against the worker's `python/`
+   * directory; when both this and `url` are omitted the bundled
+   * `python/data/titanic.csv` is used. Always available, no credentials.
+   */
+  csvPath: z.string().min(1).optional(),
+  /** Alternatively, an http(s) URL to fetch a CSV from. Takes precedence over `csvPath`. */
+  url: z.string().url().optional(),
 });
 
 export const PandasPreprocessConfigSchema = z.object({
@@ -93,7 +97,7 @@ export const RegistryDeployConfigSchema = z.object({
 // field; every branch is exhaustively typed at compile time.
 
 export const NODE_TYPES = [
-  'kaggle.download',
+  'data.source',
   'pandas.preprocess',
   'torch.train',
   'model.evaluate',
@@ -136,8 +140,8 @@ const NodeDefBaseSchema = z.object({
 
 export const NodeDefSchema = z.discriminatedUnion('type', [
   NodeDefBaseSchema.extend({
-    type: z.literal('kaggle.download'),
-    config: KaggleDownloadConfigSchema,
+    type: z.literal('data.source'),
+    config: DataSourceConfigSchema,
   }),
   NodeDefBaseSchema.extend({
     type: z.literal('pandas.preprocess'),
@@ -160,7 +164,7 @@ export const NodeDefSchema = z.discriminatedUnion('type', [
 export type NodeDef = z.infer<typeof NodeDefSchema>;
 
 // Re-export config types for convenience
-export type KaggleDownloadConfig = z.infer<typeof KaggleDownloadConfigSchema>;
+export type DataSourceConfig = z.infer<typeof DataSourceConfigSchema>;
 export type PandasPreprocessConfig = z.infer<typeof PandasPreprocessConfigSchema>;
 export type TorchTrainConfig = z.infer<typeof TorchTrainConfigSchema>;
 export type ModelEvaluateConfig = z.infer<typeof ModelEvaluateConfigSchema>;

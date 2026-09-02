@@ -56,7 +56,7 @@ function stubNodeRun(
 /** Two-node linear graph: extract → preprocess */
 const TWO_NODE_GRAPH = {
   nodes: [
-    { id: '1', key: 'extract', type: 'kaggle.download', config: { datasetSlug: 'cats', outputDir: '/tmp' } },
+    { id: '1', key: 'extract', type: 'data.source', config: {} },
     {
       id: '2',
       key: 'preprocess',
@@ -73,7 +73,7 @@ const TWO_NODE_GRAPH = {
 /** Diamond graph: a → b, a → c, b → d, c → d */
 const DIAMOND_GRAPH = {
   nodes: [
-    { id: '1', key: 'a', type: 'kaggle.download', config: { datasetSlug: 'x', outputDir: '/tmp' } },
+    { id: '1', key: 'a', type: 'data.source', config: {} },
     { id: '2', key: 'b', type: 'pandas.preprocess', config: { bOut: '{{ nodes.a.output.bValue }}' } as any },
     { id: '3', key: 'c', type: 'pandas.preprocess', config: { cOut: '{{ nodes.a.output.cValue }}' } as any },
     {
@@ -168,7 +168,7 @@ describe('resolveNodeInputs', () => {
   it('whole-value template replaced with native type (not stringified)', () => {
     const GRAPH_WITH_OBJECT_TEMPLATE = {
       nodes: [
-        { id: '1', key: 'a', type: 'kaggle.download', config: { datasetSlug: 'x', outputDir: '/tmp' } },
+        { id: '1', key: 'a', type: 'data.source', config: {} },
         {
           id: '2',
           key: 'b',
@@ -220,7 +220,7 @@ describe('resolveNodeInputs', () => {
   it('resolves nested dotted path inside parent output', () => {
     const NESTED_GRAPH = {
       nodes: [
-        { id: '1', key: 'a', type: 'kaggle.download', config: { datasetSlug: 'x', outputDir: '/tmp' } },
+        { id: '1', key: 'a', type: 'data.source', config: {} },
         {
           id: '2',
           key: 'b',

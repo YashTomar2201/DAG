@@ -119,36 +119,28 @@ node's output value.
 
 ---
 
-## 6. The First Node Can't Actually Run (`kaggle.download`)
+## 6. Worker Executors Are Mock ML — ✅ CLOSED (roadmap A1.1–A1.5)
 
-**What exists:** the middle of the pipeline is real. `preprocess.py`,
-`train.py`, and `evaluate.py` do genuine scikit-learn work on a bundled dataset
-(A1.2–A1.4, all merged). What's left is the *entry* node.
+The reference pipeline now does real work end to end. Kept here (rather than
+deleted) so the section numbers below don't shift.
 
-**What is missing:** `kaggle.download` shells out to a `kaggle` CLI binary that
-is not installed in the worker image, so a graph that starts with it fails. It
-recovers via retry into a mock path, but a real Kaggle download needs the CLI
-plus credentials.
+- **A1.1** — worker image carries real ML libraries (`node:22-slim` + a venv with
+  `pandas` / `scikit-learn` / `joblib` / `pyarrow`).
+- **A1.2** — `preprocess.py` loads a bundled dataset, drops high-null / identifier
+  columns, imputes, one-hot encodes, writes a real `train_test_split` parquet
+  pair with a content checksum.
+- **A1.3** — `train.py` fits a real `randomforest` / `logreg`, logs a genuine
+  per-iteration score, persists the model via `joblib`.
+- **A1.4** — `evaluate.py` scores the held-out split (accuracy / f1 / precision /
+  recall / confusion matrix); the `minAccuracy` gate fails runs for a real
+  reason (`0.99` fails, `0.6` passes) and is re-checked on retry without
+  re-scoring.
+- **A1.5** — `kaggle.download` is gone. The entry node is `data.source`: it
+  copies a local CSV (default: the bundled `python/data/titanic.csv`) or
+  `fetch`es one from an http(s) URL, validates it, and emits real row/column
+  counts. No CLI, no credentials, always runs.
 
-**Progress:**
-- **A1.1 (done)** — worker image holds real ML libraries (`node:22-slim` + a venv
-  with `pandas` / `scikit-learn` / `joblib` / `pyarrow`).
-- **A1.2 (done)** — `preprocess.py` loads `python/data/titanic.csv`, drops
-  high-null / identifier columns, imputes, one-hot encodes, writes a real
-  `train_test_split` parquet pair with a content checksum.
-- **A1.3 (done)** — `train.py` fits a real `randomforest` / `logreg` on the
-  split, logs a genuine per-iteration score, persists via `joblib`.
-- **A1.4 (done)** — `evaluate.py` loads the model + held-out split and reports
-  real accuracy / f1 / precision / recall / confusion matrix. The `minAccuracy`
-  gate in `executors.ts` now fails runs for a real reason (`0.99` fails, `0.6`
-  passes) and is re-checked on retry without re-scoring.
-
-**To close it — roadmap A1.5:**
-- Replace `kaggle.download` with an honest data source (`data.source`: validate
-  and copy a local CSV, or fetch one from a URL), so the first node does real
-  deterministic work with no credentials — or keep the Kaggle CLI shell-out but
-  install `kaggle`, add it to `requirements.txt`, and fall back to the bundled
-  CSV with a clear warning when `KAGGLE_USERNAME` / `KAGGLE_KEY` are unset.
+Full write-ups in [`knowledge_base/updates.md`](knowledge_base/updates.md).
 
 ---
 

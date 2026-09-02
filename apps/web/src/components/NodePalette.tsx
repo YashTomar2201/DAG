@@ -7,7 +7,7 @@ import React from 'react';
 import { NODE_ICON } from './icons';
 
 const PALETTE_ITEMS = [
-  { type: 'kaggle.download',   label: 'Kaggle Download', accent: 'var(--node-download)' },
+  { type: 'data.source',       label: 'Data Source',     accent: 'var(--node-download)' },
   { type: 'pandas.preprocess', label: 'Preprocess',      accent: 'var(--node-preprocess)' },
   { type: 'torch.train',       label: 'Train',           accent: 'var(--node-train)' },
   { type: 'model.evaluate',    label: 'Evaluate',        accent: 'var(--node-evaluate)' },

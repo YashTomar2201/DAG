@@ -42,7 +42,7 @@ vi.mock('@dag/db', () => ({
 /** The 5-node ML pipeline from PROJECT_GUIDE.md §1 */
 const ML_PIPELINE_GRAPH = {
   nodes: [
-    { key: 'extract',    type: 'kaggle.download',   label: 'Extract',    position: { x: 0, y: 0 }, config: { datasetSlug: 'my/dataset', outputDir: 'data/' } },
+    { key: 'extract',    type: 'data.source',      label: 'Extract',    position: { x: 0, y: 0 }, config: {} },
     { key: 'preprocess', type: 'pandas.preprocess', label: 'Preprocess', position: { x: 1, y: 0 }, config: { scriptPath: 'python/preprocess.py' } },
     { key: 'train',      type: 'torch.train',       label: 'Train',      position: { x: 2, y: 0 }, config: { scriptPath: 'python/train.py', epochs: 10 } },
     { key: 'evaluate',   type: 'model.evaluate',    label: 'Evaluate',   position: { x: 3, y: 0 }, config: { scriptPath: 'python/evaluate.py' } },

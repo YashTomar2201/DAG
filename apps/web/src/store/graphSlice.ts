@@ -30,7 +30,7 @@ import type { Graph } from '@dag/contracts';
 
 export type NodeData = Record<string, unknown> & {
   label: string;
-  nodeType: string; // 'kaggle.download' | 'pandas.preprocess' | etc.
+  nodeType: string; // 'data.source' | 'pandas.preprocess' | etc.
   config: Record<string, unknown>;
   status?: string;  // PENDING | QUEUED | RUNNING | SUCCEEDED | FAILED | SKIPPED
 };
@@ -109,10 +109,10 @@ function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
 
   _nodeCounter = 4;
   const nodes: Node<NodeData>[] = [
-    mk('node-1', 'Extract dataset', 'kaggle.download',
-      { datasetSlug: 'kaggle/titanic', outputDir: 'artifacts/raw' }, 0, 120),
+    mk('node-1', 'Data source', 'data.source',
+      { csvPath: 'python/data/titanic.csv' }, 0, 120),
     mk('node-2', 'Preprocess', 'pandas.preprocess',
-      { scriptPath: 'preprocess.py', csvPath: 'python/data/titanic.csv', targetColumn: 'Survived', testSize: 0.2 }, 260, 120),
+      { scriptPath: 'preprocess.py', csvPath: '{{ nodes.node-1.output.csvPath }}', targetColumn: 'Survived', testSize: 0.2 }, 260, 120),
     mk('node-3', 'Train model', 'torch.train',
       { scriptPath: 'train.py', modelType: 'randomforest', epochs: 10, outputWeightsPath: 'model.joblib',
         trainPath: '{{ nodes.node-2.output.trainPath }}',

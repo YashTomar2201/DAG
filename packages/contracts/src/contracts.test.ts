@@ -9,10 +9,10 @@ import { NodeStatusSchema, RunStatusSchema } from './status';
 /** A minimal valid extract node */
 const extractNode = {
   key: 'extract',
-  type: 'kaggle.download' as const,
+  type: 'data.source' as const,
   label: 'Extract',
   position: { x: 0, y: 0 },
-  config: { datasetSlug: 'user/dataset', outputDir: '/artifacts/raw' },
+  config: { csvPath: 'python/data/titanic.csv' },
 };
 
 /** A minimal valid preprocess node */
@@ -127,10 +127,10 @@ describe('GraphSchema', () => {
   it('rejects a graph exceeding MAX_NODES', () => {
     const nodes = Array.from({ length: 201 }, (_, i) => ({
       key: `node-${i}`,
-      type: 'kaggle.download' as const,
+      type: 'data.source' as const,
       label: `Node ${i}`,
       position: { x: i * 10, y: 0 },
-      config: { datasetSlug: 'u/d', outputDir: '/tmp' },
+      config: {},
     }));
     const result = GraphSchema.safeParse({ nodes, edges: [] });
     expect(result.success).toBe(false);
@@ -140,7 +140,7 @@ describe('GraphSchema', () => {
 // ─── NodeDefSchema — discriminated union tests ────────────────────────────────
 
 describe('NodeDefSchema', () => {
-  it('parses a kaggle.download node', () => {
+  it('parses a data.source node', () => {
     const result = NodeDefSchema.safeParse(extractNode);
     expect(result.success).toBe(true);
   });

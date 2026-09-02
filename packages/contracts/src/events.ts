@@ -50,7 +50,7 @@ export const ErrorTaxonomySchema = z.object({
    *
    * unrecoverable: permanent errors (bad credentials, SyntaxError in Python script,
    * schema validation failure). BullMQ skips remaining retries immediately —
-   * burning retries on a bad-credentials error wastes time and hammers Kaggle.
+   * burning retries on a bad-credentials error wastes time and hammers the upstream.
    */
   taxonomy: z.enum(['retryable', 'unrecoverable']),
   message: z.string(),

@@ -4,7 +4,7 @@
  * Problem this solves:
  *   A graph with 100 parallel nodes would, without any limit, enqueue all
  *   100 jobs simultaneously. If the cluster has 10 workers with concurrency 4,
- *   that's 40 simultaneous workers all hammering the same Kaggle/S3 endpoints.
+ *   that's 40 simultaneous workers all hammering the same upstream endpoints.
  *   One enormous fan-out can monopolise the entire cluster, starving all other
  *   runs from getting any worker capacity.
  *
@@ -14,7 +14,7 @@
  *   Layer 2: Per-run semaphore (this file). Controls how many nodes from a
  *            SINGLE run can be inflight simultaneously across ALL workers.
  *   Layer 3: Queue-level rate limit on `queue:io` (configured in queues.ts).
- *            Controls the rate of Kaggle API calls across the entire system.
+ *            Controls the rate of external data-source calls across the system.
  *
  * Implementation:
  *   Redis SETNX (set-if-not-exists) is used to acquire a "slot" for each

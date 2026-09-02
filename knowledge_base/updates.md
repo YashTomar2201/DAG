@@ -5,6 +5,68 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.5: an honest data source
+
+**Phase:** roadmap A1.5 — last of the A1 arc. `kaggle.download` is gone. The
+entry node is now `data.source`, which always runs with no credentials. Track
+A's executor work is complete: the whole reference pipeline does real work.
+
+### Changes
+
+Renamed the node type `kaggle.download` → `data.source` (the discriminated
+union ripples: contracts, executor registry, queue routing, web palette).
+
+- **`packages/contracts/src/node-types.ts` / `index.ts`** —
+  `KaggleDownloadConfigSchema` (`datasetSlug` + `outputDir`) → `DataSourceConfigSchema`
+  (`csvPath?` local path, `url?` http(s)); both optional — with neither set the
+  bundled `python/data/titanic.csv` is used. `NODE_TYPES`, the `NodeDefSchema`
+  union member, and the exported `KaggleDownloadConfig` type renamed to match.
+- **`apps/worker/src/executors.ts`** — `kaggleDownload` (shelled out to a
+  `kaggle` CLI that isn't in the image) → `dataSource`: copies a local CSV
+  (default: bundled) or `fetch`es one from an http(s) URL into the shared
+  artifact volume, validates it parses as CSV (header + ≥1 data row), and emits
+  `{ csvPath, rows, columns, bytes, checksum, sourceType, source }`. 4xx →
+  `UnrecoverableError`, 5xx / network → retryable. 64 MB size cap. Idempotent on
+  `result.json`. The unused `child_process` / `promisify` imports went with it.
+- **`packages/queue/src/queues.ts`** — `queueForType` routes `data.source` to
+  `queue:io`.
+- **web** — `PALETTE_ITEMS` (`NodePalette`), `NODE_ACCENT` (`CustomNode`),
+  `NODE_ICON` (`icons`), `NODE_CONFIG_FIELDS` (`ConfigPanel`), `REQUIRED_CONFIG`
+  (`App`) all updated. Starter graph: node-1 is `data.source`
+  (`csvPath: 'python/data/titanic.csv'`); node-2 preprocess now reads
+  `csvPath: '{{ nodes.node-1.output.csvPath }}'` instead of a hardcoded path.
+- **tests / fixtures** — `contracts.test.ts`, `api.test.ts`,
+  `context-resolver.test.ts`, `orchestrator.test.ts` swapped to `data.source`.
+  `hermeticPipelineGraph()`'s `extract` node is now `data.source` (it works
+  hermetically — copies the bundled CSV), and the stale "why we substitute
+  pandas.preprocess for kaggle" write-up is gone.
+- **comments** — Kaggle-specific examples in `backoff.ts`, `errors.ts`,
+  `events.ts`, `semaphore.ts` generalised. `grep -rn "kaggle" --include=*.ts`
+  is now empty.
+
+### Verification
+
+- `pnpm -r typecheck` clean; contracts 18 / graph-core 10 / worker 12 / api 35
+  unit tests green; contracts / queue / web lint clean (worker lint down one —
+  the removed `catch (err: any)` — the remaining 4 are the pre-existing A5
+  backlog in `worker.ts`).
+- End-to-end on the live 4-worker stack: `data.source` → preprocess → train →
+  evaluate all **SUCCEEDED**. `data.source` output: `sourceType "local"`, real
+  `rows 891`, `columns [PassengerId … Embarked]`, `checksum sha256:…`; the CSV
+  landed in `/data/artifacts/<runId>/source/data.csv` and preprocess read it
+  through the template ref.
+- `data.source` with no config → bundled titanic; with a bogus `csvPath` →
+  `UnrecoverableError` (fails fast, no retries).
+
+### Files
+
+`packages/contracts/src/{node-types,index}.ts`, `apps/worker/src/executors.ts`,
+`packages/queue/src/queues.ts`, `apps/web/src/components/{NodePalette,CustomNode,
+icons,ConfigPanel}.tsx`, `apps/web/src/App.tsx`, `apps/web/src/store/graphSlice.ts`,
+plus test/fixture and comment updates.
+
+---
+
 ## 2026-09-03 — A1.4: real evaluation + a working quality gate
 
 **Phase:** roadmap A1.4 — the payoff. `model.evaluate` now loads the trained

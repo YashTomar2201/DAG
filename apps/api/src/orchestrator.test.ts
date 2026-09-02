@@ -13,7 +13,7 @@ const CAN_RUN = HAS_DB && HAS_REDIS;
 
 const ML_PIPELINE = {
   nodes: [
-    { id: '1', type: 'kaggle.download', key: 'extract', config: { dataset: 'abc' } },
+    { id: '1', type: 'data.source', key: 'extract', config: {} },
     { id: '2', type: 'pandas.preprocess', key: 'preprocess', config: { script: 'x.py' } },
     { id: '3', type: 'torch.train', key: 'train', config: { epochs: 10 } },
     { id: '4', type: 'model.evaluate', key: 'evaluate', config: {} },

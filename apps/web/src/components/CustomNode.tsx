@@ -13,7 +13,7 @@ import { NODE_ICON, IconNode, IconClose } from './icons';
 // ─── Node type metadata ───────────────────────────────────────────────────────
 
 const NODE_ACCENT: Record<string, string> = {
-  'kaggle.download': 'var(--node-download)',
+  'data.source': 'var(--node-download)',
   'pandas.preprocess': 'var(--node-preprocess)',
   'torch.train': 'var(--node-train)',
   'model.evaluate': 'var(--node-evaluate)',

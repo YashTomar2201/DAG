@@ -27,8 +27,8 @@ const defaultJobOptions = {
 };
 
 /**
- * queue:io - For network-bound tasks like downloading datasets (kaggle.download).
- * Workers can run with high concurrency here.
+ * queue:io - For network-bound tasks like loading/fetching datasets (data.source)
+ * and registry deploys. Workers can run with high concurrency here.
  */
 export const ioQueue = new Queue<JobPayload>('io', {
   connection,
@@ -57,7 +57,7 @@ export const gpuQueue = new Queue<JobPayload>('gpu', {
 // logic usually belongs to the queue layer.
 export const queueForType = (type: NodeType): Queue<JobPayload> => {
   switch (type) {
-    case 'kaggle.download':
+    case 'data.source':
     case 'registry.deploy':
       return ioQueue;
     case 'pandas.preprocess':

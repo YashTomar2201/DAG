@@ -7,8 +7,8 @@
  *
  * This is the least-mocked test in the repo: real Postgres, real Redis, real
  * BullMQ queues, and real `python3` child processes via the Python bridge
- * (apps/worker/python/preprocess.py, train.py, evaluate.py — see fixtures.ts
- * for why `extract` uses pandas.preprocess instead of kaggle.download).
+ * (apps/worker/python/preprocess.py, train.py, evaluate.py). The `extract`
+ * node is `data.source` — it copies the bundled titanic.csv, no creds needed.
  *
  * Execution happens on the two worker OS processes spawned once in
  * global-setup.ts (see that file for why they're shared across every

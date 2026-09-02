@@ -13,11 +13,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import { UnrecoverableError } from 'bullmq';
 import type {
-  KaggleDownloadConfig,
+  DataSourceConfig,
   PandasPreprocessConfig,
   TorchTrainConfig,
   ModelEvaluateConfig,
@@ -26,8 +24,6 @@ import type {
 import type { ExecutorContext, ExecutorOutput, ExecutorRegistry } from './executor-types';
 import { runPython } from './python-bridge';
 import { logger } from './logger';
-
-const execAsync = promisify(exec);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -75,52 +71,112 @@ function startHeartbeat(ctx: ExecutorContext, intervalMs = 15_000): () => void {
   return () => clearInterval(iv);
 }
 
-// ─── kaggle.download ─────────────────────────────────────────────────────────
+// ─── data.source ─────────────────────────────────────────────────────────────
 
-async function kaggleDownload(ctx: ExecutorContext): Promise<ExecutorOutput> {
-  const config = ctx.config as KaggleDownloadConfig;
+/** Bundled dataset shipped in the image (see apps/worker/python/data/). */
+const BUNDLED_CSV = path.resolve(process.cwd(), 'python', 'data', 'titanic.csv');
+const MAX_CSV_BYTES = 64 * 1024 * 1024; // 64 MB — refuse anything larger
+
+/** Resolve a local `csvPath` against a few sensible bases. */
+function resolveLocalCsv(csvPath: string): string {
+  const bases = [csvPath, path.resolve(process.cwd(), csvPath), path.resolve(process.cwd(), 'python', csvPath)];
+  for (const b of bases) {
+    if (fs.existsSync(b) && fs.statSync(b).isFile()) return b;
+  }
+  throw new UnrecoverableError(`data.source: local CSV not found (tried ${bases.join(', ')})`);
+}
+
+/**
+ * data.source — the honest entry node. Copies a local CSV (default: the bundled
+ * dataset) or fetches one from an http(s) URL into the shared artifact volume,
+ * validates that it parses as CSV, and emits a reference + real row/column
+ * counts. No credentials, always runs.
+ */
+async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
+  const config = ctx.config as DataSourceConfig;
   const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const metadataPath = path.join(destDir, 'metadata.json');
+  const csvOut = path.join(destDir, 'data.csv');
+  const resultPath = path.join(destDir, 'result.json');
 
-  // ── Idempotency short-circuit ────────────────────────────────────────────
-  // If metadata.json already exists, the download completed in a previous
-  // attempt. Return the cached output instead of re-downloading.
-  if (fs.existsSync(metadataPath)) {
-    const cached = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-    logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'kaggle.download: cache hit, skipping download');
-    return cached;
+  // Idempotency: a prior attempt in this run already fetched + validated it.
+  if (fs.existsSync(resultPath)) {
+    logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'data.source: cache hit');
+    return JSON.parse(fs.readFileSync(resultPath, 'utf8'));
   }
 
   fs.mkdirSync(destDir, { recursive: true });
 
-  // ── Shell out to Kaggle CLI ──────────────────────────────────────────────
-  const cmd = `kaggle datasets download -d "${config.datasetSlug}" -p "${destDir}" --unzip`;
-  logger.info({ cmd }, 'kaggle.download: running');
+  let sourceType: 'url' | 'local';
+  let source: string;
 
-  try {
-    const { stdout, stderr } = await execAsync(cmd, { timeout: 10 * 60 * 1000 });
-    if (stdout) ctx.onLog(stdout);
-    if (stderr) ctx.onLog(stderr);
-  } catch (err: any) {
-    const msg = String(err?.stderr ?? err?.message ?? err);
-    // 403 = bad API key / private dataset → unrecoverable (retrying won't help)
-    if (msg.includes('403') || msg.includes('Unauthorized') || msg.includes('credentials')) {
-      throw new UnrecoverableError(`Kaggle credentials invalid or dataset is private: ${msg}`);
+  if (config.url) {
+    sourceType = 'url';
+    source = config.url;
+    if (!/^https?:\/\//i.test(config.url)) {
+      throw new UnrecoverableError(`data.source: only http(s) URLs are supported, got "${config.url}"`);
     }
-    // All other errors (network, rate-limit) → retryable
-    throw new Error(`kaggle.download failed (retryable): ${msg}`);
+    ctx.onLog(`[data.source] fetching ${config.url}`);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 60_000);
+    try {
+      const res = await fetch(config.url, { signal: ac.signal });
+      if (!res.ok) {
+        // 4xx won't fix itself on retry; 5xx / network might.
+        const Err = res.status >= 400 && res.status < 500 ? UnrecoverableError : Error;
+        throw new Err(`data.source: fetch ${config.url} → HTTP ${res.status}`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.byteLength > MAX_CSV_BYTES) {
+        throw new UnrecoverableError(`data.source: ${config.url} is ${buf.byteLength} bytes, over the ${MAX_CSV_BYTES} limit`);
+      }
+      fs.writeFileSync(`${csvOut}.tmp`, buf);
+      fs.renameSync(`${csvOut}.tmp`, csvOut);
+    } catch (err) {
+      if (err instanceof UnrecoverableError) throw err;
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`data.source: fetch failed (retryable): ${msg}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  } else {
+    sourceType = 'local';
+    source = config.csvPath ?? path.relative(process.cwd(), BUNDLED_CSV);
+    const src = config.csvPath ? resolveLocalCsv(config.csvPath) : BUNDLED_CSV;
+    if (!fs.existsSync(src)) {
+      throw new UnrecoverableError(`data.source: bundled dataset missing at ${src}`);
+    }
+    if (fs.statSync(src).size > MAX_CSV_BYTES) {
+      throw new UnrecoverableError(`data.source: ${src} is over the ${MAX_CSV_BYTES}-byte limit`);
+    }
+    ctx.onLog(`[data.source] copying ${src}`);
+    fs.copyFileSync(src, `${csvOut}.tmp`);
+    fs.renameSync(`${csvOut}.tmp`, csvOut);
   }
 
-  // ── Atomic metadata write ────────────────────────────────────────────────
-  const files = fs.readdirSync(destDir);
-  const result: ExecutorOutput = {
-    datasetSlug: config.datasetSlug,
-    outputDir: destDir,
-    files,
-    rows: files.length, // placeholder; Python scripts fill in real counts
-  };
-  atomicWriteJson(metadataPath, result);
+  // ── Validate it parses as CSV ────────────────────────────────────────────
+  const text = fs.readFileSync(csvOut, 'utf8');
+  const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
+  if (lines.length < 2) {
+    throw new UnrecoverableError(`data.source: ${source} has no data rows (got ${lines.length} non-empty line(s))`);
+  }
+  const columns = lines[0]!.split(',').map((c) => c.trim());
+  if (columns.length < 1 || columns.some((c) => c === '')) {
+    throw new UnrecoverableError(`data.source: ${source} has a malformed header row`);
+  }
+  const rows = lines.length - 1;
 
+  const result: ExecutorOutput = {
+    csvPath: csvOut,
+    rows,
+    columns,
+    bytes: Buffer.byteLength(text, 'utf8'),
+    checksum: sha256File(csvOut),
+    sourceType,
+    source,
+    outputDir: destDir,
+  };
+  ctx.onLog(`[data.source] ${sourceType}: ${rows} rows x ${columns.length} cols`);
+  atomicWriteJson(resultPath, result);
   return result;
 }
 
@@ -306,7 +362,7 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
  * when the first job of the new type is dequeued.
  */
 export const executors: ExecutorRegistry = {
-  'kaggle.download': kaggleDownload,
+  'data.source': dataSource,
   'pandas.preprocess': pandasPreprocess,
   'torch.train': torchTrain,
   'model.evaluate': modelEvaluate,

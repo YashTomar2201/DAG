@@ -12,9 +12,9 @@ import { NODE_ICON, IconNode, IconClose, IconTrash } from './icons';
 // Config field metadata per node type
 // In a full implementation these would be derived from the Zod schema itself
 const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; type: string; placeholder: string }>> = {
-  'kaggle.download': [
-    { key: 'datasetSlug', label: 'Dataset Slug', type: 'text', placeholder: 'username/dataset-name' },
-    { key: 'outputDir',   label: 'Output Dir',   type: 'text', placeholder: 'artifacts/download' },
+  'data.source': [
+    { key: 'csvPath', label: 'CSV Path (local)', type: 'text', placeholder: 'python/data/titanic.csv (default: bundled)' },
+    { key: 'url',     label: 'CSV URL (http/https)', type: 'text', placeholder: 'https://example.com/data.csv' },
   ],
   'pandas.preprocess': [
     { key: 'scriptPath',   label: 'Script Path',     type: 'text',   placeholder: 'preprocess.py' },

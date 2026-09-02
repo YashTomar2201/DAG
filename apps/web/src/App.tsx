@@ -219,7 +219,7 @@ function AppCanvas() {
    * gets a clear, immediate error instead of a raw 400 from the API.
    */
   const REQUIRED_CONFIG: Record<string, string[]> = {
-    'kaggle.download':   ['datasetSlug', 'outputDir'],
+    // data.source needs nothing — it defaults to the bundled dataset.
     'registry.deploy':   ['registryUrl', 'modelTag'],
   };
 
