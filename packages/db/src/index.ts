@@ -42,3 +42,4 @@ export type {
   Tenant,
   Workflow,
 } from './repositories';
+export type { Prisma } from './generated/client';

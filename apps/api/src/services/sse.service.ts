@@ -118,7 +118,7 @@ export async function streamRunEvents(
   // ── Phase 2: Live pub/sub ─────────────────────────────────────────────────
   // Log events are buffered to avoid flooding the channel with one frame per
   // stdout line. All other events (status transitions) are written immediately.
-  let logBuffer: Array<{ runId: string; nodeKey?: string; payload: unknown; ts: number }> = [];
+  const logBuffer: Array<{ runId: string; nodeKey?: string; payload: unknown; ts: number }> = [];
   let logFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   function flushLogs(): void {

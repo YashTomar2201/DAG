@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck · lint · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Corepack ships with Node on the runner and pins pnpm to the version in
+      # package.json's "packageManager" field.
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # @dag/db's types come from the Prisma client, which is generated (and
+      # gitignored). Everything downstream — typecheck, lint, test — needs it.
+      - name: Generate Prisma client
+        run: pnpm --filter @dag/db exec prisma generate --schema=./prisma/schema.prisma
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      - name: Lint
+        run: pnpm -r lint
+
+      # The unit suites; the DB / Redis / Testcontainers-backed suites self-skip
+      # when DATABASE_URL / REDIS_URL are unset (see their HAS_DB / HAS_REDIS
+      # guards). A services-backed integration job can be added later.
+      - name: Test
+        run: pnpm -r test

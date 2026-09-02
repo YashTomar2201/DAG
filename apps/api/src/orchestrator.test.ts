@@ -4,6 +4,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { prisma } from '@dag/db';
+import type { Prisma } from '@dag/db';
 import { ioQueue, cpuQueue, connection } from '@dag/queue';
 import { startRun, onNodeSucceeded } from './services/orchestrator.service';
 
@@ -52,8 +53,8 @@ describe.skipIf(!CAN_RUN)('Phase 6 — Orchestrator (requires DB and Redis)', ()
       data: {
         workflowId,
         version: 1,
-        graph: ML_PIPELINE as any,
-        topoOrder: TOPO_ORDER as any,
+        graph: ML_PIPELINE as unknown as Prisma.InputJsonValue,
+        topoOrder: TOPO_ORDER as unknown as Prisma.InputJsonValue,
       },
     });
     versionId = version.id;

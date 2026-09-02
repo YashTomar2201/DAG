@@ -15,8 +15,8 @@
  */
 
 import { Worker, UnrecoverableError, type Job } from 'bullmq';
-import { prisma, findNodeRun, tryTransitionNodeRun } from '@dag/db';
-import { connection, publishRunEvent, releaseConcurrencySlot } from '@dag/queue';
+import { tryTransitionNodeRun } from '@dag/db';
+import { connection, publishRunEvent } from '@dag/queue';
 import type { JobPayload } from '@dag/contracts';
 import { env } from './env';
 import { logger } from './logger';
@@ -113,7 +113,7 @@ export function createWorkers(): Worker[] {
       },
     });
 
-    worker.on('completed', (job, result) => {
+    worker.on('completed', (job) => {
       logger.info({ jobId: job.id, queue: queueName }, 'Job completed');
     });
 

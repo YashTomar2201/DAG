@@ -24,8 +24,13 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
  *  - written: array capturing what would be sent over SSE
  *  - flush: call this to simulate the 200ms timer firing
  */
+interface LogFrame {
+  type: string;
+  logs: unknown[];
+}
+
 function makeLogBuffer(flushIntervalMs = 200) {
-  const written: unknown[] = [];
+  const written: LogFrame[] = [];
   let buffer: unknown[] = [];
   let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -56,7 +61,7 @@ describe('SSE log buffering', () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it('batches multiple log lines into one frame after flush interval', () => {
-    const { written, pushLog, forceFlush } = makeLogBuffer(200);
+    const { written, pushLog } = makeLogBuffer(200);
 
     pushLog({ line: 'epoch 1/10 loss=0.9' });
     pushLog({ line: 'epoch 2/10 loss=0.8' });
@@ -69,8 +74,8 @@ describe('SSE log buffering', () => {
     vi.advanceTimersByTime(200);
 
     expect(written).toHaveLength(1);
-    expect((written[0] as any).type).toBe('NODE_LOG_BATCH');
-    expect((written[0] as any).logs).toHaveLength(3);
+    expect(written[0]!.type).toBe('NODE_LOG_BATCH');
+    expect(written[0]!.logs).toHaveLength(3);
   });
 
   it('forceFlush emits buffered lines immediately', () => {
@@ -82,7 +87,7 @@ describe('SSE log buffering', () => {
     expect(written).toHaveLength(0);
     forceFlush();
     expect(written).toHaveLength(1);
-    expect((written[0] as any).logs).toHaveLength(2);
+    expect(written[0]!.logs).toHaveLength(2);
   });
 
   it('a second batch starts fresh after first flush', () => {
@@ -95,7 +100,7 @@ describe('SSE log buffering', () => {
     pushLog({ line: 'b' });
     vi.advanceTimersByTime(200);
     expect(written).toHaveLength(2);
-    expect((written[1] as any).logs[0]).toEqual({ line: 'b' });
+    expect(written[1]!.logs[0]).toEqual({ line: 'b' });
   });
 
   it('forceFlush on an empty buffer is a no-op', () => {

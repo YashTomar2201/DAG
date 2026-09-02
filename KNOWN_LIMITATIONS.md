@@ -165,16 +165,21 @@ machines, so increasing worker count actually adds CPU capacity rather than comp
 
 ---
 
-## 8. The Lint Backlog
+## 8. The Lint Backlog — ✅ CLOSED (roadmap A5)
 
-**What exists:** `apps/api` and `apps/worker` have approximately 30 pre-existing ESLint errors
-(mostly `@typescript-eslint/no-explicit-any` in orchestrator/SSE/worker code from Phases 4–10,
-plus scattered unused imports). These were not fixed during Phase 12 to avoid touching logic
-outside that phase's scope with risk of a behavioral regression.
+`pnpm -r lint` exits 0 across all seven packages. The 31 pre-existing errors
+(unused imports, and `@typescript-eslint/no-explicit-any` in the orchestrator /
+SSE / worker-event code) were fixed with real types: `getGraphFromVersion` takes
+`WorkflowVersion`, `emitAndLog` takes `Record<string, unknown>`,
+`onNodeSucceeded` takes `unknown`, `onNodeFailed` takes a `NodeFailure`
+interface, and the Prisma-JSON writes cast `… as unknown as Prisma.InputJsonValue`
+(the pattern already used in `packages/db/src/repositories.ts`). `@dag/db` now
+re-exports the `Prisma` type namespace so consumers don't reach into
+`generated/`.
 
-**To close it:** A dedicated lint-cleanup pass before any production hardening. The errors are
-cosmetic (`any` types, unused vars) rather than correctness issues, but they mask real new errors
-that `pnpm -r lint` would otherwise catch in CI.
+CI (`.github/workflows/ci.yml`) runs `pnpm -r typecheck && pnpm -r lint &&
+pnpm -r test` on every PR and push to `main`, so the backlog can't silently
+grow back.
 
 ---
 

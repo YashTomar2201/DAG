@@ -12,7 +12,7 @@ export function startQueueEventListeners() {
     const queueEvents = new QueueEvents(q, { connection });
     listeners.push(queueEvents);
 
-    queueEvents.on('completed', async ({ jobId, returnvalue }: { jobId: string, returnvalue: any }) => {
+    queueEvents.on('completed', async ({ jobId, returnvalue }: { jobId: string; returnvalue: unknown }) => {
       try {
         const [runId, nodeKey] = parseJobId(jobId);
         logger.debug({ queue: q, runId, nodeKey }, 'Received completed event');

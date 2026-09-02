@@ -44,7 +44,7 @@ function stubNodeRun(
     status,
     attempt: 0,
     input: null,
-    output: output as any,
+    output: output,
     error: null,
     workerId: null,
     leaseExpiresAt: null,
@@ -64,7 +64,7 @@ const TWO_NODE_GRAPH = {
       config: {
         // Template: resolved at dispatch time from extract's output
         csvPath: '{{ nodes.extract.output.metadataPath }}',
-      } as any,
+      },
     },
   ],
   edges: [{ from: 'extract', to: 'preprocess' }],
@@ -74,8 +74,8 @@ const TWO_NODE_GRAPH = {
 const DIAMOND_GRAPH = {
   nodes: [
     { id: '1', key: 'a', type: 'data.source', config: {} },
-    { id: '2', key: 'b', type: 'pandas.preprocess', config: { bOut: '{{ nodes.a.output.bValue }}' } as any },
-    { id: '3', key: 'c', type: 'pandas.preprocess', config: { cOut: '{{ nodes.a.output.cValue }}' } as any },
+    { id: '2', key: 'b', type: 'pandas.preprocess', config: { bOut: '{{ nodes.a.output.bValue }}' } },
+    { id: '3', key: 'c', type: 'pandas.preprocess', config: { cOut: '{{ nodes.a.output.cValue }}' } },
     {
       id: '4',
       key: 'd',
@@ -85,7 +85,7 @@ const DIAMOND_GRAPH = {
         fromB: '{{ nodes.b.output.result }}',
         fromC: '{{ nodes.c.output.result }}',
         label: 'run={{ nodes.b.output.result }}-and-{{ nodes.c.output.result }}',
-      } as any,
+      },
     },
   ],
   edges: [
@@ -176,7 +176,7 @@ describe('resolveNodeInputs', () => {
           config: {
             // Whole value is a template → should get the raw object, not "[object Object]"
             stats: '{{ nodes.a.output.stats }}',
-          } as any,
+          },
         },
       ],
       edges: [{ from: 'a', to: 'b' }],
@@ -201,7 +201,7 @@ describe('resolveNodeInputs', () => {
           id: '1',
           key: 'train',
           type: 'torch.train',
-          config: { epochs: 10, scriptPath: 'train.py', lr: 0.001, dryRun: false, tags: ['v1', 'prod'] } as any,
+          config: { epochs: 10, scriptPath: 'train.py', lr: 0.001, dryRun: false, tags: ['v1', 'prod'] },
         },
       ],
       edges: [],
@@ -225,7 +225,7 @@ describe('resolveNodeInputs', () => {
           id: '2',
           key: 'b',
           type: 'pandas.preprocess',
-          config: { file: '{{ nodes.a.output.artifacts.train.path }}' } as any,
+          config: { file: '{{ nodes.a.output.artifacts.train.path }}' },
         },
       ],
       edges: [{ from: 'a', to: 'b' }],

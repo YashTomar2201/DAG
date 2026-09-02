@@ -8,6 +8,7 @@ import {
   allNodeRunsTerminal,
   appendRunEvent,
 } from '@dag/db';
+import type { Prisma, WorkflowVersion } from '@dag/db';
 import {
   seedInDegrees,
   decrementInDegree,
@@ -18,7 +19,7 @@ import {
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
 import type { Graph, NodeDef, NodeType, RunEventType } from '@dag/contracts';
-import { resolveNodeInputs, assertOutputSize, UnresolvedTemplateError, OutputTooLargeError } from '../context-resolver';
+import { resolveNodeInputs, assertOutputSize, OutputTooLargeError } from '../context-resolver';
 import { nodeDurationSeconds } from '../metrics';
 
 /**
@@ -35,7 +36,7 @@ function observeNodeDuration(startedAt: Date | null, nodeType: string, outcome: 
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function getGraphFromVersion(version: any): Graph {
+function getGraphFromVersion(version: WorkflowVersion): Graph {
   // Prisma Json types are tricky; safely cast it back to the Graph contract
   return version.graph as unknown as Graph;
 }
@@ -50,13 +51,13 @@ function getChildren(graph: Graph, nodeKey: string): string[] {
   return graph.edges.filter((e) => e.from === nodeKey).map((e) => e.to);
 }
 
-function emitAndLog(runId: string, type: RunEventType, payload: any, nodeKey?: string) {
+function emitAndLog(runId: string, type: RunEventType, payload: Record<string, unknown>, nodeKey?: string) {
   // 1. Fire and forget the Redis pub/sub for real-time UI
   publishRunEvent(runId, { runId, nodeKey, type, payload, ts: Date.now() })
     .catch((err: unknown) => logger.error({ err, runId }, 'Failed to publish event to redis'));
   
   // 2. Persist to Postgres audit log
-  appendRunEvent(runId, type, payload, nodeKey)
+  appendRunEvent(runId, type, payload as Prisma.InputJsonValue, nodeKey)
     .catch((err: unknown) => logger.error({ err, runId }, 'Failed to append event to DB'));
 }
 
@@ -119,10 +120,10 @@ export async function startRun(workflowVersionId: string, idempotencyKey?: strin
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 export async function dispatchNode(
-  runId: string, 
-  nodeKey: string, 
+  runId: string,
+  nodeKey: string,
   graph?: Graph,
-  versionId?: string
+  _versionId?: string
 ) {
   // 1. tryTransitionNodeRun(PENDING → QUEUED)
   const nr = await findNodeRun(runId, nodeKey);
@@ -137,6 +138,7 @@ export async function dispatchNode(
   if (!graph) {
     const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
     const version = await prisma.workflowVersion.findUnique({ where: { id: run!.workflowVersionId } });
+    if (!version) throw new NotFoundError('WorkflowVersion', run!.workflowVersionId);
     graph = getGraphFromVersion(version);
   }
 
@@ -149,7 +151,9 @@ export async function dispatchNode(
   // Persist resolved inputs on the row before enqueuing
   await prisma.nodeRun.update({
     where: { id: nr.id },
-    data: { input: resolvedInput as any },
+    // Prisma's Json field expects InputJsonValue — cast through unknown, the
+    // same pattern packages/db/src/repositories.ts uses for graph/topoOrder.
+    data: { input: resolvedInput as unknown as Prisma.InputJsonValue },
   });
 
   // 2. Queue the job
@@ -176,7 +180,7 @@ export async function dispatchNode(
 
 // ─── Completion Handlers ──────────────────────────────────────────────────────
 
-export async function onNodeSucceeded(runId: string, nodeKey: string, output: any) {
+export async function onNodeSucceeded(runId: string, nodeKey: string, output: unknown) {
   const nr = await findNodeRun(runId, nodeKey);
   if (!nr || nr.status !== 'RUNNING') return; // Might have been already completed or cancelled
 
@@ -194,8 +198,8 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: an
   }
 
   // 1. Persist output and transition
-  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'SUCCEEDED', { 
-    output,
+  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'SUCCEEDED', {
+    output: output as Prisma.InputJsonValue,
     finishedAt: new Date(),
   });
   
@@ -232,12 +236,17 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: an
   }
 }
 
-export async function onNodeFailed(runId: string, nodeKey: string, error: any) {
+export interface NodeFailure {
+  message: string;
+  taxonomy?: 'retryable' | 'unrecoverable';
+}
+
+export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFailure) {
   const nr = await findNodeRun(runId, nodeKey);
   if (!nr || nr.status !== 'RUNNING') return;
 
-  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'FAILED', { 
-    error,
+  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'FAILED', {
+    error: error as unknown as Prisma.InputJsonValue,
     finishedAt: new Date(),
   });
   
@@ -277,7 +286,7 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: any) {
   for (const skipKey of toSkip) {
     const childNr = await findNodeRun(runId, skipKey);
     if (childNr && ['PENDING', 'QUEUED'].includes(childNr.status)) {
-      await tryTransitionNodeRun(childNr.id, childNr.status as any, 'SKIPPED', { finishedAt: new Date() });
+      await tryTransitionNodeRun(childNr.id, childNr.status, 'SKIPPED', { finishedAt: new Date() });
       emitAndLog(runId, 'NODE_SKIPPED', { reason: `Ancestor ${nodeKey} failed` }, skipKey);
     }
   }

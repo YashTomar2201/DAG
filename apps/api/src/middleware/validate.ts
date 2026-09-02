@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
-import { ZodSchema, ZodError } from 'zod';
+import type { ZodSchema} from 'zod';
+import { ZodError } from 'zod';
 
 /**
  * Factory that returns an Express middleware which parses and validates

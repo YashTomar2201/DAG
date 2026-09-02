@@ -1,7 +1,7 @@
 import { Router, type Router as ExpressRouter } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
-import { getRunService, getRunEventsService, cancelRunService, retryFailedNodesService } from '../services/run.service';
+import { getRunService, cancelRunService, retryFailedNodesService } from '../services/run.service';
 import { streamRunEvents } from '../services/sse.service';
 import { startRun } from '../services/orchestrator.service';
 import { logger } from '../logger';

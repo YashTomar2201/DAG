@@ -5,6 +5,65 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A5: clear the lint backlog + add CI
+
+**Phase:** roadmap A5. Goal: `pnpm -r lint` is green so CI can catch
+regressions.
+
+### Changes
+
+31 pre-existing ESLint errors fixed (was: `apps/worker` 4, `apps/api` 27 — the
+rest of the estimated ~30 had been chipped away in earlier phases). No
+behavioural change beyond one strictly-safer null guard.
+
+- **`apps/worker/src/worker.ts`** — dropped unused imports (`prisma`,
+  `findNodeRun`, `releaseConcurrencySlot`) and the unused `result` arg on the
+  `'completed'` listener.
+- **`apps/api/src/services/orchestrator.service.ts`** — the worst offender.
+  `getGraphFromVersion(version: any)` → `WorkflowVersion`; `emitAndLog(payload:
+  any)` → `Record<string, unknown>`; `onNodeSucceeded(output: any)` → `unknown`;
+  `onNodeFailed(error: any)` → a new exported `NodeFailure` interface
+  (`{ message; taxonomy? }`). Prisma-JSON writes now cast
+  `… as unknown as Prisma.InputJsonValue` (the repositories.ts pattern) instead
+  of `as any`. Removed the unused `UnresolvedTemplateError` import; renamed the
+  unused `versionId` param to `_versionId`. Added `if (!version) throw new
+  NotFoundError(...)` where a `null` `WorkflowVersion` would previously have hit
+  a raw TypeError.
+- **`packages/db/src/index.ts`** — re-exports `type { Prisma }` from the
+  generated client, so consumers get `Prisma.InputJsonValue` without importing
+  from `generated/`.
+- **`apps/api/src/worker-events.ts`** — `returnvalue: any` → `unknown`.
+- **`apps/api/src/routes/run.routes.ts`** — dropped unused `getRunEventsService`
+  import.
+- **`middleware/validate.ts`** (`import type`), **`services/sse.service.ts`**
+  (`const`) — `eslint --fix`.
+- **tests** — `context-resolver.test.ts` (8), `orchestrator.test.ts` (2),
+  `sse.test.ts` (4): redundant inner `as any` casts removed (the fixtures are
+  already `as unknown as Graph`); `sse.test.ts` got a `LogFrame` type for the
+  `written` array so `.type` / `.logs` need no cast; one unused `forceFlush`
+  destructure dropped.
+- **`.github/workflows/ci.yml`** (new) — `pnpm -r typecheck && lint && test` on
+  every PR and push to `main`. Corepack-pinned pnpm, Node 22, `prisma generate`
+  before the checks (the client is gitignored). Concurrency-cancels superseded
+  runs.
+
+### Verification
+
+- `pnpm -r lint` → exit 0, all 7 packages.
+- `pnpm -r typecheck` clean; `pnpm -r test` → contracts 18 / graph-core 10 /
+  worker 12 / api 35 green (queue / db / integration self-skip without
+  services).
+- `KNOWN_LIMITATIONS.md` §8 marked CLOSED.
+
+### Files
+
+`.github/workflows/ci.yml` (new), `apps/worker/src/worker.ts`,
+`apps/api/src/{worker-events.ts, routes/run.routes.ts, middleware/validate.ts,
+services/orchestrator.service.ts, services/sse.service.ts}`, three api test
+files, `packages/db/src/index.ts`, `KNOWN_LIMITATIONS.md`.
+
+---
+
 ## 2026-09-03 — A2: commit the migration history
 
 **Phase:** roadmap A2. Goal: a fresh clone rebuilds the database
