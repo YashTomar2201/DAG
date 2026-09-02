@@ -5,6 +5,204 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — A1.3: real training
+
+**Phase:** roadmap A1.3 — third of the A1 arc. `torch.train` now fits a real
+scikit-learn estimator on the preprocessed split and logs a genuine
+per-iteration train score. `model.evaluate` stays a stub for one more part
+(A1.4), so the pipeline still finishes green.
+
+### Changes
+
+- **`apps/worker/python/train.py`** — rewritten. Same stdio protocol. Reads
+  `trainPath` (the `train.parquet` from preprocess), `targetColumn`, `modelType`
+  ("randomforest" default, or "logreg"), and `epochs` from the context.
+  - **randomforest:** `warm_start=True`, `n_estimators` grown 1 → epochs, refit
+    each step — a real score progression (bootstrap noise makes it
+    non-monotonic). Deterministic (`random_state=42`) so the idempotency
+    checksum is stable.
+  - **logreg:** refit with a growing `max_iter` budget each step — a genuine
+    convergence progression. The expected `ConvergenceWarning` is silenced so
+    the log stays the score lines.
+  - Model persisted with `joblib.dump` — a real pickle (~223 KB for RF on the
+    Titanic split; `joblib.load` returns a fitted `RandomForestClassifier`),
+    not the 11 bytes `STUBWEIGHTS`. Result carries `modelType`, `trainScore`,
+    `scoreHistory`, `featureNames`, `nFeatures`, `nTrain`, and a `sha256` of
+    the weights file.
+  - Falls back to a deterministic `make_classification(400×8)` when no
+    `trainPath` is wired, so un-updated graphs and the integration fixtures
+    still train something real and stay green.
+- **`packages/contracts/src/node-types.ts`** — `TorchTrainConfigSchema` gains
+  optional `modelType` (`z.enum(['randomforest','logreg'])`), `trainPath`,
+  `targetColumn`. Templates only survive if the key is on the schema
+  (`z.object()` strips unknowns — the `registry.deploy` bug).
+- **`apps/web/src/components/ConfigPanel.tsx`** — Model / Train Data Ref /
+  Target Column Ref inputs for `torch.train`; weights placeholder → `model.joblib`.
+- **`apps/web/src/store/graphSlice.ts`** — starter graph's Train node wires
+  `trainPath: '{{ nodes.node-2.output.trainPath }}'`,
+  `targetColumn: '{{ nodes.node-2.output.targetColumn }}'`,
+  `modelType: 'randomforest'`, `outputWeightsPath: 'model.joblib'`.
+
+### Verification
+
+- `train.py` run directly on the A1.2 `train.parquet`:
+  - randomforest, epochs 8 → `scoreHistory [0.8975, 0.8947, 0.9494, 0.9424,
+    0.9733, 0.9691, 0.9803, 0.9761]` — **non-monotonic**; 178 KB joblib file;
+    identical checksum across two runs.
+  - logreg → `trainScore 0.68` vs RF `0.98` — **`modelType` changes the score**.
+- End-to-end on the live 4-worker stack (templates resolved,
+  `trainPath` threaded from preprocess): preprocess → train → evaluate all
+  SUCCEEDED for both `randomforest` (`trainScore 0.982`) and `logreg`
+  (`trainScore 0.684`, different checksum). SSE log shows real
+  `[train] iter i/10 ... train_score=…` lines. In-container
+  `joblib.load(model.joblib)` → `RandomForestClassifier n_estimators=10`.
+- `pnpm -r typecheck` clean; contracts 18 / worker 12 / api 35 unit tests
+  green; contracts + web lint clean.
+
+### Note — bundled Dockerfile layer-ordering commit
+
+This branch also carries `build(worker): install Python deps before copying app
+code` (from the spun-off background task): the runtime stage now `COPY`s only
+`requirements.txt` and runs `pip install` **before** `COPY --from=deploy /out ./`,
+so editing worker source no longer busts the ~1-minute wheel-download layer.
+Verified: `docker compose build worker` a second time reuses the pip layer
+(`#34 … CACHED`).
+
+### Files
+
+`apps/worker/python/train.py`, `packages/contracts/src/node-types.ts`,
+`apps/web/src/components/ConfigPanel.tsx`, `apps/web/src/store/graphSlice.ts`
+(+ `infra/Dockerfile.worker` from the background task).
+
+---
+
+## 2026-09-03 — A1.2: real preprocessing on a bundled dataset
+
+**Phase:** roadmap A1.2 — second of the A1 arc. The `pandas.preprocess` node now
+does genuine work: it loads a CSV, drops mostly-empty and identifier-like
+columns, median/mode-imputes, one-hot encodes, and writes a real train/test
+parquet split. `torch.train` and `model.evaluate` stay stubs and simply ignore
+the richer upstream output, so the pipeline still finishes green.
+
+### Changes
+
+- **`apps/worker/python/data/titanic.csv`** (new, ~62 KB) +
+  **`data/make_titanic.py`** — a *synthetic* 891×12 passenger manifest,
+  deterministically generated (`numpy` seed 42). Not the Kaggle file: same column
+  shape and realistic missingness (Age ~21% null, Cabin ~76% null, Embarked a
+  few), so preprocessing has real work to do while staying reproducible and
+  credential-free. A1.5 adds an optional real source.
+- **`apps/worker/python/preprocess.py`** — rewritten. Same stdio protocol (one
+  JSON line in, log lines out, one `::RESULT::` line). Reads `csvPath` /
+  `targetColumn` / `testSize` from the context (all optional; `csvPath` falls
+  back to the bundled dataset). Real steps: drop columns with >40% nulls, drop
+  near-unique object columns (Name, Ticket), median/mode impute, `pd.get_dummies`,
+  `train_test_split(random_state=42)`, `to_parquet`. Result carries `rows`,
+  `cols`, `nTrain`, `nTest`, `nFeatures`, `features`, and a content checksum
+  (`sha256` of `hash_pandas_object(train_df)` — stable across parquet writer
+  versions, moves iff the processed data moves).
+- **`packages/contracts/src/node-types.ts`** — `PandasPreprocessConfigSchema`
+  gains optional `csvPath` (string), `targetColumn` (string), `testSize`
+  (`z.number().gt(0).lt(1)`). `z.object()` strips unknown keys, so a field only
+  reaches the worker if it's on the schema.
+- **`apps/web/src/components/ConfigPanel.tsx`** — `NODE_CONFIG_FIELDS` for
+  `pandas.preprocess` gains CSV Path / Target Column / Test Size inputs.
+- **`apps/web/src/store/graphSlice.ts`** — `testSize` added to
+  `NUMERIC_CONFIG_KEYS` (else the `<input type=number>` string is sent as a
+  string and rejected by Zod — the `minAccuracy` bug). Starter graph's Preprocess
+  node now points at `python/data/titanic.csv` with `targetColumn: 'Survived'`,
+  `testSize: 0.2`.
+
+### Gotcha
+
+`packages/contracts` is baked into **both** the `api` and `worker` images. The
+first E2E showed the new config fields silently stripped — the running `api`
+still had the old schema and `z.object()` dropped `csvPath` / `targetColumn` /
+`testSize` before persisting the version. Rebuild **both**:
+`docker compose -f infra/docker-compose.yml build api worker`.
+
+### Verification
+
+- `preprocess.py` run directly and end-to-end on the live 4-worker stack, three
+  contexts (identical checksums locally and in-container — deterministic):
+  - default `Survived` / 0.2 → 712 / 179 split, features `[PassengerId, Pclass,
+    Age, SibSp, Parch, Fare, Sex_male, Embarked_Q, Embarked_S]`,
+    checksum `…08368d5a`.
+  - `targetColumn=Pclass` → `Survived` becomes a feature, checksum `…a6445109`.
+  - `testSize=0.4` → 534 / 357 split, checksum `…6deb8a70`.
+- Live SSE `NODE_LOG_BATCH` carries the real lines: `loaded 891 rows x 12 cols`,
+  `dropped 1 high-null column(s): ['Cabin']`, `dropped 2 identifier-like
+  column(s): ['Name', 'Ticket']`, `imputed 2 column(s) …`, `one-hot encoded …`,
+  `split -> train 712 rows / test 179 rows`.
+- Full pipeline still `SUCCEEDED` (preprocess / train / evaluate all SUCCEEDED).
+- `pnpm -r typecheck` clean; contracts / graph-core / worker / api unit suites
+  green; `pnpm --filter @dag/contracts --filter @dag/web lint` clean.
+
+### Files
+
+`apps/worker/python/data/titanic.csv` (new), `apps/worker/python/data/make_titanic.py`
+(new), `apps/worker/python/preprocess.py`, `packages/contracts/src/node-types.ts`,
+`apps/web/src/components/ConfigPanel.tsx`, `apps/web/src/store/graphSlice.ts`.
+
+---
+
+## 2026-09-03 — A1.1: a Python runtime that can hold real ML libraries
+
+**Phase:** roadmap A1.1 — the first of the five-part A1 ("real ML executors")
+arc. This part ships the *capability*, not the logic: the executor scripts
+(`apps/worker/python/{preprocess,train,evaluate}.py`) are still the stdlib
+stubs, so the pipeline behaves exactly as before. A1.2+ replace the scripts.
+
+### Gap
+
+`infra/Dockerfile.worker`'s runtime stage was `node:22-alpine` (musl) and
+installed only the bare `python3` interpreter — the header comment even
+explained why pandas/torch were *deliberately* left out. There are no musl
+wheels for pandas / scikit-learn, so `pip install pandas` on that image tries
+to compile from source and fails (or takes ~40 min). The image was
+structurally incapable of running real ML, which blocks every later A1 part.
+
+### Fix
+
+- **New `apps/worker/python/requirements.txt`** — `pandas==2.2.3`,
+  `scikit-learn==1.5.2`, `joblib==1.4.2`, `pyarrow==17.0.0`, pinned exactly for
+  reproducible image builds. scikit-learn, not PyTorch: ~30 MB installed vs
+  800 MB+ of torch wheels for the same tabular-demo value.
+- **`infra/Dockerfile.worker`** — the whole `fetch → build → deploy → runtime`
+  chain moved from `node:22-alpine` to `node:22-slim` (Debian / glibc). One
+  libc across every stage on purpose: native modules compiled in `build` (the
+  Prisma query engine, msgpackr-extract) are `COPY --from=deploy`'d verbatim
+  into `runtime`, and a musl binary can't load in a glibc image.
+  - `runtime` stage installs `python3 python3-venv python3-pip`, creates
+    `/opt/venv`, and `pip install --no-cache-dir -r python/requirements.txt`
+    into it. The venv sidesteps Debian's `externally-managed-environment`
+    error that a bare `pip install` hits.
+  - `ENV PATH="/opt/venv/bin:${PATH}"` so `python-bridge.ts`'s
+    `spawn('python3', …)` resolves to the venv interpreter with **no code
+    change**.
+  - `build` stage gains `build-essential python3` so any native npm dep
+    without a prebuilt Debian binary can still compile during `pnpm install`.
+  - Header comment rewritten — the old text argued for omitting the deps; that
+    rationale is now obsolete.
+
+### Verification
+
+- `docker compose -f infra/docker-compose.yml build worker` — clean; pip
+  pulled prebuilt `manylinux` wheels for every package (no source builds).
+- `docker compose … exec worker python3 -c "import pandas, sklearn, joblib,
+  pyarrow"` — ok (pandas 2.2.3, sklearn 1.5.2); `command -v python3` →
+  `/opt/venv/bin/python3`.
+- Stub pipeline still green end-to-end: `POST /workflows` + `POST /runs` on the
+  live 4-worker stack → run **SUCCEEDED**, all 4 NodeRuns SUCCEEDED, stub
+  outputs (`accuracy 0.923`, `rows 100`) unchanged.
+- `docker images infra-worker` — **1.31 GB**, under the ~1.5 GB target.
+
+### Files
+
+`infra/Dockerfile.worker`, `apps/worker/python/requirements.txt` (new).
+
+---
+
 ## 2026-09-02 — Editor interaction & run-control fixes
 
 Follow-up round after the redesign, all in `apps/web`. Shipped as PRs #2–#4

@@ -17,12 +17,18 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'outputDir',   label: 'Output Dir',   type: 'text', placeholder: 'artifacts/download' },
   ],
   'pandas.preprocess': [
-    { key: 'scriptPath', label: 'Script Path', type: 'text', placeholder: 'preprocess.py' },
+    { key: 'scriptPath',   label: 'Script Path',     type: 'text',   placeholder: 'preprocess.py' },
+    { key: 'csvPath',      label: 'CSV Path',        type: 'text',   placeholder: 'python/data/titanic.csv' },
+    { key: 'targetColumn', label: 'Target Column',   type: 'text',   placeholder: 'Survived' },
+    { key: 'testSize',     label: 'Test Size (0–1)', type: 'number', placeholder: '0.2' },
   ],
   'torch.train': [
-    { key: 'scriptPath',         label: 'Script Path',         type: 'text',   placeholder: 'train.py' },
-    { key: 'epochs',             label: 'Epochs',              type: 'number', placeholder: '10' },
-    { key: 'outputWeightsPath',  label: 'Weights Output Path', type: 'text',   placeholder: 'model.pt' },
+    { key: 'scriptPath',         label: 'Script Path',            type: 'text',   placeholder: 'train.py' },
+    { key: 'modelType',          label: 'Model (randomforest / logreg)', type: 'text', placeholder: 'randomforest' },
+    { key: 'epochs',             label: 'Epochs (trees / iters)', type: 'number', placeholder: '10' },
+    { key: 'trainPath',          label: 'Train Data Ref',         type: 'text',   placeholder: '{{ nodes.<preprocess>.output.trainPath }}' },
+    { key: 'targetColumn',       label: 'Target Column Ref',      type: 'text',   placeholder: '{{ nodes.<preprocess>.output.targetColumn }}' },
+    { key: 'outputWeightsPath',  label: 'Weights Output Path',    type: 'text',   placeholder: 'model.joblib' },
   ],
   'model.evaluate': [
     { key: 'scriptPath',  label: 'Script Path',      type: 'text',   placeholder: 'evaluate.py' },

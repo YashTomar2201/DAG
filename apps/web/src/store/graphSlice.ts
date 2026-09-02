@@ -112,9 +112,11 @@ function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
     mk('node-1', 'Extract dataset', 'kaggle.download',
       { datasetSlug: 'kaggle/titanic', outputDir: 'artifacts/raw' }, 0, 120),
     mk('node-2', 'Preprocess', 'pandas.preprocess',
-      { scriptPath: 'preprocess.py' }, 260, 120),
+      { scriptPath: 'preprocess.py', csvPath: 'python/data/titanic.csv', targetColumn: 'Survived', testSize: 0.2 }, 260, 120),
     mk('node-3', 'Train model', 'torch.train',
-      { scriptPath: 'train.py', epochs: 10, outputWeightsPath: 'model.pt' }, 520, 120),
+      { scriptPath: 'train.py', modelType: 'randomforest', epochs: 10, outputWeightsPath: 'model.joblib',
+        trainPath: '{{ nodes.node-2.output.trainPath }}',
+        targetColumn: '{{ nodes.node-2.output.targetColumn }}' }, 520, 120),
     mk('node-4', 'Evaluate', 'model.evaluate',
       { scriptPath: 'evaluate.py', minAccuracy: 0.8 }, 780, 120),
   ];
@@ -144,7 +146,7 @@ const _starter = starterGraph();
  * and coerces the few numeric fields the API expects as real numbers rather
  * than the strings an <input> produces.
  */
-const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy']);
+const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy', 'testSize']);
 
 function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
