@@ -13,6 +13,14 @@
 # apps/worker/python/requirements.txt; PATH is prepended with the venv so
 # python-bridge.ts's `spawn('python3', ...)` resolves to it with no code change.
 #
+# Runtime-stage layer ordering matters: the pip install (pandas/scikit-learn/
+# scipy/numpy/pyarrow — ~1 min of PyPI downloads) copies ONLY
+# requirements.txt and runs BEFORE `COPY --from=deploy /out ./`. If the app
+# code were copied first, every worker source edit (TS or python/*.py) would
+# bust the COPY layer and force a full wheel re-download. Keyed on
+# requirements.txt alone, the heavy layer stays cached until deps actually
+# change.
+#
 # Why the WHOLE chain (fetch -> build -> deploy -> runtime) is on one libc:
 # native modules compiled during `build` (the Prisma query engine,
 # msgpackr-extract, ...) are copied verbatim into `runtime` by
@@ -54,12 +62,16 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-venv python3-pip \
  && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production
-COPY --from=deploy /out ./
-# Python deps for the executor scripts, isolated in a venv (Debian blocks a
-# bare `pip install` with "externally-managed-environment"). The PATH prepend
-# makes `python3` resolve to this interpreter.
+# Python deps first, keyed only on requirements.txt so the wheel-download layer
+# survives worker source changes. Isolated in a venv because Debian blocks a
+# bare `pip install` ("externally-managed-environment"); the PATH prepend makes
+# `python3` resolve to this interpreter.
+COPY apps/worker/python/requirements.txt ./python/requirements.txt
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
  && /opt/venv/bin/pip install --no-cache-dir -r python/requirements.txt
 ENV PATH="/opt/venv/bin:${PATH}"
+# App code last — edits here reuse the pip layer above. `/out` also carries its
+# own identical python/requirements.txt, which harmlessly overwrites the copy.
+COPY --from=deploy /out ./
 CMD ["node_modules/.bin/tsx", "src/index.ts"]
