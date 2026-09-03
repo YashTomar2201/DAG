@@ -158,6 +158,28 @@ export function IconHistory(p: IconProps) {
   );
 }
 
+export function IconClock(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3.5 2" />
+    </svg>
+  );
+}
+
+export function IconWebhook(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <path d="M18 8a6 6 0 0 0-11.4-2.6" />
+      <path d="M6 16a6 6 0 0 0 10.7 1.2" />
+      <path d="M12 20a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z" />
+      <path d="M6.5 16H12" />
+      <path d="M17 8.5 14 14" />
+      <path d="M7 5.5 10 11" />
+    </svg>
+  );
+}
+
 export function IconRetry(p: IconProps) {
   return (
     <svg {...base(p)}>

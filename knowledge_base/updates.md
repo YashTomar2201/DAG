@@ -5,6 +5,26 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B2 (UI): Automation panel
+
+The editor now surfaces B2. `apps/web/src/components/AutomationPanel.tsx` — a
+slide-in on the canvas (button bottom-right, same shape as Run History):
+
+- **Cron schedules** — list (cron, plain-English gloss, timezone, `next in …`,
+  `last fired …`), an enable/disable checkbox, delete, and an add row with four
+  preset chips (`* * * * *`, `0 * * * *`, `0 2 * * *`, `0 9 * * 1`) feeding a
+  free-text cron `<input>`.
+- **Webhook triggers** — list (masked token, Copy URL, enable toggle, delete)
+  and an add button; on create, a one-time green box reveals the full URL + the
+  signing secret with Copy buttons and the `X-Signature-256` hint (the secret is
+  never shown again).
+
+`apps/web/src/api/client.ts` gained the schedule/trigger CRUD calls and
+`webhookUrl()`; `icons.tsx` gained `IconClock` / `IconWebhook`. Only active once
+the workflow is saved (both run its latest version). Browser-verified against
+the live API: create/list/enable-toggle/delete for both; the Redis Job Scheduler
+count returned to 0 after a UI delete.
+
 ## 2026-09-04 — B2 (backend): scheduled + webhook-triggered runs
 
 **Phase:** roadmap B2. Runs could only start via `POST /runs`. Now a workflow

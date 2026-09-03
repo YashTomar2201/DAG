@@ -263,6 +263,89 @@ export async function retryFailed(runId: string): Promise<unknown> {
   return request(`/runs/${runId}/retry-failed`, { method: 'POST' });
 }
 
+// ─── Schedules & webhooks (B2) ───────────────────────────────────────────────
+
+export interface Schedule {
+  id: string;
+  workflowId: string;
+  cron: string;
+  timezone: string;
+  enabled: boolean;
+  nextFireAt: string | null;
+  lastFiredAt: string | null;
+  lastRunId: string | null;
+  createdAt: string;
+}
+
+export interface Trigger {
+  id: string;
+  workflowId: string;
+  token: string;
+  webhookPath: string;
+  enabled: boolean;
+  lastFiredAt: string | null;
+  lastRunId: string | null;
+  createdAt: string;
+}
+
+/** Only the create call ever returns the signing secret. */
+export type TriggerWithSecret = Trigger & { secret: string };
+
+export async function listSchedules(workflowId: string): Promise<Schedule[]> {
+  const r = await request<{ schedules: Schedule[] }>(`/workflows/${workflowId}/schedules?${T}`);
+  return r.schedules;
+}
+
+export async function createSchedule(
+  workflowId: string,
+  cron: string,
+  timezone = 'UTC',
+): Promise<Schedule> {
+  return request(`/workflows/${workflowId}/schedules?${T}`, {
+    method: 'POST',
+    body: JSON.stringify({ cron, timezone }),
+  });
+}
+
+export async function updateSchedule(
+  scheduleId: string,
+  patch: Partial<{ cron: string; timezone: string; enabled: boolean }>,
+): Promise<Schedule> {
+  return request(`/schedules/${scheduleId}?${T}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
+export async function deleteSchedule(scheduleId: string): Promise<void> {
+  await request<void>(`/schedules/${scheduleId}?${T}`, { method: 'DELETE' });
+}
+
+export async function listTriggers(workflowId: string): Promise<Trigger[]> {
+  const r = await request<{ triggers: Trigger[] }>(`/workflows/${workflowId}/triggers?${T}`);
+  return r.triggers;
+}
+
+export async function createTrigger(workflowId: string): Promise<TriggerWithSecret> {
+  return request(`/workflows/${workflowId}/triggers?${T}`, { method: 'POST' });
+}
+
+export async function setTriggerEnabled(triggerId: string, enabled: boolean): Promise<Trigger> {
+  return request(`/triggers/${triggerId}?${T}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export async function deleteTrigger(triggerId: string): Promise<void> {
+  await request<void>(`/triggers/${triggerId}?${T}`, { method: 'DELETE' });
+}
+
+/** Absolute webhook URL for a trigger token — for the "copy" affordance. */
+export function webhookUrl(token: string): string {
+  return `${API_BASE}/triggers/${token}`;
+}
+
 // ─── SSE ─────────────────────────────────────────────────────────────────────
 
 /**

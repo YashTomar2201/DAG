@@ -20,6 +20,7 @@ import { NodePalette } from './components/NodePalette';
 import { ConfigPanel } from './components/ConfigPanel';
 import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
+import { AutomationPanel } from './components/AutomationPanel';
 import { WorkflowMenu } from './components/WorkflowMenu';
 import { VersionMenu } from './components/VersionMenu';
 
@@ -792,6 +793,7 @@ function AppCanvas() {
           )}
 
           <RunHistory workflowId={workflowId} />
+          <AutomationPanel workflowId={workflowId} />
 
           {/* Product Surface: DAG Canvas */}
           <div
