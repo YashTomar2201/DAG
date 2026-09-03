@@ -55,6 +55,20 @@ export class ValidationError extends Error {
   }
 }
 
+// ─── UnauthorizedError ───────────────────────────────────────────────────────
+
+/**
+ * Thrown when a request fails authentication — currently only a webhook
+ * trigger whose HMAC signature is missing or does not match.
+ * Maps to HTTP 401.
+ */
+export class UnauthorizedError extends Error {
+  constructor(message = 'Unauthorized') {
+    super(message);
+    this.name = 'UnauthorizedError';
+  }
+}
+
 // ─── ConflictError ────────────────────────────────────────────────────────────
 
 /**

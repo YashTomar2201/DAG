@@ -74,7 +74,11 @@ function emitAndLog(runId: string, type: RunEventType, payload: Record<string, u
 
 // ─── Start Run ────────────────────────────────────────────────────────────────
 
-export async function startRun(workflowVersionId: string, idempotencyKey?: string) {
+export async function startRun(
+  workflowVersionId: string,
+  idempotencyKey?: string,
+  opts: { triggeredBy?: string } = {},
+) {
   const version = await prisma.workflowVersion.findUnique({
     where: { id: workflowVersionId },
   });
@@ -83,8 +87,14 @@ export async function startRun(workflowVersionId: string, idempotencyKey?: strin
   const graph = getGraphFromVersion(version);
   const nodeKeys = graph.nodes.map((n) => n.key);
 
-  // 1. Create Run + NodeRuns (idempotent)
-  const run = await createRun(workflowVersionId, 'api', nodeKeys, idempotencyKey);
+  // 1. Create Run + NodeRuns (idempotent). `triggeredBy` records the origin:
+  //    'api' (a POST /runs), 'schedule', or 'webhook'.
+  const run = await createRun(
+    workflowVersionId,
+    opts.triggeredBy ?? 'api',
+    nodeKeys,
+    idempotencyKey,
+  );
   
   // If the run was already started (idempotency hit), we don't re-seed
   if (run.status !== 'PENDING') {

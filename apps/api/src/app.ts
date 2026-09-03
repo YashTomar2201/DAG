@@ -1,6 +1,8 @@
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { workflowRouter } from './routes/workflow.routes';
 import { runRouter } from './routes/run.routes';
+import { scheduleRouter } from './routes/schedule.routes';
+import { triggerRouter } from './routes/trigger.routes';
 import { errorHandler } from './middleware/errorHandler';
 import { registry, renderMetrics } from './metrics';
 
@@ -35,6 +37,14 @@ export function createApp(): Express {
     next();
   });
 
+  // ── Webhook raw body ─────────────────────────────────────────────────────
+  // The trigger webhook verifies an HMAC over the EXACT request bytes, so it
+  // must see the raw Buffer — capture it here, before express.json, and only
+  // for this one route+method (express.raw calls next(), so the request still
+  // falls through to the trigger router). express.json then no-ops because
+  // express.raw has already marked the body as read.
+  app.post('/triggers/:token', express.raw({ type: () => true, limit: '1mb' }));
+
   // ── Body parsing ──────────────────────────────────────────────────────────
   app.use(express.json({ limit: '1mb' }));
 
@@ -57,6 +67,11 @@ export function createApp(): Express {
   // ── API routes ────────────────────────────────────────────────────────────
   app.use('/workflows', workflowRouter);
   app.use('/runs', runRouter);
+  // Schedules (B2) and triggers own absolute paths (/workflows/:id/schedules,
+  // /schedules/:id, /workflows/:id/triggers, /triggers/:id, /triggers/:token),
+  // so they mount at the root rather than under a shared prefix.
+  app.use(scheduleRouter);
+  app.use(triggerRouter);
 
   // ── Central error handler — MUST be registered after all routes ───────────
   app.use(errorHandler);

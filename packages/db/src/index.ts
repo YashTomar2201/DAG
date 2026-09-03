@@ -26,6 +26,7 @@ export {
   softDeleteWorkflow,
   // Run lifecycle
   createRun,
+  findRunByIdempotencyKey,
   tryTransitionRun,
   allNodeRunsTerminal,
   // NodeRun lifecycle
@@ -38,6 +39,21 @@ export {
   // Observability (Phase 12)
   countNodeRunsByStatus,
   countRunsByStatus,
+  // Schedules & Triggers (B2)
+  getLatestVersionId,
+  workflowBelongsToTenant,
+  createSchedule,
+  listSchedulesForWorkflow,
+  getScheduleById,
+  listEnabledSchedules,
+  updateSchedule,
+  deleteSchedule,
+  createTrigger,
+  listTriggersForWorkflow,
+  getTriggerByToken,
+  getTriggerById,
+  updateTrigger,
+  deleteTrigger,
 } from './repositories';
 
 // Prisma-generated types (re-exported so consumers don't need a generated/ import)
@@ -48,6 +64,8 @@ export type {
   RunEvent,
   Tenant,
   Workflow,
+  Schedule,
+  Trigger,
 } from './repositories';
 export type { WorkflowListRow } from './repositories';
 export type { Prisma } from './generated/client';

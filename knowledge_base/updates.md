@@ -5,6 +5,90 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B2 (backend): scheduled + webhook-triggered runs
+
+**Phase:** roadmap B2. Runs could only start via `POST /runs`. Now a workflow
+runs itself on a cron, or when a signed webhook fires. Engine + API + tests
+here; the editor UI is a follow-up.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** + migration
+  `20260903211647_b2_schedules_and_triggers` — two models:
+  - `Schedule` — `{ cron, timezone, enabled, lastRunId, lastFiredAt, nextFireAt }`,
+    pins the **workflow** (not a version): each fire runs the latest saved
+    version. Indexed `[workflowId]` and `[enabled, nextFireAt]`.
+  - `Trigger` — `{ token (unique), secret, enabled, lastRunId, lastFiredAt }`.
+    `token` is the public URL segment; `secret` keys the HMAC.
+- **`packages/queue/src/scheduler.ts`** (new) — a `scheduler` BullMQ queue plus
+  helpers over BullMQ **Job Schedulers** (`upsertScheduleJob` /
+  `removeScheduleJob` / `listScheduleJobIds`): Redis-backed cron that survives
+  API restarts and never double-fires across replicas. Also `assertValidCron`
+  / `nextCronFire` (via `cron-parser`, added as a `@dag/queue` dep) and
+  `plannedFireMillis` — the tick's planned time for the idempotency key
+  (parses BullMQ's `<id>:<millis>` job id, falls back to the current minute).
+- **`apps/api/src/services/schedule.service.ts`** (new) — CRUD that keeps the
+  DB row and the Job Scheduler in lock-step (create/enable → upsert,
+  disable/delete → remove), plus `fireSchedule(scheduleId, jobId)`: resolves
+  the latest version, `startRun` with
+  `idempotencyKey = schedule:<id>:<plannedISO>`, records `lastRunId` /
+  `nextFireAt`. `reconcileSchedules()` re-asserts every enabled row's Job
+  Scheduler on boot (heals a flushed Redis).
+- **`apps/api/src/scheduler-worker.ts`** (new) — a BullMQ `Worker` on the
+  `scheduler` queue, started from `index.ts` only (not `createApp`, so
+  integration tests don't spin a timer). One tick = one `fireSchedule`.
+- **`apps/api/src/services/trigger.service.ts`** (new) — trigger CRUD (the
+  `secret` is returned once, on create, never listed) and
+  `handleWebhookService(token, rawBody, signature)`: constant-time HMAC-SHA256
+  check of `X-Signature-256: sha256=<hex>` over the **raw bytes**, then
+  `startRun` with `idempotencyKey = webhook:<triggerId>:<sha256(body)>` — an
+  identical replay returns the first run. A disabled/unknown token is a flat
+  404 (no oracle).
+- **`apps/api/src/services/orchestrator.service.ts`** — `startRun` gained an
+  `opts.triggeredBy` (`'api'` default, else `'schedule'` / `'webhook'`), so
+  `Run.triggeredBy` records the origin.
+- **Routes** — `apps/api/src/routes/schedule.routes.ts`
+  (`GET|POST /workflows/:id/schedules`, `PATCH|DELETE /schedules/:id`) and
+  `trigger.routes.ts` (`GET|POST /workflows/:id/triggers`,
+  `PATCH|DELETE /triggers/:id`, and `POST /triggers/:token` — the webhook).
+  Both mount at the app root (`app.ts`). Shared `tenantOf` extracted to
+  `routes/tenant.ts`.
+- **`apps/api/src/app.ts`** — `app.post('/triggers/:token', express.raw(...))`
+  **before** `express.json` so the webhook handler sees the exact bytes the
+  caller signed; `express.json` then no-ops for that request.
+- **`apps/api/src/errors.ts`** — `UnauthorizedError` → HTTP 401 (bad/missing
+  webhook signature).
+- **`packages/db/src/repositories.ts`** — `findRunByIdempotencyKey`,
+  `getLatestVersionId`, `workflowBelongsToTenant`, and schedule/trigger CRUD
+  helpers.
+
+### Verification
+
+- `apps/api/src/integration/schedule.integration.test.ts` (6) +
+  `trigger.integration.test.ts` (5), real Postgres + Redis: invalid cron
+  rejected; create → Job Scheduler exists + `nextFireAt` set; **`fireSchedule`
+  twice for the same planned tick → exactly one run** (2nd `deduped: true`);
+  disable/enable/delete sync the Job Scheduler; missing/wrong HMAC → 401;
+  valid → run (`triggeredBy: 'webhook'`); identical replay → same run;
+  different body → new run; cross-tenant → 404. Full integration suite: 11
+  files / 24 tests green.
+- Live stack (rebuilt `api` image, migration applied): created a
+  `* * * * *` schedule → it fired on the minute boundary
+  (`lastFiredAt: 21:36:00.103Z`), one `SUCCEEDED` run with
+  `triggeredBy: schedule`, `nextFireAt` advanced; `redis ZCARD bull:scheduler:repeat`
+  went to 0 after `DELETE /schedules/:id`. Webhook: signed POST → run;
+  same body again → same runId, `deduped: true`; bad signature → 401.
+- `pnpm -r typecheck` / `pnpm -r lint` green.
+
+### Rebuild note
+
+`@dag/db` (new Prisma models) and `@dag/queue` are baked into the `api` image —
+`docker compose build api` (and the `migrate` one-shot, which shares the
+`build` stage: `docker compose build migrate` then `run --rm migrate`). Workers
+don't touch these tables, so a worker rebuild isn't required for B2.
+
+---
+
 ## 2026-09-04 — B1.2: condition builder in the editor
 
 **Phase:** roadmap B1.2. The engine has understood edge conditions since B1.1,

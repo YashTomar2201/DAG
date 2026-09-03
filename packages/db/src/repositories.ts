@@ -275,6 +275,12 @@ export async function createRun(
   });
 }
 
+/** The run created for a given idempotency key, or null. Lets callers tell a
+ *  fresh run apart from an idempotent replay (B2 schedule / webhook fires). */
+export async function findRunByIdempotencyKey(idempotencyKey: string): Promise<Run | null> {
+  return prisma.run.findUnique({ where: { idempotencyKey } });
+}
+
 // ─── NodeRun state machine ───────────────────────────────────────────────────
 
 /**
@@ -430,4 +436,122 @@ export async function countRunsByStatus(): Promise<Record<string, number>> {
   const result: Record<string, number> = {};
   for (const row of rows) result[row.status] = row._count._all;
   return result;
+}
+
+// ─── Schedules & Triggers (roadmap B2) ──────────────────────────────────────
+
+export type { Schedule, Trigger } from './generated/client';
+
+/**
+ * The id of a workflow's newest version, or null if it has none / is
+ * soft-deleted / belongs to another tenant. Used by the schedule + webhook
+ * fire paths, which run "whatever is latest right now".
+ */
+export async function getLatestVersionId(
+  workflowId: string,
+  tenantId?: string,
+): Promise<string | null> {
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, deletedAt: null, ...(tenantId ? { tenantId } : {}) },
+    select: {
+      versions: { orderBy: { version: 'desc' }, take: 1, select: { id: true } },
+    },
+  });
+  return wf?.versions[0]?.id ?? null;
+}
+
+/** True iff the workflow exists, is not soft-deleted, and belongs to the tenant. */
+export async function workflowBelongsToTenant(workflowId: string, tenantId: string): Promise<boolean> {
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, tenantId, deletedAt: null },
+    select: { id: true },
+  });
+  return wf !== null;
+}
+
+// ── Schedule ────────────────────────────────────────────────────────────────
+
+export async function createSchedule(data: {
+  workflowId: string;
+  cron: string;
+  timezone: string;
+  nextFireAt: Date | null;
+}) {
+  return prisma.schedule.create({ data });
+}
+
+export async function listSchedulesForWorkflow(workflowId: string) {
+  return prisma.schedule.findMany({
+    where: { workflowId },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+export async function getScheduleById(id: string) {
+  return prisma.schedule.findUnique({ where: { id } });
+}
+
+/** All enabled schedules across every workflow — used to reconcile BullMQ on API boot. */
+export async function listEnabledSchedules() {
+  return prisma.schedule.findMany({ where: { enabled: true } });
+}
+
+export async function updateSchedule(
+  id: string,
+  data: Partial<{
+    cron: string;
+    timezone: string;
+    enabled: boolean;
+    nextFireAt: Date | null;
+    lastRunId: string | null;
+    lastFiredAt: Date | null;
+  }>,
+) {
+  const result = await prisma.schedule.updateMany({ where: { id }, data });
+  if (result.count === 0) return null;
+  return prisma.schedule.findUnique({ where: { id } });
+}
+
+export async function deleteSchedule(id: string): Promise<boolean> {
+  const result = await prisma.schedule.deleteMany({ where: { id } });
+  return result.count > 0;
+}
+
+// ── Trigger ─────────────────────────────────────────────────────────────────
+
+export async function createTrigger(data: {
+  workflowId: string;
+  token: string;
+  secret: string;
+}) {
+  return prisma.trigger.create({ data });
+}
+
+export async function listTriggersForWorkflow(workflowId: string) {
+  return prisma.trigger.findMany({
+    where: { workflowId },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+export async function getTriggerByToken(token: string) {
+  return prisma.trigger.findUnique({ where: { token } });
+}
+
+export async function getTriggerById(id: string) {
+  return prisma.trigger.findUnique({ where: { id } });
+}
+
+export async function updateTrigger(
+  id: string,
+  data: Partial<{ enabled: boolean; lastRunId: string | null; lastFiredAt: Date | null }>,
+) {
+  const result = await prisma.trigger.updateMany({ where: { id }, data });
+  if (result.count === 0) return null;
+  return prisma.trigger.findUnique({ where: { id } });
+}
+
+export async function deleteTrigger(id: string): Promise<boolean> {
+  const result = await prisma.trigger.deleteMany({ where: { id } });
+  return result.count > 0;
 }

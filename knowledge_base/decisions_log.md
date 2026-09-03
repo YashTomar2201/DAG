@@ -664,3 +664,68 @@ encodes which branch won. Keeps the SSE contract unchanged.
 `ConfigPanel` renders `<EdgeInspector />` in place of the node form. One
 inspector panel, one selected thing — no stacked panels, no ambiguity about
 what "Delete" or "Save Changes" acts on.
+
+---
+
+## B2 — Scheduled & Webhook-Triggered Runs (`apps/api`, `packages/queue`)
+
+### Decision: BullMQ Job Schedulers, not a `setInterval` loop
+
+Each enabled `Schedule` row has a matching BullMQ Job Scheduler on the
+`scheduler` queue, keyed by the schedule id. BullMQ stores the cron state in
+Redis, so it survives an API restart, and it produces exactly one delayed job
+per tick even if several API replicas are connected — none of which a
+hand-rolled `setInterval` in one process gets right (lost on restart,
+duplicated per replica, drifts). The API process runs a `Worker` on that queue
+whose only job is a DB lookup + `startRun`. The DB row is the user-facing
+mirror and bookkeeping (`lastRunId`, `nextFireAt`); the Job Scheduler is the
+authority for *when*. `reconcileSchedules()` on boot re-asserts a Job Scheduler
+for every enabled row, healing the one divergence that matters (Redis flushed,
+Postgres intact).
+
+### Decision: a schedule pins the workflow, not a version
+
+The roadmap sketch had `workflowVersionId`. We pin `workflowId` and resolve the
+latest version at fire time instead: "run this workflow every night" should
+track your edits, which is how Airflow/Prefect schedules behave. The cost —
+a bad save silently changes what the nightly run executes — is the same cost
+you already accept for `POST /runs` from the editor, and version history plus
+the run's pinned `workflowVersionId` make it auditable after the fact.
+
+### Decision: idempotency key = planned fire time, derived without trusting BullMQ internals
+
+`fireSchedule` builds `schedule:<id>:<plannedISO>`. The planned time comes from
+`plannedFireMillis(jobId)`: BullMQ names scheduler jobs `<schedulerId>:<millis>`,
+so the trailing number is the tick time — but if that can't be parsed (format
+changed, sanity-bound blown) it falls back to the current minute boundary.
+For the `* * * * *` case the planned times *are* minute boundaries, so the
+fallback is exact; for a stalled-job re-delivery after an API crash the ~30s
+lock window lands in the same minute the vast majority of the time. The unique
+`Run.idempotencyKey` constraint plus `createRun`'s "return the existing run"
+is the actual guarantee — this just derives a stable key for it.
+
+### Decision: webhook idempotency key embeds `sha256(rawBody)`, prefixed by trigger id
+
+The roadmap says `idempotencyKey = sha256(rawBody)`. We prefix it
+(`webhook:<triggerId>:<hash>`) so two different triggers receiving the same
+JSON body (`{}` is common) don't collide on the global-unique key. The
+consequence — re-POSTing the exact same body is a no-op that returns the first
+run — is the intended "reject replays for free" behaviour. A caller that wants
+to fire twice with the same semantic payload adds a nonce field.
+
+### Decision: raw body captured per-route, before `express.json`
+
+The webhook verifies an HMAC over the exact request bytes, so it can't run
+after `express.json` has parsed and discarded them. `app.post('/triggers/:token',
+express.raw({ type: () => true }))` is registered before the global
+`express.json`; `express.raw` calls `next()`, the request falls through to the
+trigger router, and `express.json` skips it (body already read). Only that one
+method+path is affected — `PATCH /triggers/:id` etc. still get normal JSON
+parsing.
+
+### Decision: an unknown token and a disabled trigger return the same 404
+
+`handleWebhookService` throws `NotFoundError` for both. A distinct "disabled"
+response would tell an attacker probing tokens which ones are real. Signature
+failures are 401 (you found a real token but can't sign for it); everything
+else about a token's existence is opaque.

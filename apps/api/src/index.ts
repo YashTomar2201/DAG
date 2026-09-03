@@ -12,6 +12,7 @@ import { createApp } from './app';
 import { logger } from './logger';
 import { prisma } from '@dag/db';
 import { startQueueEventListeners } from './worker-events';
+import { startSchedulerWorker } from './scheduler-worker';
 
 const app = createApp();
 
@@ -20,6 +21,7 @@ const server = app.listen(env.API_PORT, () => {
 });
 
 const closeQueueEvents = startQueueEventListeners();
+const closeScheduler = startSchedulerWorker();
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 // Allow in-flight requests to complete before closing the DB connection pool.
@@ -27,6 +29,7 @@ const closeQueueEvents = startQueueEventListeners();
 async function shutdown(signal: string) {
   logger.info({ signal }, 'Shutdown signal received — draining connections');
   closeQueueEvents();
+  await closeScheduler().catch((err) => logger.error({ err }, 'Error closing scheduler worker'));
   server.close(async () => {
     await prisma.$disconnect();
     logger.info('Server closed, Prisma disconnected');

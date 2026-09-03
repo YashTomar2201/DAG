@@ -61,6 +61,7 @@ export async function teardownTestEnv(ctx: Awaited<ReturnType<typeof bootstrapTe
     ctx.queue.ioQueue.close(),
     ctx.queue.cpuQueue.close(),
     ctx.queue.gpuQueue.close(),
+    ctx.queue.schedulerQueue.close(),
   ]);
   await ctx.db.prisma.$disconnect();
   await ctx.queue.connection.quit().catch(() => {});

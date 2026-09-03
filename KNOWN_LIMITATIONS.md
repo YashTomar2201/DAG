@@ -32,23 +32,32 @@ API reads `tenantId` from a request header that is passed through as-is.
 
 ---
 
-## 2. No Scheduled or Time-Triggered Runs
+## 2. Scheduled + Webhook-Triggered Runs — ✅ CLOSED (roadmap B2)
 
-**What exists:** Runs are started only via `POST /workflows/:id/runs` — an explicit HTTP call
-from the browser or an API consumer.
+**Done:**
+- **Cron schedules.** A `Schedule` row (`{ workflowId, cron, timezone, enabled,
+  lastRunId, lastFiredAt, nextFireAt }`) is mirrored by a BullMQ **Job
+  Scheduler** on the `scheduler` queue (Redis-backed, survives API restarts, one
+  fire per tick across replicas). The API process runs a `Worker` that turns
+  each tick into `startRun` with
+  `idempotencyKey = schedule:<id>:<plannedFireISO>`, so a crash-and-restart
+  mid-tick can't double-start. `reconcileSchedules()` on boot re-asserts every
+  enabled row's Job Scheduler. Routes: `GET|POST /workflows/:id/schedules`,
+  `PATCH|DELETE /schedules/:id`.
+- **Webhook triggers.** A `Trigger` row (`{ token, secret, enabled, … }`);
+  `POST /triggers/:token` with `X-Signature-256: sha256=<hmac-of-raw-body>`
+  starts a run of the latest version. `idempotencyKey =
+  webhook:<triggerId>:<sha256(body)>`, so an identical replay returns the first
+  run. Bad/missing signature → 401; unknown or disabled token → 404 (no oracle).
+  Routes: `GET|POST /workflows/:id/triggers`, `PATCH|DELETE /triggers/:id`.
+- `Run.triggeredBy` now records `'api'` / `'schedule'` / `'webhook'`.
 
-**What is missing:** Cron-style scheduling ("run this workflow every day at 02:00 UTC"), event-
-triggered dispatch ("run when a file appears in S3"), or sensor polling ("run when a Kaggle dataset
-version changes").
+Verified by `apps/api/src/integration/{schedule,trigger}.integration.test.ts`
+and a live-stack smoke (schedule fired on the minute; webhook replay de-duped;
+`DELETE /schedules/:id` cleared the Redis Job Scheduler).
 
-**To close it:**
-- Add a `Schedule` model (`{ workflowId, cron: string, timezone: string, enabled: bool }`).
-- Run a scheduler process (or an API-side `cron` job using `node-cron`) that wakes up, queries
-  due schedules, calls `startRun`, and records the next fire time.
-- For event triggers, integrate a webhook ingestion endpoint that validates a signature, matches
-  a registered trigger, and calls `startRun`.
-- Both need idempotency keys derived from the scheduled fire time / event ID to prevent double-
-  starts on crash-and-restart of the scheduler process.
+**Still open:** file/S3-arrival and dataset-version sensors (polling triggers)
+are not built — the webhook path is the extension point for them.
 
 ---
 

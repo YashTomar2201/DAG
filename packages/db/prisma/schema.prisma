@@ -66,9 +66,55 @@ model Workflow {
   deletedAt DateTime?
   tenant    Tenant            @relation(fields: [tenantId], references: [id])
   versions  WorkflowVersion[]
+  schedules Schedule[]
+  triggers  Trigger[]
 
   /// Keeps the tenant-scoped, newest-first list query fast.
   @@index([tenantId, createdAt])
+}
+
+/// A cron schedule that starts a run on a fixed cadence (roadmap B2).
+///
+/// Pins the *workflow*, not a version: each fire resolves the workflow's
+/// latest version, so "run this every night" keeps tracking your edits. The
+/// authoritative timer is a BullMQ Job Scheduler keyed by this row's id
+/// (`scheduler` queue) — this row is the user-facing mirror plus the
+/// bookkeeping the fire handler needs (`lastRunId` / `lastFiredAt`).
+model Schedule {
+  id          String    @id @default(cuid())
+  workflowId  String
+  cron        String // standard 5-field cron, e.g. "0 2 * * *"
+  timezone    String    @default("UTC")
+  enabled     Boolean   @default(true)
+  lastRunId   String? // Run started by the most recent fire
+  lastFiredAt DateTime?
+  nextFireAt  DateTime? // cached from cron-parser for display; not load-bearing
+  createdAt   DateTime  @default(now())
+
+  workflow Workflow @relation(fields: [workflowId], references: [id])
+
+  @@index([workflowId])
+  @@index([enabled, nextFireAt])
+}
+
+/// A webhook endpoint that starts a run when it receives a valid POST
+/// (roadmap B2). `token` is the public path segment (`POST /triggers/:token`);
+/// `secret` signs the HMAC-SHA256 the caller must send in `X-Signature-256`.
+/// The run's idempotency key is `sha256(rawBody)`, so replaying the exact same
+/// body is a no-op — it returns the run the first delivery created.
+model Trigger {
+  id          String    @id @default(cuid())
+  workflowId  String
+  token       String    @unique
+  secret      String
+  enabled     Boolean   @default(true)
+  lastRunId   String?
+  lastFiredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  workflow Workflow @relation(fields: [workflowId], references: [id])
+
+  @@index([workflowId])
 }
 
 /// An immutable snapshot of a graph at a point in time.

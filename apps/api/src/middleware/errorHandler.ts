@@ -7,6 +7,7 @@ import {
   NotFoundError,
   ValidationError,
   ConflictError,
+  UnauthorizedError,
 } from '../errors';
 
 /**
@@ -18,6 +19,7 @@ import {
  *   CycleError     → 422  (graph is structurally invalid — cycle detected)
  *   NotFoundError  → 404
  *   ConflictError  → 409
+ *   UnauthorizedError → 401  (bad / missing webhook HMAC signature)
  *   everything else→ 500  (unexpected; include correlation id for log lookup)
  *
  * Express identifies this as an error handler because it has 4 parameters.
@@ -67,6 +69,11 @@ export function errorHandler(
 
   if (err instanceof ConflictError) {
     res.status(409).json({ error: err.message });
+    return;
+  }
+
+  if (err instanceof UnauthorizedError) {
+    res.status(401).json({ error: err.message });
     return;
   }
 

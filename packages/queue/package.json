@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "bullmq": "^5.8.2",
+    "cron-parser": "^4.9.0",
     "ioredis": "^5.4.1",
     "@dag/contracts": "workspace:*"
   },
