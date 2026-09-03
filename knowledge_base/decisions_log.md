@@ -579,3 +579,49 @@ Both are already true from Phase 13. Adding new code features in a documentation
 either be Phase 15 scope creep (introducing new risk right before the final deliverable) or
 cosmetic changes dressed up as features. The honest deliverable is exactly what the workflow
 specifies: consolidation, not extension.
+
+---
+
+## B1.1 — Conditional Edges (`apps/api`)
+
+### Decision: Structured `{ left, op, right }` condition, not an expression string
+
+**Why:** an expression string (`"accuracy > 0.9 && !dryRun"`) means shipping an
+evaluator: a parser, an AST, and `eval`-adjacent execution over user input on
+the control plane. A fixed `{ left, op, right }` triple with an 8-value `op`
+enum covers every branch case this project needs, renders as three inputs in
+the B1.2 UI, and has zero injection surface. `left` is resolved with the
+existing Phase-7 `walkAndResolve`, so `{{ nodes.eval.output.accuracy }}` works
+exactly as it does in node config.
+
+**Trade-off:** no compound conditions (`A && B`) on a single edge. Model those
+as two edges in series, or a small router node. Acceptable.
+
+### Decision: Join semantics — "any active parent"
+
+A child with multiple incoming edges runs if **at least one** edge was active
+(unconditional, or its condition passed). It is `SKIPPED` only when **every**
+incoming edge was inactive.
+
+**Why not "all parents":** the common shape is an if/else that re-joins — 
+`A→B (if x)`, `A→C (if !x)`, `B→D`, `C→D`. With "all parents", D would need both
+B and C, but exactly one of them is always skipped, so D could never run.
+"Any active parent" makes the diamond work: whichever branch ran feeds D.
+
+**Implementation:** a Redis set `run:{runId}:activeParents:{childKey}` holds the
+parent keys whose edge in was active. `markParentActive` is called **before**
+`decrementInDegree`, so when the decrement that zeroes a child's in-degree
+lands, the set already reflects every parent that finished. The in-degree hash
+still decrements for **every** parent regardless of the edge's activity — a
+skipped branch can never leave a downstream node stuck at in-degree > 0. A
+child that reaches in-degree 0 with an empty `activeParents` set is `SKIPPED`,
+and that skip recurses through the same propagation with `parentActive = false`.
+
+### Decision: an unresolvable condition fails the run, loudly
+
+If `left` references an output that isn't ready (`UnresolvedTemplateError`) or
+`op` is applied to incompatible values (`ConditionTypeError`), the run is
+aborted: every pending node → `SKIPPED`, run → `FAILED`, with the condition and
+the reason in the event. Silently evaluating a broken condition to `false`
+would make a skipped branch look like the user's routing choice rather than
+their bug.

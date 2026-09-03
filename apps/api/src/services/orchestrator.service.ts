@@ -12,6 +12,8 @@ import type { Prisma, WorkflowVersion } from '@dag/db';
 import {
   seedInDegrees,
   decrementInDegree,
+  markParentActive,
+  hasActiveParent,
   queueForType,
   createJobId,
   publishRunEvent,
@@ -19,7 +21,14 @@ import {
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
 import type { Graph, NodeDef, NodeType, RunEventType } from '@dag/contracts';
-import { resolveNodeInputs, assertOutputSize, OutputTooLargeError } from '../context-resolver';
+import type { NodeRun } from '@dag/db';
+import {
+  resolveNodeInputs,
+  assertOutputSize,
+  OutputTooLargeError,
+  UnresolvedTemplateError,
+} from '../context-resolver';
+import { evaluateCondition, ConditionTypeError } from '../condition-evaluator';
 import { nodeDurationSeconds } from '../metrics';
 
 /**
@@ -215,15 +224,18 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
   const graph = getGraphFromVersion(version);
   observeNodeDuration(nr.startedAt, getNodeFromGraph(graph, nodeKey).type, 'succeeded');
 
-  const children = getChildren(graph, nodeKey);
-
-  // 2. Decrement in-degree for all children via atomic Lua script
-  for (const childKey of children) {
-    const shouldDispatch = await decrementInDegree(runId, childKey);
-    // 3. Dispatch ONLY if Lua returned 1
-    if (shouldDispatch) {
-      await dispatchNode(runId, childKey, graph, version.id);
+  // 2. Propagate to children — evaluate each outgoing edge's condition, mark
+  //    active parents, decrement in-degree (always), and dispatch / skip.
+  try {
+    const nodeRunMap = await getNodeRunMap(runId); // includes this node's just-persisted output
+    await propagateToChildren(runId, nodeKey, graph, version.id, nodeRunMap, /* parentActive */ true);
+  } catch (err) {
+    if (err instanceof UnresolvedTemplateError || err instanceof ConditionTypeError) {
+      logger.error({ runId, nodeKey, err: err.message }, 'Condition evaluation failed — aborting run');
+      await abortRun(runId, err.message);
+      return;
     }
+    throw err;
   }
 
   // 4. Check if the entire run is complete
@@ -298,5 +310,86 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
       logger.info({ runId }, 'Run failed');
       emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason: `Node ${nodeKey} failed` });
     }
+  }
+}
+
+// ─── Conditional-edge propagation (B1.1) ──────────────────────────────────────
+
+/**
+ * Walks the outgoing edges of `parentKey` after it reached a terminal state.
+ *
+ * For each edge:
+ *   - the edge is "active" iff `parentActive` AND (no condition OR it passes);
+ *   - an active edge marks `parentKey` as an active parent of the child (Redis);
+ *   - the child's in-degree is decremented **regardless** (a skipped branch
+ *     must never leave the subgraph hanging);
+ *   - when the child's in-degree hits zero, it is dispatched if it has any
+ *     active parent, otherwise SKIPPED (which recurses through here with
+ *     `parentActive = false`).
+ *
+ * Cycle-free graphs guarantee this recursion terminates.
+ */
+async function propagateToChildren(
+  runId: string,
+  parentKey: string,
+  graph: Graph,
+  versionId: string,
+  nodeRunMap: Map<string, NodeRun>,
+  parentActive: boolean,
+): Promise<void> {
+  for (const childKey of getChildren(graph, parentKey)) {
+    const edge = graph.edges.find((e) => e.from === parentKey && e.to === childKey);
+    const edgeActive =
+      parentActive && (!edge?.condition || evaluateCondition(edge.condition, nodeRunMap, parentKey));
+
+    if (edgeActive) await markParentActive(runId, childKey, parentKey);
+
+    const ready = await decrementInDegree(runId, childKey);
+    if (!ready) continue;
+
+    if (await hasActiveParent(runId, childKey)) {
+      await dispatchNode(runId, childKey, graph, versionId);
+    } else {
+      await skipNode(runId, childKey, graph, versionId, nodeRunMap);
+    }
+  }
+}
+
+/** Marks one node SKIPPED (no active branch reached it) and cascades downstream. */
+async function skipNode(
+  runId: string,
+  nodeKey: string,
+  graph: Graph,
+  versionId: string,
+  nodeRunMap: Map<string, NodeRun>,
+): Promise<void> {
+  const nr = await findNodeRun(runId, nodeKey);
+  if (!nr || !['PENDING', 'QUEUED'].includes(nr.status)) return;
+
+  const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', { finishedAt: new Date() });
+  if (!ok) return;
+
+  emitAndLog(runId, 'NODE_SKIPPED', { reason: 'no active branch reached this node' }, nodeKey);
+  await propagateToChildren(runId, nodeKey, graph, versionId, nodeRunMap, /* parentActive */ false);
+}
+
+/**
+ * Aborts a run when a condition can't be evaluated (unresolved ref / type
+ * error). Skips every still-pending node and transitions the run to FAILED —
+ * a broken condition is the user's graph bug, surfaced loudly, not silently
+ * treated as false.
+ */
+async function abortRun(runId: string, reason: string): Promise<void> {
+  const nodeRunMap = await getNodeRunMap(runId);
+  for (const [key, nr] of nodeRunMap) {
+    if (nr.status === 'PENDING' || nr.status === 'QUEUED') {
+      const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', { finishedAt: new Date() });
+      if (ok) emitAndLog(runId, 'NODE_SKIPPED', { reason }, key);
+    }
+  }
+  const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', { finishedAt: new Date() });
+  if (failed) {
+    logger.info({ runId, reason }, 'Run failed (condition error)');
+    emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason });
   }
 }

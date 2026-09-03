@@ -1,6 +1,27 @@
 import { z } from 'zod';
 import { NodeDefSchema } from './node-types';
 
+// ─── Edge condition (B1.1) ─────────────────────────────────────────────────
+// A structured comparison — deliberately NOT an expression string: no eval, no
+// parser, no injection surface, and the UI renders it as three inputs.
+//   left   — usually a template ref, e.g. "{{ nodes.evaluate.output.accuracy }}"
+//   op     — the comparison
+//   right  — a literal to compare against
+// The orchestrator resolves `left` against completed parent outputs at dispatch
+// time; an unresolved ref fails the run (never silently false).
+
+export const ConditionOpSchema = z.enum([
+  'eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'contains',
+]);
+export type ConditionOp = z.infer<typeof ConditionOpSchema>;
+
+export const ConditionSchema = z.object({
+  left: z.string().min(1),
+  op: ConditionOpSchema,
+  right: z.union([z.string(), z.number(), z.boolean(), z.array(z.unknown())]),
+});
+export type Condition = z.infer<typeof ConditionSchema>;
+
 // ─── Edge ──────────────────────────────────────────────────────────────────
 
 export const EdgeDefSchema = z.object({
@@ -8,6 +29,12 @@ export const EdgeDefSchema = z.object({
   from: z.string().min(1),
   /** Key of the destination node */
   to: z.string().min(1),
+  /**
+   * Optional runtime gate. When present and it evaluates false, this edge is
+   * inactive: the child's in-degree still decrements, but the edge does not
+   * count as an "active parent". A child with no active parent is SKIPPED.
+   */
+  condition: ConditionSchema.optional(),
 });
 
 export type EdgeDef = z.infer<typeof EdgeDefSchema>;

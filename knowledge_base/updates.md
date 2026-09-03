@@ -5,6 +5,61 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — B1.1: conditional edges in the engine
+
+**Phase:** roadmap B1.1. "If accuracy > 0.9 deploy, else retrain" — branches
+that activate on runtime data. Engine-only; the editor UI is B1.2. Author
+conditions by POSTing a graph.
+
+### Changes
+
+- **`packages/contracts/src/graph.ts`** — `EdgeDef.condition?` = a structured
+  `{ left, op, right }` (`ConditionSchema`): `left` is a template string
+  (`{{ nodes.evaluate.output.accuracy }}` or a literal), `op ∈ {eq, ne, gt,
+  gte, lt, lte, in, contains}`, `right` a string / number / boolean / array.
+  Structured, not an expression string — no `eval`, no parser, renders as
+  three inputs. `decisions_log.md` has the "why".
+- **`apps/api/src/condition-evaluator.ts`** (new) — `evaluateCondition` resolves
+  `left` with the Phase-7 `walkAndResolve` (now exported), then applies `op`.
+  Numeric ops coerce both sides (`0.83` vs `"0.83"`); `eq`/`ne` are loose
+  cross-type; `in`/`contains` for membership. An unresolved ref throws
+  `UnresolvedTemplateError`; an ill-typed compare throws `ConditionTypeError` —
+  never a silent `false`.
+- **`packages/queue/src/lua.ts`** — `markParentActive` / `hasActiveParent` on a
+  Redis set `run:{runId}:activeParents:{childKey}` (7-day TTL). Join semantics:
+  **"any active parent"** — a child runs if ≥1 incoming edge was active, is
+  `SKIPPED` only if every edge was inactive.
+- **`apps/api/src/services/orchestrator.service.ts`** — `onNodeSucceeded`'s
+  child loop replaced by `propagateToChildren(…, parentActive)`: per edge, mark
+  active parents, **decrement in-degree regardless**, then dispatch (has active
+  parent) or `skipNode` (none — which recurses with `parentActive = false`).
+  `abortRun` handles a condition that can't be evaluated: sweep pending nodes
+  to `SKIPPED`, run → `FAILED`.
+
+### Verification
+
+- `condition-evaluator.test.ts` — 8 unit tests (every op, coercion, unresolved
+  ref throws).
+- `contracts.test.ts` — condition parses; unknown op rejected (20 tests total).
+- `conditional-branch.integration.test.ts` — real Postgres/Redis/workers:
+  `evaluate → deploy [acc gt 0.99]` / `evaluate → retrain [acc lte 0.99]`,
+  both → `merge`. Result: **deploy SKIPPED, retrain SUCCEEDED, merge SUCCEEDED
+  (diamond re-join), run SUCCEEDED**. Bad-ref variant → **run FAILED, all nodes
+  terminal, no hang**.
+- Full integration suite still green (7 files, 13 tests). `pnpm -r typecheck` /
+  `lint` clean; unit suites green (api 43).
+
+### Files
+
+`packages/contracts/src/{graph.ts, index.ts}`,
+`apps/api/src/{condition-evaluator.ts (new), condition-evaluator.test.ts (new),
+context-resolver.ts, services/orchestrator.service.ts}`,
+`packages/queue/src/lua.ts`,
+`apps/api/src/integration/conditional-branch.integration.test.ts` (new),
+`knowledge_base/decisions_log.md`, `KNOWN_LIMITATIONS.md`.
+
+---
+
 ## 2026-09-03 — D1.3: version history and restore
 
 **Phase:** roadmap D1.3. Browse a workflow's immutable version history, load an

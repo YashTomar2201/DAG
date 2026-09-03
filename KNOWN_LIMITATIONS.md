@@ -98,24 +98,27 @@ to read would fail silently — Node B simply would not have the file.
 
 ---
 
-## 5. No Conditional Branching
+## 5. Conditional Branching — engine done (B1.1), UI pending (B1.2)
 
-**What exists:** Every node in a `GraphSchema` runs if its parents succeed; failure propagates
-all descendants to `SKIPPED`. There is no mechanism to run different branches based on a parent
-node's output value.
+**Done (roadmap B1.1):** `EdgeDef` carries an optional `condition`
+(`{ left, op, right }` — see `packages/contracts/src/graph.ts`). `left` is
+resolved as a Phase-7 template against completed parent outputs; `op` is one of
+`eq ne gt gte lt lte in contains`. The orchestrator (`propagateToChildren` in
+`orchestrator.service.ts`) evaluates each outgoing edge on parent completion:
+an active edge marks the child's parent active in Redis
+(`run:{id}:activeParents:{child}`), the in-degree still decrements for every
+edge, and a child that reaches in-degree 0 with no active parent is `SKIPPED`
+(cascading downstream). Join semantics are "any active parent" so an if/else
+diamond re-joins. An unresolvable condition aborts the run
+(`FAILED` + pending nodes `SKIPPED`), never a silent `false`. Verified by
+`apps/api/src/integration/conditional-branch.integration.test.ts` and
+`condition-evaluator.test.ts`.
 
-**What is missing:** "If model accuracy > 0.95, deploy. Otherwise, trigger a retraining branch"
-— a conditional edge that only activates based on runtime data.
-
-**To close it:**
-- Add an optional `condition` field on `EdgeDef`: a JSONPath expression or a simple comparison
-  evaluated against the parent's `output` at dispatch time.
-- Extend `dispatchNode`: after template resolution, evaluate each outgoing edge's condition. Only
-  decrement in-degree for children whose edge condition is true; mark children of a false branch
-  as `SKIPPED` immediately.
-- Zod schema validation at version-creation time cannot statically verify that conditions are
-  satisfiable (that's undecidable in general), but it can validate that condition expressions are
-  syntactically valid and reference fields that exist on the parent node's declared output schema.
+**Still missing (roadmap B1.2):** the editor can't author or display
+conditions. `toGraph()` / `fromGraph()` in `apps/web/src/store/graphSlice.ts`
+drop the `condition` field on round-trip, so a conditional graph edited in the
+UI loses its conditions on the next save. Author conditions via the API
+(`POST /workflows` / `.../versions`) until B1.2 lands.
 
 ---
 

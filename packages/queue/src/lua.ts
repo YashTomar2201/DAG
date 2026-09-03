@@ -92,3 +92,33 @@ export async function seedInDegrees(
 
   await pipeline.exec();
 }
+
+// ─── Active-parent tracking for conditional edges (B1.1) ─────────────────────
+//
+// Join semantics: "any active parent" — a child runs if AT LEAST ONE incoming
+// edge was active (unconditional, or its condition passed). It is SKIPPED only
+// when EVERY incoming edge was inactive. `run:{runId}:activeParents:{childKey}`
+// is a Redis set of the parent keys whose edge into `childKey` was active. The
+// in-degree hash still decrements for every parent regardless — so a skipped
+// branch can never leave a child hanging at in-degree > 0.
+
+const ACTIVE_PARENTS_TTL = 7 * 24 * 3600;
+
+/** Record that `parentKey`'s edge into `childKey` was active. Call BEFORE decrementInDegree. */
+export async function markParentActive(
+  runId: string,
+  childKey: string,
+  parentKey: string,
+): Promise<void> {
+  const key = `run:${runId}:activeParents:${childKey}`;
+  const p = connection.pipeline();
+  p.sadd(key, parentKey);
+  p.expire(key, ACTIVE_PARENTS_TTL);
+  await p.exec();
+}
+
+/** True if any incoming edge into `childKey` has been marked active. */
+export async function hasActiveParent(runId: string, childKey: string): Promise<boolean> {
+  const key = `run:${runId}:activeParents:${childKey}`;
+  return (await connection.scard(key)) > 0;
+}

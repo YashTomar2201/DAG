@@ -111,7 +111,7 @@ function resolvePath(
  * - If a template appears as part of a larger string, it is replaced with the
  *   string coercion of the resolved value.
  */
-function walkAndResolve(
+export function walkAndResolve(
   value: unknown,
   nodeRunMap: Map<string, NodeRun>,
   ownerNodeKey: string,

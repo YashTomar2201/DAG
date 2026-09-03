@@ -42,8 +42,8 @@ export type {
 } from './node-types';
 
 // Graph schema with structural refinements (also exports EdgeDefSchema, EdgeDef)
-export { GraphSchema, EdgeDefSchema, MAX_NODES } from './graph';
-export type { Graph, EdgeDef } from './graph';
+export { GraphSchema, EdgeDefSchema, ConditionSchema, ConditionOpSchema, MAX_NODES } from './graph';
+export type { Graph, EdgeDef, Condition, ConditionOp } from './graph';
 
 // BullMQ job payload
 export { JobPayloadSchema } from './job';

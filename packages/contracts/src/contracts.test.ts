@@ -135,6 +135,30 @@ describe('GraphSchema', () => {
     const result = GraphSchema.safeParse({ nodes, edges: [] });
     expect(result.success).toBe(false);
   });
+
+  it('parses an edge with a structured condition (B1.1)', () => {
+    const result = GraphSchema.safeParse({
+      ...validLinearGraph,
+      edges: [
+        {
+          from: 'extract',
+          to: 'preprocess',
+          condition: { left: '{{ nodes.extract.output.rows }}', op: 'gt', right: 0 },
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects an edge condition with an unknown operator', () => {
+    const result = GraphSchema.safeParse({
+      ...validLinearGraph,
+      edges: [
+        { from: 'extract', to: 'preprocess', condition: { left: 'x', op: 'approx', right: 1 } },
+      ],
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 // ─── NodeDefSchema — discriminated union tests ────────────────────────────────
