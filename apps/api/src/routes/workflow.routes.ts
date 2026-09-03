@@ -8,6 +8,7 @@ import {
   listWorkflowsService,
   getWorkflowService,
   listWorkflowVersionsService,
+  getWorkflowVersionService,
   renameWorkflowService,
   deleteWorkflowService,
 } from '../services/workflow.service';
@@ -85,6 +86,22 @@ workflowRouter.get('/:id/versions', async (req, res, next) => {
   try {
     const versions = await listWorkflowVersionsService(req.params['id'] as string, tenantOf(req));
     res.json({ versions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /workflows/:id/versions/:versionId ──────────────────────────────────
+
+/** One full version — graph + topoOrder. Used to open a workflow in the editor. */
+workflowRouter.get('/:id/versions/:versionId', async (req, res, next) => {
+  try {
+    const version = await getWorkflowVersionService(
+      req.params['id'] as string,
+      req.params['versionId'] as string,
+      tenantOf(req),
+    );
+    res.json(version);
   } catch (err) {
     next(err);
   }

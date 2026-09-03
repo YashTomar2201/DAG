@@ -169,6 +169,23 @@ export async function getWorkflowWithVersions(id: string, tenantId: string) {
   });
 }
 
+/**
+ * One full version (graph + topoOrder) of a workflow, tenant-scoped. Null if
+ * the workflow is missing / soft-deleted / wrong tenant, or the version id
+ * doesn't belong to it.
+ */
+export async function getWorkflowVersion(workflowId: string, versionId: string, tenantId: string) {
+  const wf = await prisma.workflow.findFirst({
+    where: { id: workflowId, tenantId, deletedAt: null },
+    select: { id: true },
+  });
+  if (!wf) return null;
+  return prisma.workflowVersion.findFirst({
+    where: { id: versionId, workflowId },
+    select: { id: true, workflowId: true, version: true, graph: true, topoOrder: true, createdAt: true },
+  });
+}
+
 /** Just the version list for a workflow (D1.3). Returns null if not found. */
 export async function listWorkflowVersions(id: string, tenantId: string) {
   const wf = await prisma.workflow.findFirst({

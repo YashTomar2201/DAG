@@ -79,6 +79,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await res.json().catch(() => res.text().catch(() => 'Unknown error'));
     throw new ApiError(res.status, body);
   }
+  // 204 No Content (e.g. DELETE) has no body to parse.
+  if (res.status === 204) return undefined as T;
   return res.json() as Promise<T>;
 }
 
@@ -132,6 +134,65 @@ export async function saveWorkflowVersion(
     method: 'POST',
     body: JSON.stringify({ graph }),
   });
+}
+
+// ─── Workflow management (D1.1 / D1.2) ────────────────────────────────────────
+
+export interface WorkflowListItem {
+  id: string;
+  name: string;
+  createdAt: string;
+  versionCount: number;
+  lastRunAt: string | null;
+}
+
+export interface WorkflowVersionMeta {
+  id: string;
+  version: number;
+  createdAt: string;
+}
+
+const T = `tenantId=${DEFAULT_TENANT_ID}`;
+
+/** Paginated, newest-first list of this tenant's workflows. */
+export async function listWorkflows(
+  opts: { limit?: number; cursor?: string } = {},
+): Promise<{ workflows: WorkflowListItem[]; nextCursor: string | null }> {
+  const p = new URLSearchParams({ tenantId: DEFAULT_TENANT_ID });
+  if (opts.limit) p.set('limit', String(opts.limit));
+  if (opts.cursor) p.set('cursor', opts.cursor);
+  return request(`/workflows?${p.toString()}`);
+}
+
+/** A workflow + its version list (newest first). */
+export async function getWorkflow(
+  id: string,
+): Promise<{ id: string; name: string; createdAt: string; versions: WorkflowVersionMeta[] }> {
+  return request(`/workflows/${id}?${T}`);
+}
+
+/** One full version — { id, workflowId, version, graph, topoOrder, createdAt }. */
+export async function getWorkflowVersion(
+  workflowId: string,
+  versionId: string,
+): Promise<WorkflowVersion> {
+  return request(`/workflows/${workflowId}/versions/${versionId}?${T}`);
+}
+
+/** Rename a workflow. Returns { id, name, createdAt }. */
+export async function renameWorkflow(
+  id: string,
+  name: string,
+): Promise<{ id: string; name: string; createdAt: string }> {
+  return request(`/workflows/${id}?${T}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** Soft-delete a workflow. Resolves on 204. */
+export async function deleteWorkflow(id: string): Promise<void> {
+  await request<void>(`/workflows/${id}?${T}`, { method: 'DELETE' });
 }
 
 // ─── Runs ─────────────────────────────────────────────────────────────────────

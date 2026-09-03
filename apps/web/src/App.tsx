@@ -19,8 +19,21 @@ import { NodePalette } from './components/NodePalette';
 import { ConfigPanel } from './components/ConfigPanel';
 import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
+import { WorkflowMenu } from './components/WorkflowMenu';
 
-import { createWorkflow, saveWorkflowVersion, startRun, openRunEventStream, ApiError } from './api/client';
+import type { Graph } from '@dag/contracts';
+import {
+  createWorkflow,
+  saveWorkflowVersion,
+  startRun,
+  openRunEventStream,
+  getWorkflow,
+  getWorkflowVersion,
+  renameWorkflow as apiRenameWorkflow,
+  ApiError,
+} from './api/client';
+
+const LS_LAST_WORKFLOW = 'dag:lastWorkflowId';
 import { LogoMark, IconPlay, IconSpinner, IconCheck, IconAlert, IconClose, IconUndo, IconRedo } from './components/icons';
 
 type Notice = { kind: 'error' | 'success'; text: string };
@@ -50,6 +63,13 @@ function AppCanvas() {
   const addNode = useGraphStore((s) => s.addNode);
   const markSaved = useGraphStore((s) => s.markSaved);
   const toGraph = useGraphStore((s) => s.toGraph);
+  const workflowId = useGraphStore((s) => s.workflowId);
+  const versionId = useGraphStore((s) => s.versionId);
+  const workflowName = useGraphStore((s) => s.workflowName);
+  const fromGraph = useGraphStore((s) => s.fromGraph);
+  const newWorkflow = useGraphStore((s) => s.newWorkflow);
+  const setWorkflowMeta = useGraphStore((s) => s.setWorkflowMeta);
+  const setWorkflowName = useGraphStore((s) => s.setWorkflowName);
   const undo = useGraphStore((s) => s.undo);
   const redo = useGraphStore((s) => s.redo);
   const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
@@ -93,11 +113,14 @@ function AppCanvas() {
     };
   }, [fitView]);
 
-  const [workflowId, setWorkflowId] = useState<string | null>(null);
-  const [versionId, setVersionId] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [isOpening, setIsOpening] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // Bumped after any save / rename / delete so the WorkflowMenu list refetches.
+  const [workflowsRefreshKey, setWorkflowsRefreshKey] = useState(0);
+  const [nameDraft, setNameDraft] = useState(workflowName);
+  useEffect(() => setNameDraft(workflowName), [workflowName]);
 
   // Auto-dismiss success toasts; errors stay until the user acts or dismisses.
   useEffect(() => {
@@ -259,23 +282,103 @@ function AppCanvas() {
       const graph = toGraph();
       if (!workflowId) {
         // POST /workflows → { workflowId, versionId }
-        const result = await createWorkflow('My Pipeline', graph);
-        setWorkflowId(result.workflowId);
-        setVersionId(result.versionId);
-        setNotice({ kind: 'success', text: 'Pipeline saved.' });
+        const result = await createWorkflow(workflowName.trim() || 'Untitled workflow', graph);
+        setWorkflowMeta({ workflowId: result.workflowId, versionId: result.versionId });
+        try { localStorage.setItem(LS_LAST_WORKFLOW, result.workflowId); } catch { /* ignore */ }
+        setNotice({ kind: 'success', text: 'Workflow saved.' });
       } else {
         // POST /workflows/:id/versions → full WorkflowVersion row
         const version = await saveWorkflowVersion(workflowId, graph);
-        setVersionId(version.id);
+        setWorkflowMeta({ versionId: version.id });
         setNotice({ kind: 'success', text: `Saved as version ${version.version}.` });
       }
       markSaved();
+      setWorkflowsRefreshKey((k) => k + 1);
     } catch (err) {
       setNotice({ kind: 'error', text: describeError(err) });
     } finally {
       setIsSaving(false);
     }
   }
+
+  // ── Open / new / rename (D1.2) ─────────────────────────────────────────────
+
+  const openWorkflow = useCallback(
+    async (id: string) => {
+      if (useGraphStore.getState().isDirty) {
+        if (!window.confirm('You have unsaved changes. Discard them and open another workflow?')) return;
+      }
+      setIsOpening(true);
+      setNotice(null);
+      try {
+        const wf = await getWorkflow(id);
+        const latest = wf.versions[0];
+        if (!latest) throw new Error('That workflow has no versions.');
+        const version = await getWorkflowVersion(id, latest.id);
+        fromGraph(version.graph as Graph, { workflowId: id, versionId: latest.id, name: wf.name });
+        stopListening();
+        try { localStorage.setItem(LS_LAST_WORKFLOW, id); } catch { /* ignore */ }
+      } catch (err) {
+        // A stale localStorage id (deleted workflow) shouldn't wedge the editor.
+        if (err instanceof ApiError && err.status === 404) {
+          try { localStorage.removeItem(LS_LAST_WORKFLOW); } catch { /* ignore */ }
+        }
+        setNotice({ kind: 'error', text: describeError(err) });
+      } finally {
+        setIsOpening(false);
+      }
+    },
+    [fromGraph, stopListening],
+  );
+
+  const handleNewWorkflow = useCallback(() => {
+    if (useGraphStore.getState().isDirty) {
+      if (!window.confirm('You have unsaved changes. Discard them and start a new workflow?')) return;
+    }
+    newWorkflow();
+    stopListening();
+    try { localStorage.removeItem(LS_LAST_WORKFLOW); } catch { /* ignore */ }
+    setNotice(null);
+  }, [newWorkflow, stopListening]);
+
+  async function commitName() {
+    const next = nameDraft.trim();
+    if (!next || next === workflowName) {
+      setNameDraft(workflowName);
+      return;
+    }
+    setWorkflowName(next);
+    if (workflowId) {
+      try {
+        await apiRenameWorkflow(workflowId, next);
+        setWorkflowsRefreshKey((k) => k + 1);
+      } catch (err) {
+        setNotice({ kind: 'error', text: describeError(err) });
+      }
+    }
+  }
+
+  // Resume the last workflow on load (once). A stale/deleted id is cleared by
+  // openWorkflow's 404 handler.
+  const didResume = useRef(false);
+  useEffect(() => {
+    if (didResume.current) return;
+    didResume.current = true;
+    let last: string | null = null;
+    try { last = localStorage.getItem(LS_LAST_WORKFLOW); } catch { /* ignore */ }
+    if (last) void openWorkflow(last);
+  }, [openWorkflow]);
+
+  // Warn before a full page unload if there are unsaved changes.
+  useEffect(() => {
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (!useGraphStore.getState().isDirty) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
 
   async function handleRun() {
     if (isRunning) return;
@@ -352,8 +455,43 @@ function AppCanvas() {
               Visual DAG Orchestrator
             </span>
           </div>
-          <nav style={{ display: 'flex', gap: 24, marginLeft: 36, alignItems: 'center' }}>
-            <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--color-ink)', borderBottom: '2px solid var(--color-primary)', paddingBottom: 4 }}>Editor</span>
+          <nav style={{ display: 'flex', gap: 8, marginLeft: 30, alignItems: 'center' }}>
+            <WorkflowMenu
+              currentWorkflowId={workflowId}
+              onOpen={openWorkflow}
+              onNew={handleNewWorkflow}
+              refreshKey={workflowsRefreshKey}
+            />
+            <span style={{ color: 'var(--color-hairline)', fontSize: 16 }}>/</span>
+            <input
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={commitName}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                if (e.key === 'Escape') { setNameDraft(workflowName); (e.target as HTMLInputElement).blur(); }
+              }}
+              aria-label="Workflow name"
+              spellCheck={false}
+              style={{
+                fontSize: 14,
+                fontWeight: 600,
+                fontFamily: 'var(--font-body)',
+                color: 'var(--color-ink)',
+                background: 'transparent',
+                border: '1px solid transparent',
+                borderRadius: 'var(--radius-md)',
+                padding: '5px 8px',
+                width: 190,
+                outline: 'none',
+              }}
+              onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--color-hairline)'; e.currentTarget.style.background = 'var(--color-surface)'; }}
+              onMouseLeave={(e) => { if (document.activeElement !== e.currentTarget) { e.currentTarget.style.borderColor = 'transparent'; } }}
+            />
+            {isOpening && <IconSpinner size={14} />}
+            {workflowId ? null : (
+              <span className="caption-uppercase" style={{ fontSize: 9, color: 'var(--color-muted-soft)', letterSpacing: '1px' }}>unsaved</span>
+            )}
           </nav>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>

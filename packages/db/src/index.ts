@@ -20,6 +20,7 @@ export {
   // Workflow CRUD (D1.1)
   listWorkflows,
   getWorkflowWithVersions,
+  getWorkflowVersion,
   listWorkflowVersions,
   renameWorkflow,
   softDeleteWorkflow,

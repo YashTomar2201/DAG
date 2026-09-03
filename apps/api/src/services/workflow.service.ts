@@ -8,6 +8,7 @@ import {
   createWorkflowVersion,
   listWorkflows,
   getWorkflowWithVersions,
+  getWorkflowVersion,
   listWorkflowVersions,
   renameWorkflow,
   softDeleteWorkflow,
@@ -87,6 +88,17 @@ export async function listWorkflowVersionsService(id: string, tenantId: string) 
   const versions = await listWorkflowVersions(id, tenantId);
   if (versions === null) throw new NotFoundError('Workflow', id);
   return versions;
+}
+
+/** One full version (graph + topoOrder). 404 if it doesn't belong to the workflow/tenant. */
+export async function getWorkflowVersionService(
+  workflowId: string,
+  versionId: string,
+  tenantId: string,
+) {
+  const version = await getWorkflowVersion(workflowId, versionId, tenantId);
+  if (!version) throw new NotFoundError('WorkflowVersion', versionId);
+  return version;
 }
 
 /** Rename. 404 if missing or soft-deleted. */

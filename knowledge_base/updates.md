@@ -5,6 +5,74 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — D1.2: workflow list + open/rename in the editor
+
+**Phase:** roadmap D1.2. The editor stops being a single hardcoded
+`'My Pipeline'` — you can list, open, rename, delete, and switch workflows,
+and a reload resumes where you were. The roadmap calls this "the biggest
+perceived-quality jump in the whole roadmap."
+
+### API
+
+- **`GET /workflows/:id/versions/:versionId`** (new) — one full version
+  (`graph` + `topoOrder`), tenant-scoped. "Open a workflow" needs the graph and
+  `GET /workflows/:id` deliberately stays lightweight. Repo helper
+  `getWorkflowVersion` + service + route.
+- **`request()` in `apps/web/src/api/client.ts`** — returns `undefined` for
+  `204` (DELETE) instead of choking on the empty body.
+
+### Web
+
+- **`store/graphSlice.ts`** — `fromGraph(graph, meta)`, the inverse of
+  `toGraph()`: rebuilds React Flow nodes/edges and resets `_nodeCounter` past
+  the highest `node-N` key so a later `addNode` can't collide. Plus
+  workflow-identity state (`workflowId`, `versionId`, `workflowName`) moved out
+  of `App.tsx` local state into the store, with `newWorkflow`, `setWorkflowMeta`,
+  `setWorkflowName`.
+- **`components/WorkflowMenu.tsx`** (new) — header dropdown: `+ New workflow`,
+  then the tenant's workflows from `GET /workflows` (name · versionCount ·
+  relative lastRunAt), each with open / rename (`prompt`) / delete (`confirm`).
+  Refetches on open and whenever the parent bumps `refreshKey`.
+- **`App.tsx`** —
+  - inline-editable workflow name in the header (blur / Enter commits; if the
+    workflow is saved it also `PATCH`es; Escape reverts).
+  - `openWorkflow(id)`: dirty-guard → `getWorkflow` → latest version →
+    `getWorkflowVersion` → `fromGraph` → stop any run stream → remember the id
+    in `localStorage`. A 404 (stale id for a deleted workflow) clears the
+    stored id instead of wedging.
+  - `handleNewWorkflow()`: dirty-guard → `newWorkflow()` → clear the stored id.
+  - first mount resumes `localStorage['dag:lastWorkflowId']`.
+  - `beforeunload` handler warns when `isDirty`.
+  - first save sends the header name (not `'My Pipeline'`) and records ids in
+    the store + `localStorage`.
+
+### Verification (browser, against the live stack)
+
+- Rename "Untitled workflow" → "Titanic pipeline", **Save** → button flips to
+  "Saved", `POST /workflows` created it with that name, `localStorage` set.
+- **Workflows ▾** lists it ("1 version · never run"); "+ New workflow" resets
+  the canvas to the starter graph, name → "Untitled workflow", `localStorage`
+  cleared, Save button back to "Save pipeline".
+- Reopen "Titanic pipeline" from the menu → 4 nodes rebuilt via `fromGraph`,
+  name + `localStorage` restored, Save shows "Saved" (clean).
+- **Page reload** → resumes "Titanic pipeline" (graph, name, ids) from
+  `localStorage`.
+- Edit a node's Target Column (Save → "Save changes", dirty) then "+ New
+  workflow" → `confirm("You have unsaved changes…")`; **decline** stays put,
+  **accept** switches. `beforeunload` guard wired the same way.
+- `pnpm -r typecheck` / `lint` clean; unit suites green; the
+  `workflow-crud` integration test (now also covering `getWorkflowVersion`)
+  passes.
+
+### Files
+
+`packages/db/src/{repositories.ts, index.ts}`,
+`apps/api/src/{services/workflow.service.ts, routes/workflow.routes.ts}`,
+`apps/web/src/{App.tsx, api/client.ts, store/graphSlice.ts,
+components/WorkflowMenu.tsx}`.
+
+---
+
 ## 2026-09-03 — D1.1: the workflow CRUD API
 
 **Phase:** roadmap D1.1. The read/rename/delete side of workflow management —

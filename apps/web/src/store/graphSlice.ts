@@ -52,6 +52,13 @@ export interface GraphState {
   isDirty: boolean;
   cycleHighlight: string[]; // node ids in a rejected cycle
 
+  // ── Workflow identity (D1.2) ──────────────────────────────────────────────
+  // Null workflowId = an unsaved new workflow. `workflowName` is what the
+  // header shows and what the first save sends as the workflow name.
+  workflowId: string | null;
+  versionId: string | null;
+  workflowName: string;
+
   // Undo / redo history (structural edits only: add/remove node, add/remove
   // edge, move node). `past` is oldest→newest; `future` is what redo replays.
   past: GraphSnapshot[];
@@ -75,6 +82,16 @@ export interface GraphState {
   clearCycleHighlight: () => void;
   markSaved: () => void;
   toGraph: () => Graph;
+
+  // ── Workflow identity actions (D1.2) ──────────────────────────────────────
+  /** Load a stored workflow: rebuild the canvas from `graph` and set identity. */
+  fromGraph: (graph: Graph, meta: { workflowId: string; versionId: string; name: string }) => void;
+  /** Reset to the starter graph as a brand-new unsaved workflow. */
+  newWorkflow: () => void;
+  /** Record ids/name after a save (or a server-side rename). */
+  setWorkflowMeta: (meta: Partial<{ workflowId: string; versionId: string; name: string }>) => void;
+  /** Update the display name only (the actual rename is an API call). */
+  setWorkflowName: (name: string) => void;
 
   /** Push a caller-captured snapshot onto the undo stack (used for node drags). */
   pushSnapshot: (snap: GraphSnapshot) => void;
@@ -143,6 +160,43 @@ function starterGraph(): { nodes: Node<NodeData>[]; edges: Edge[] } {
 
 const _starter = starterGraph();
 
+const DEFAULT_WORKFLOW_NAME = 'Untitled workflow';
+
+/**
+ * Inverse of `toGraph()` — rebuilds React Flow nodes/edges from a stored
+ * `Graph`. Also resets `_nodeCounter` past the highest `node-N` id so the next
+ * `addNode` can't collide with a loaded node.
+ */
+function graphToFlow(graph: Graph): { nodes: Node<NodeData>[]; edges: Edge[] } {
+  let maxN = 0;
+  const nodes: Node<NodeData>[] = graph.nodes.map((n) => {
+    const m = /^node-(\d+)$/.exec(n.key);
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+    return {
+      id: n.key,
+      position: { x: n.position?.x ?? 0, y: n.position?.y ?? 0 },
+      type: 'dagNode',
+      data: {
+        label: n.label,
+        nodeType: n.type,
+        config: (n.config ?? {}) as Record<string, unknown>,
+        status: 'PENDING',
+      },
+    };
+  });
+  _nodeCounter = maxN;
+
+  const edges: Edge[] = graph.edges.map((e) => ({
+    id: `e-${e.from}-${e.to}`,
+    source: e.from,
+    target: e.to,
+    type: 'smoothstep',
+    markerEnd: { type: MarkerType.ArrowClosed },
+  }));
+
+  return { nodes, edges };
+}
+
 /**
  * Drops entries whose value is empty / null / undefined so optional config
  * fields (`z.string().min(1).optional()`) don't get rejected as empty strings,
@@ -194,6 +248,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   selectedEdgeId: null,
   isDirty: false,
   cycleHighlight: [],
+  workflowId: null,
+  versionId: null,
+  workflowName: DEFAULT_WORKFLOW_NAME,
   past: [],
   future: [],
 
@@ -383,6 +440,51 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   clearCycleHighlight: () => set({ cycleHighlight: [] }),
   markSaved: () => set({ isDirty: false }),
+
+  // ── Workflow identity (D1.2) ────────────────────────────────────────────────
+
+  fromGraph: (graph, meta) => {
+    const { nodes, edges } = graphToFlow(graph);
+    set({
+      nodes,
+      edges,
+      workflowId: meta.workflowId,
+      versionId: meta.versionId,
+      workflowName: meta.name,
+      isDirty: false,
+      selectedNodeId: null,
+      selectedEdgeId: null,
+      cycleHighlight: [],
+      past: [],
+      future: [],
+    });
+  },
+
+  newWorkflow: () => {
+    const fresh = starterGraph(); // also resets _nodeCounter to 4
+    set({
+      nodes: fresh.nodes,
+      edges: fresh.edges,
+      workflowId: null,
+      versionId: null,
+      workflowName: DEFAULT_WORKFLOW_NAME,
+      isDirty: false,
+      selectedNodeId: null,
+      selectedEdgeId: null,
+      cycleHighlight: [],
+      past: [],
+      future: [],
+    });
+  },
+
+  setWorkflowMeta: (meta) =>
+    set((s) => ({
+      workflowId: meta.workflowId ?? s.workflowId,
+      versionId: meta.versionId ?? s.versionId,
+      workflowName: meta.name ?? s.workflowName,
+    })),
+
+  setWorkflowName: (name) => set({ workflowName: name }),
 
   // ── Undo / redo ────────────────────────────────────────────────────────────
 
