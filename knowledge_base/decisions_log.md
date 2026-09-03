@@ -625,3 +625,42 @@ aborted: every pending node → `SKIPPED`, run → `FAILED`, with the condition 
 the reason in the event. Silently evaluating a broken condition to `false`
 would make a skipped branch look like the user's routing choice rather than
 their bug.
+
+---
+
+## B1.2 — Condition Builder in the Editor (`apps/web`)
+
+### Decision: coerce the `right` input on serialise, not on every keystroke
+
+The inspector's "right" field is a plain text `<input>`. It stores the raw
+string in the graph store as you type and only converts to number / boolean /
+array in `toGraph()` (via `coerceRightValue`). Coercing on each `onChange`
+would mangle partial input — typing `0.` would collapse to `0`, `tru` is not
+yet `true`. This mirrors how `sanitizeConfig` already defers numeric coercion
+for node config fields, so the two code paths behave the same way.
+
+### Decision: a blank `left` means "no condition", silently
+
+`serializeCondition` returns `null` when `left` is empty after trim, so
+`toGraph()` omits the `condition` entirely rather than sending
+`{ left: "", ... }` to be rejected by the API (`left` is `.min(1)`).
+`validateGraphForSave` still surfaces a *partially* filled condition (left set,
+right blank or vice-versa) as a readable pre-flight error. The net effect: you
+can click "Add condition", change your mind, clear the field, and save without
+an error — the edge just goes back to unconditional.
+
+### Decision: run-time edge colour is derived in the view, from node statuses
+
+B1.2 shows a resolved edge as green (taken) or grey (skipped) during a run.
+Rather than add an edge-level event or store, `App.tsx` derives it in
+`displayEdges` from `runSlice.nodeStatuses` that already stream in: target
+`SKIPPED` → grey; source `SUCCEEDED` and target dispatched → green. The engine
+never emits per-edge state, and it doesn't need to — the child's status already
+encodes which branch won. Keeps the SSE contract unchanged.
+
+### Decision: node config panel and edge inspector are mutually exclusive
+
+`selectNode` and `selectEdge` each clear the other's selection in the store, and
+`ConfigPanel` renders `<EdgeInspector />` in place of the node form. One
+inspector panel, one selected thing — no stacked panels, no ambiguity about
+what "Delete" or "Save Changes" acts on.

@@ -24,7 +24,8 @@ import { create } from 'zustand';
 import { applyNodeChanges, applyEdgeChanges, MarkerType } from '@xyflow/react';
 import type { Node, Edge, NodeChange, EdgeChange, Connection } from '@xyflow/react';
 import { detectCycle } from '@dag/graph-core';
-import type { Graph } from '@dag/contracts';
+import type { Graph, Condition } from '@dag/contracts';
+import { serializeCondition } from '../lib/condition';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,13 @@ export type NodeData = Record<string, unknown> & {
   config: Record<string, unknown>;
   status?: string;  // PENDING | QUEUED | RUNNING | SUCCEEDED | FAILED | SKIPPED
 };
+
+/**
+ * Extra data carried on a React Flow edge. `condition`, when present, is the
+ * B1.2 runtime gate authored in the edge inspector; `toGraph()` serialises it
+ * back onto the `EdgeDef` and `graphToFlow()` restores it on open.
+ */
+export type DagEdgeData = { condition?: Condition };
 
 /** A point-in-time copy of the graph topology, used for undo / redo. */
 export interface GraphSnapshot {
@@ -89,6 +97,8 @@ export interface GraphState {
   selectNode: (id: string | null) => void;
   /** Persistently highlight a connecting edge. Pass the same id again to clear. */
   selectEdge: (id: string | null) => void;
+  /** Set (or clear, with `null`) the runtime condition on an edge (B1.2). */
+  updateEdgeCondition: (id: string, condition: Condition | null) => void;
   updateNodeConfig: (id: string, config: Record<string, unknown>) => void;
   updateNodeLabel: (id: string, label: string) => void;
   updateNodeStatus: (nodeKey: string, status: string) => void;
@@ -213,6 +223,7 @@ function graphToFlow(graph: Graph): { nodes: Node<NodeData>[]; edges: Edge[] } {
     target: e.to,
     type: 'smoothstep',
     markerEnd: { type: MarkerType.ArrowClosed },
+    ...(e.condition ? { data: { condition: e.condition } satisfies DagEdgeData } : {}),
   }));
 
   return { nodes, edges };
@@ -324,7 +335,32 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * edge is picked, or the empty canvas is clicked.
    */
   selectEdge: (id) =>
-    set((s) => ({ selectedEdgeId: s.selectedEdgeId === id ? null : id })),
+    set((s) => {
+      const next = s.selectedEdgeId === id ? null : id;
+      // Node and edge inspectors are mutually exclusive — picking an edge
+      // dismisses the node form so the edge inspector can take the panel.
+      return { selectedEdgeId: next, selectedNodeId: next ? null : s.selectedNodeId };
+    }),
+
+  /**
+   * updateEdgeCondition: attach, edit, or (with `null`) remove the runtime
+   * gate on an edge. Read-only when viewing a historical version. Recorded in
+   * undo history so Ctrl+Z reverts a condition edit like any structural change.
+   */
+  updateEdgeCondition: (id, condition) => {
+    if (get().isReadOnly) return;
+    set((s) => ({
+      ...withHistory(s),
+      edges: s.edges.map((e) => {
+        if (e.id !== id) return e;
+        const data = { ...(e.data as DagEdgeData | undefined) };
+        if (condition) data.condition = condition;
+        else delete data.condition;
+        return { ...e, data };
+      }),
+      isDirty: true,
+    }));
+  },
 
   removeEdge: (id) => {
     if (get().isReadOnly) return;
@@ -416,7 +452,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     set((s) => ({ ...withHistory(s), nodes: [...s.nodes, newNode], isDirty: true }));
   },
 
-  selectNode: (id) => set({ selectedNodeId: id }),
+  selectNode: (id) =>
+    set((s) => ({ selectedNodeId: id, selectedEdgeId: id ? null : s.selectedEdgeId })),
 
   /**
    * removeNode: removes a node and all edges that reference it.
@@ -584,7 +621,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         config: sanitizeConfig(n.data.config) as any,
         position: { x: n.position.x, y: n.position.y },
       })),
-      edges: edges.map((e) => ({ from: e.source, to: e.target })),
+      edges: edges.map((e) => {
+        const condition = serializeCondition((e.data as DagEdgeData | undefined)?.condition);
+        return condition
+          ? { from: e.source, to: e.target, condition }
+          : { from: e.source, to: e.target };
+      }),
     };
   },
 }));

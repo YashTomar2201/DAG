@@ -7,6 +7,7 @@
  */
 
 import { useGraphStore } from '../store/graphSlice';
+import { EdgeInspector } from './EdgeInspector';
 import { NODE_ICON, IconNode, IconClose, IconTrash } from './icons';
 
 // Config field metadata per node type
@@ -46,6 +47,7 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
 
 export function ConfigPanel() {
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
+  const selectedEdgeId = useGraphStore((s) => s.selectedEdgeId);
   const nodes = useGraphStore((s) => s.nodes);
   const updateNodeConfig = useGraphStore((s) => s.updateNodeConfig);
   const updateNodeLabel = useGraphStore((s) => s.updateNodeLabel);
@@ -57,7 +59,9 @@ export function ConfigPanel() {
 
   // Collapse entirely when nothing is selected so the canvas gets the full width
   // (standard inspector-panel behaviour). The panel slides back in on selection.
-  if (!node) return null;
+  // An edge selection (mutually exclusive with a node) swaps in the edge
+  // inspector — the B1.2 condition builder.
+  if (!node) return selectedEdgeId ? <EdgeInspector /> : null;
 
   const fields = NODE_CONFIG_FIELDS[node.data.nodeType] ?? [];
   const config = node.data.config ?? {};

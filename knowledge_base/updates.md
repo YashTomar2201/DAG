@@ -5,6 +5,61 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B1.2: condition builder in the editor
+
+**Phase:** roadmap B1.2. The engine has understood edge conditions since B1.1,
+but the web editor couldn't author or show them and dropped `condition` on every
+`toGraph()` / `fromGraph()` round-trip. Now you build, edit, and remove a
+condition from an inspector panel — no JSON.
+
+### Changes
+
+- **`apps/web/src/lib/condition.ts`** (new) — shared helpers: `OP_OPTIONS`
+  (the 8-op `<select>` list), `summarizeCondition` → the on-canvas label
+  (`{{ nodes.evaluate.output.accuracy }} gt 0.9` renders as `accuracy > 0.9`),
+  `coerceRightValue` (raw input string → number / boolean / `in`-list array,
+  same spirit as `sanitizeConfig`'s numeric coercion), and `serializeCondition`
+  (trims `left`, coerces `right`, returns `null` for a blank `left` so an
+  incomplete condition is never POSTed).
+- **`apps/web/src/store/graphSlice.ts`** —
+  - `toGraph()` now emits `edge.condition` (via `serializeCondition`);
+    `graphToFlow()` restores it onto `edge.data.condition`. Round-trip safe.
+  - New `updateEdgeCondition(id, condition | null)` action — read-only-guarded,
+    recorded in undo history.
+  - `selectNode` / `selectEdge` now clear each other, so the node config panel
+    and the edge inspector are mutually exclusive.
+  - Exported `DagEdgeData` (`{ condition?: Condition }`).
+- **`apps/web/src/components/EdgeInspector.tsx`** (new) — the config panel's
+  edge mode: `source → target` header, "Add condition" (prefills
+  `{{ nodes.<source>.output.accuracy }} gt 0.9`), left / op / right controls,
+  "Remove condition", and a "Delete edge" button (wires up the store's
+  `removeEdge`, which had no UI). Respects `isReadOnly`.
+- **`apps/web/src/components/ConfigPanel.tsx`** — renders `<EdgeInspector />`
+  when an edge is selected and no node is.
+- **`apps/web/src/App.tsx`** — `displayEdges` decorates each edge: conditional
+  edges are **dashed** with the summary as a label; during a run a resolved edge
+  goes **green** (source `SUCCEEDED`, target dispatched) or **grey** (target
+  `SKIPPED`), read from `runSlice.nodeStatuses`; the selected-edge highlight
+  layers on top. `validateGraphForSave` now rejects a half-filled condition with
+  a readable message instead of letting the API 400.
+
+### Verification
+
+- `apps/web/src/store/graphSlice.test.ts` (new, 6 tests, first web unit tests) —
+  plain edge emits no `condition`; `updateEdgeCondition` attaches + coerces
+  (`"0.9"` → `0.9`); `fromGraph → toGraph` round-trip preserves it; `null`
+  removes it; `in` splits `"alpha, 2, beta"` → `['alpha', 2, 'beta']`;
+  read-only version is a no-op.
+- `pnpm -r typecheck` green; `pnpm --filter @dag/web lint` green.
+- Browser (Vite dev server, no API needed): selected an edge → inspector opens;
+  Add condition → edge turns dashed with an `accuracy > 0.9` label; changed the
+  operator → label updates to `accuracy ≥ 0.9`; Remove condition → edge back to
+  solid, label gone. No console errors. Run-time green/grey colouring is wired
+  from `nodeStatuses` but not exercised here (Docker stack was paused).
+- Added a `web` entry to `.claude/launch.json` (Vite dev on :5173).
+
+---
+
 ## 2026-09-03 — B1.1: conditional edges in the engine
 
 **Phase:** roadmap B1.1. "If accuracy > 0.9 deploy, else retrain" — branches

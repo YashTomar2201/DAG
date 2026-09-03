@@ -98,7 +98,7 @@ to read would fail silently — Node B simply would not have the file.
 
 ---
 
-## 5. Conditional Branching — engine done (B1.1), UI pending (B1.2)
+## 5. Conditional Branching — ✅ CLOSED (roadmap B1.1 + B1.2)
 
 **Done (roadmap B1.1):** `EdgeDef` carries an optional `condition`
 (`{ left, op, right }` — see `packages/contracts/src/graph.ts`). `left` is
@@ -114,11 +114,19 @@ diamond re-joins. An unresolvable condition aborts the run
 `apps/api/src/integration/conditional-branch.integration.test.ts` and
 `condition-evaluator.test.ts`.
 
-**Still missing (roadmap B1.2):** the editor can't author or display
-conditions. `toGraph()` / `fromGraph()` in `apps/web/src/store/graphSlice.ts`
-drop the `condition` field on round-trip, so a conditional graph edited in the
-UI loses its conditions on the next save. Author conditions via the API
-(`POST /workflows` / `.../versions`) until B1.2 lands.
+**Editor (roadmap B1.2):** selecting an edge opens an inspector
+(`apps/web/src/components/EdgeInspector.tsx`) with source→target header and
+left / op / right controls; "Add condition" prefills a working
+`{{ nodes.<source>.output.accuracy }} gt 0.9`. `toGraph()` / `fromGraph()` now
+preserve `condition` on round-trip (`serializeCondition` in
+`apps/web/src/lib/condition.ts` coerces the `right` input and drops a blank
+condition). Conditional edges render dashed with the condition as a label;
+during a run a resolved edge is coloured green (taken) or grey (skipped) from
+the run store's node statuses. Covered by `apps/web/src/store/graphSlice.test.ts`.
+
+**Remaining nuance:** one edge carries one `{ left, op, right }` — no compound
+`A && B` on a single edge (model it as two edges in series or a router node, as
+noted in the B1.1 decision log).
 
 ---
 

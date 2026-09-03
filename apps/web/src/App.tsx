@@ -12,8 +12,9 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 
-import { useGraphStore, type GraphSnapshot } from './store/graphSlice';
+import { useGraphStore, type GraphSnapshot, type DagEdgeData } from './store/graphSlice';
 import { useRunStore } from './store/runSlice';
+import { summarizeCondition } from './lib/condition';
 import { CustomNode } from './components/CustomNode';
 import { NodePalette } from './components/NodePalette';
 import { ConfigPanel } from './components/ConfigPanel';
@@ -82,6 +83,7 @@ function AppCanvas() {
 
   const activeRunId = useRunStore((s) => s.activeRunId);
   const runStatus = useRunStore((s) => s.runStatus);
+  const nodeStatuses = useRunStore((s) => s.nodeStatuses);
   const startListening = useRunStore((s) => s.startListening);
   const stopListening = useRunStore((s) => s.stopListening);
   const applyEvent = useRunStore((s) => s.applyEvent);
@@ -195,23 +197,53 @@ function AppCanvas() {
     return true;
   }, [pushSnapshot]);
 
-  // Apply the persistent highlight to whichever edge is selected. Done here
-  // (not in the store) so it's a pure view concern and never marks the graph dirty.
+  // Decorate edges for display — a pure view concern kept out of the store so
+  // it never marks the graph dirty:
+  //   • conditional edges render dashed, with the condition as a label (B1.2)
+  //   • during a run, a resolved edge goes green (branch taken) or grey
+  //     (branch skipped), read from the node statuses already in the run store
+  //   • the persistently-selected edge is highlighted on top of all of that
   const displayEdges = useMemo<Edge[]>(
     () =>
-      edges.map((e) =>
-        e.id === selectedEdgeId
-          ? {
-              ...e,
-              animated: true,
-              zIndex: 10,
-              // Concrete hex, not a CSS var — SVG marker fill won't resolve var().
-              style: { ...e.style, stroke: '#cc785c', strokeWidth: 2.5 },
-              markerEnd: { type: MarkerType.ArrowClosed, color: '#cc785c' },
-            }
-          : e,
-      ),
-    [edges, selectedEdgeId],
+      edges.map((e) => {
+        const next: Edge = { ...e };
+        const style: NonNullable<Edge['style']> = { ...e.style };
+        const condition = (e.data as DagEdgeData | undefined)?.condition;
+
+        if (condition) {
+          style.strokeDasharray = '7 5';
+          next.label = summarizeCondition(condition);
+          next.labelStyle = { fill: '#d8d3c8', fontSize: 10, fontFamily: 'var(--font-code)' };
+          next.labelShowBg = true;
+          next.labelBgStyle = { fill: '#2b2a27' };
+          next.labelBgPadding = [6, 3];
+          next.labelBgBorderRadius = 4;
+        }
+
+        if (activeRunId) {
+          const targetStatus = nodeStatuses[e.target]?.status;
+          const sourceStatus = nodeStatuses[e.source]?.status;
+          if (targetStatus === 'SKIPPED') {
+            style.stroke = 'var(--color-muted-soft)';
+            style.strokeOpacity = 0.45;
+          } else if (sourceStatus === 'SUCCEEDED' && targetStatus && targetStatus !== 'PENDING') {
+            style.stroke = 'var(--color-success)';
+          }
+        }
+
+        if (e.id === selectedEdgeId) {
+          next.animated = true;
+          next.zIndex = 10;
+          // Concrete hex, not a CSS var — SVG marker fill won't resolve var().
+          style.stroke = '#cc785c';
+          style.strokeWidth = 2.5;
+          next.markerEnd = { type: MarkerType.ArrowClosed, color: '#cc785c' };
+        }
+
+        next.style = style;
+        return next;
+      }),
+    [edges, selectedEdgeId, activeRunId, nodeStatuses],
   );
 
   const onDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -263,6 +295,20 @@ function AppCanvas() {
       );
       if (missing.length > 0) {
         errors.push(`"${node.data.label}" is missing: ${missing.join(', ')}`);
+      }
+    }
+
+    // B1.2: an edge condition that was started but left blank would 400 at the
+    // API (`left` is `.min(1)`) — catch it here with a readable message.
+    const labelOf = (id: string) => nodes.find((n) => n.id === id)?.data.label ?? id;
+    for (const edge of edges) {
+      const c = (edge.data as DagEdgeData | undefined)?.condition;
+      if (!c) continue;
+      const rightBlank =
+        c.right === '' || c.right === undefined || c.right === null ||
+        (Array.isArray(c.right) && c.right.length === 0);
+      if (!c.left.trim() || rightBlank) {
+        errors.push(`Edge ${labelOf(edge.source)} → ${labelOf(edge.target)} has an incomplete condition`);
       }
     }
 
