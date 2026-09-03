@@ -29,6 +29,9 @@ export {
   findRunByIdempotencyKey,
   tryTransitionRun,
   allNodeRunsTerminal,
+  // Fan-out run tree (B3)
+  getChildRunSummary,
+  listChildRuns,
   // NodeRun lifecycle
   tryTransitionNodeRun,
   findNodeRun,
@@ -67,5 +70,5 @@ export type {
   Schedule,
   Trigger,
 } from './repositories';
-export type { WorkflowListRow } from './repositories';
+export type { WorkflowListRow, ChildRunSummary } from './repositories';
 export type { Prisma } from './generated/client';

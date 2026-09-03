@@ -729,3 +729,33 @@ parsing.
 response would tell an attacker probing tokens which ones are real. Signature
 failures are 401 (you found a real token but can't sign for it); everything
 else about a token's existence is opaque.
+
+---
+
+## B3.1 — Run-Tree Schema & Read Paths (`packages/db`, `apps/api`)
+
+### Decision: fan-out children are separate `Run` rows, not a new table
+
+A `flow.map` element runs the same subgraph as any other run — it has NodeRuns,
+events, a status, timing. Reusing `Run` (plus `parentRunId` / `fanOutIndex`)
+means every existing read path, the SSE stream, the Gantt chart, retry, and
+cancel already work on a child with zero changes. The alternative — a
+`FanOutTask` table — would duplicate all of that. The cost is one nullable
+self-FK and remembering that "a run" now sometimes means "a child run".
+
+### Decision: `children` is a count summary on `GET /runs/:id`, computed per request
+
+The run detail response carries `children: { total, succeeded, failed, ... }`
+from a `groupBy`, not an array of child rows. A 1000-element fan-out must not
+turn one run fetch into a 1000-row join. The array is a separate, paginated
+endpoint (`GET /runs/:id/children`) that the B3.5 drill-in view calls on demand.
+An ordinary run gets an all-zero summary, so the response shape only grows by
+one key — no consumer breaks.
+
+### Decision: children order by `fanOutIndex`, not completion time
+
+`listChildRuns` sorts `[{ fanOutIndex: 'asc' }, { id: 'asc' }]`. The reduce step
+(B3.3) needs the children's outputs in source-array order regardless of which
+finished first, and the UI list is far more readable indexed 0..N than by a
+jittery completion order. Cursor pagination is on `id` (unique), which is stable
+under that sort.

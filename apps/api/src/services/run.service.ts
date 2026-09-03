@@ -1,4 +1,4 @@
-import { prisma, getRunEvents } from '@dag/db';
+import { prisma, getRunEvents, getChildRunSummary, listChildRuns } from '@dag/db';
 import { NotFoundError } from '../errors';
 import { ioQueue, cpuQueue, gpuQueue, createJobId } from '@dag/queue';
 import { dispatchNode } from './orchestrator.service';
@@ -9,6 +9,11 @@ import { logger } from '../logger';
 /**
  * Returns a full Run record with all its NodeRuns and timing info.
  * Used by `GET /runs/:id`.
+ *
+ * `children` (roadmap B3) is a per-status count of the run's fan-out children,
+ * computed with a `groupBy` — never by loading the child rows. It is an
+ * all-zero summary for an ordinary run, so existing consumers see no change in
+ * shape beyond the new key.
  */
 export async function getRunService(runId: string) {
   const run = await prisma.run.findUnique({
@@ -34,7 +39,27 @@ export async function getRunService(runId: string) {
 
   if (!run) throw new NotFoundError('Run', runId);
 
-  return run;
+  const children = await getChildRunSummary(runId);
+
+  return { ...run, children };
+}
+
+const CHILDREN_PAGE_DEFAULT = 50;
+const CHILDREN_PAGE_MAX = 200;
+
+/**
+ * Paginated list of a run's direct fan-out children, ordered by `fanOutIndex`.
+ * Backs `GET /runs/:id/children` (the B3.5 drill-in view).
+ */
+export async function listRunChildrenService(
+  runId: string,
+  opts: { limit?: number; cursor?: string } = {},
+) {
+  const run = await prisma.run.findUnique({ where: { id: runId }, select: { id: true } });
+  if (!run) throw new NotFoundError('Run', runId);
+
+  const limit = Math.min(Math.max(opts.limit ?? CHILDREN_PAGE_DEFAULT, 1), CHILDREN_PAGE_MAX);
+  return listChildRuns(runId, { limit, cursor: opts.cursor });
 }
 
 /**

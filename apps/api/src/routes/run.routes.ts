@@ -1,7 +1,12 @@
 import { Router, type Router as ExpressRouter } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
-import { getRunService, cancelRunService, retryFailedNodesService } from '../services/run.service';
+import {
+  getRunService,
+  cancelRunService,
+  retryFailedNodesService,
+  listRunChildrenService,
+} from '../services/run.service';
 import { streamRunEvents } from '../services/sse.service';
 import { startRun } from '../services/orchestrator.service';
 import { logger } from '../logger';
@@ -38,6 +43,27 @@ runRouter.get('/:id', async (req, res, next) => {
   try {
     const run = await getRunService(req.params['id'] as string);
     res.json(run);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /runs/:id/children ──────────────────────────────────────────────────
+
+/**
+ * Paginated list of a run's fan-out children (roadmap B3), ordered by
+ * `fanOutIndex`. Response: { children: [...], nextCursor: string | null }.
+ */
+const ChildrenQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().min(1).optional(),
+});
+
+runRouter.get('/:id/children', async (req, res, next) => {
+  try {
+    const q = ChildrenQuery.parse(req.query);
+    const result = await listRunChildrenService(req.params['id'] as string, q);
+    res.json(result);
   } catch (err) {
     next(err);
   }

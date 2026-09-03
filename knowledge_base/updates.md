@@ -5,6 +5,48 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B3.1: run-tree schema + read paths
+
+**Phase:** roadmap B3.1. Purely additive groundwork for dynamic fan-out
+(map/reduce) — no execution behaviour changes yet.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** + migration `20260903221423_b3_run_tree` —
+  `Run` gains `parentRunId String?`, `fanOutIndex Int?`, a self-relation
+  (`parent` / `children`, `RunTree`), and `@@index([parentRunId, status])` for
+  the fan-out join query. All nullable; the FK is `ON DELETE SET NULL`.
+- **`packages/db/src/repositories.ts`** —
+  - `getChildRunSummary(parentRunId)` → `{ total, pending, running, succeeded,
+    failed, skipped, cancelled }` from a single `groupBy`, never by loading
+    child rows. All-zero for a childless run.
+  - `listChildRuns(parentRunId, { limit, cursor })` → cursor-paginated, ordered
+    by `fanOutIndex` then `id`, lean projection.
+- **`apps/api/src/services/run.service.ts`** — `getRunService` now returns
+  `{ ...run, children }` (the summary); new `listRunChildrenService(runId,
+  { limit?, cursor? })` (default 50, max 200).
+- **`apps/api/src/routes/run.routes.ts`** — `GET /runs/:id/children?limit=&cursor=`
+  → `{ children: [...], nextCursor }`.
+- **`apps/web/src/api/client.ts`** — `ChildRunSummary` / `ChildRunRow` types,
+  `RunSummary.children?`, and `getRunChildren()` (forward-compat for B3.5; no UI
+  yet).
+
+### Verification
+
+- `apps/api/src/integration/run-tree.integration.test.ts` (4): ordinary run →
+  all-zero `children`; a 5-child parent (statuses 3×SUCCEEDED / FAILED / RUNNING,
+  indices inserted out of order) → correct per-status counts; `GET
+  /runs/:id/children` pages `[0,1] → [2,3] → [4]` in `fanOutIndex` order;
+  unknown run id → 404. Full integration suite: 10 files / 28 tests green.
+- `pnpm -r typecheck` / `lint` green; api unit 43/45 (2 skipped).
+- `prisma migrate dev` applied the migration to the local DB; the Docker
+  `migrate` one-shot (`migrate deploy`) applies it on the stack.
+
+### Rebuild note
+
+`@dag/db` schema change → `docker compose build api migrate`, then
+`run --rm migrate`. Workers don't read the new columns yet.
+
 ## 2026-09-04 — B2 (UI): Automation panel
 
 The editor now surfaces B2. `apps/web/src/components/AutomationPanel.tsx` — a

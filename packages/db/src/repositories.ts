@@ -281,6 +281,92 @@ export async function findRunByIdempotencyKey(idempotencyKey: string): Promise<R
   return prisma.run.findUnique({ where: { idempotencyKey } });
 }
 
+// ─── Fan-out run tree (roadmap B3) ──────────────────────────────────────────
+
+export interface ChildRunSummary {
+  total: number;
+  pending: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  cancelled: number;
+}
+
+const EMPTY_CHILD_SUMMARY: ChildRunSummary = {
+  total: 0, pending: 0, running: 0, succeeded: 0, failed: 0, skipped: 0, cancelled: 0,
+};
+
+/**
+ * Per-status counts of a run's direct children, from one `groupBy` — never by
+ * loading the child rows. Returns an all-zero summary for a run with no
+ * children (the common case). `pending` folds PENDING + RUNNING-is-separate:
+ * PENDING here is the DB `PENDING` state only; `running` is `RUNNING`.
+ */
+export async function getChildRunSummary(parentRunId: string): Promise<ChildRunSummary> {
+  const rows = await prisma.run.groupBy({
+    by: ['status'],
+    where: { parentRunId },
+    _count: { _all: true },
+  });
+  const summary: ChildRunSummary = { ...EMPTY_CHILD_SUMMARY };
+  for (const row of rows) {
+    const n = row._count._all;
+    summary.total += n;
+    switch (row.status) {
+      case 'PENDING': summary.pending += n; break;
+      case 'RUNNING': summary.running += n; break;
+      case 'SUCCEEDED': summary.succeeded += n; break;
+      case 'FAILED': summary.failed += n; break;
+      case 'CANCELLED': summary.cancelled += n; break;
+      // RunStatus has no SKIPPED; a skipped fan-out branch never creates a Run.
+    }
+  }
+  return summary;
+}
+
+/**
+ * Cursor-paginated list of a run's direct children, ordered by `fanOutIndex`
+ * (the source-array position) then `id`. Lean projection — the drill-in view
+ * (B3.5) fetches a child's full detail separately.
+ */
+export async function listChildRuns(
+  parentRunId: string,
+  opts: { limit: number; cursor?: string },
+): Promise<{
+  children: Array<{
+    id: string;
+    status: string;
+    fanOutIndex: number | null;
+    triggeredBy: string;
+    startedAt: Date | null;
+    finishedAt: Date | null;
+  }>;
+  nextCursor: string | null;
+}> {
+  const rows = await prisma.run.findMany({
+    where: { parentRunId },
+    orderBy: [{ fanOutIndex: 'asc' }, { id: 'asc' }],
+    take: opts.limit + 1,
+    ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+    select: {
+      id: true,
+      status: true,
+      fanOutIndex: true,
+      triggeredBy: true,
+      startedAt: true,
+      finishedAt: true,
+    },
+  });
+
+  const hasMore = rows.length > opts.limit;
+  const children = hasMore ? rows.slice(0, opts.limit) : rows;
+  return {
+    children,
+    nextCursor: hasMore ? children[children.length - 1]!.id : null,
+  };
+}
+
 // ─── NodeRun state machine ───────────────────────────────────────────────────
 
 /**

@@ -225,11 +225,45 @@ export interface RunRecord {
   idempotencyKey: string | null;
 }
 
+/** Per-status counts of a run's fan-out children (roadmap B3). All zero for an ordinary run. */
+export interface ChildRunSummary {
+  total: number;
+  pending: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  cancelled: number;
+}
+
 /**
- * Full Run returned by GET /runs/:id — includes all nodeRuns.
+ * Full Run returned by GET /runs/:id — includes all nodeRuns and a fan-out
+ * `children` count summary.
  */
 export interface RunSummary extends RunRecord {
   nodeRuns: NodeRunSummary[];
+  children?: ChildRunSummary;
+}
+
+export interface ChildRunRow {
+  id: string;
+  status: string;
+  fanOutIndex: number | null;
+  triggeredBy: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+/** Paginated fan-out children of a run — GET /runs/:id/children (drill-in view). */
+export async function getRunChildren(
+  runId: string,
+  opts: { limit?: number; cursor?: string } = {},
+): Promise<{ children: ChildRunRow[]; nextCursor: string | null }> {
+  const p = new URLSearchParams();
+  if (opts.limit) p.set('limit', String(opts.limit));
+  if (opts.cursor) p.set('cursor', opts.cursor);
+  const qs = p.toString();
+  return request(`/runs/${runId}/children${qs ? `?${qs}` : ''}`);
 }
 
 /**

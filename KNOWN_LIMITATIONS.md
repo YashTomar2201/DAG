@@ -61,7 +61,12 @@ are not built — the webhook path is the extension point for them.
 
 ---
 
-## 3. No Dynamic Fan-Out (Static Graphs Only)
+## 3. Dynamic Fan-Out — schema landed (B3.1), execution pending (B3.2–B3.5)
+
+**Done (roadmap B3.1):** `Run` carries `parentRunId` / `fanOutIndex` with a self-relation and a
+`[parentRunId, status]` index; `GET /runs/:id` returns a `children` count summary (all-zero for
+an ordinary run) and `GET /runs/:id/children` pages child runs in `fanOutIndex` order. No
+execution behaviour changes yet — a `flow.map` node that actually spawns children is B3.2.
 
 **What exists:** The graph topology is fixed at version-creation time. Every node and edge is
 known before the run starts.

@@ -144,18 +144,31 @@ model WorkflowVersion {
 ///
 /// `idempotencyKey` — caller-supplied key so retried HTTP requests return the
 ///                    existing run rather than spawning a duplicate.
+///
+/// Fan-out run tree (roadmap B3): a `flow.map` node spawns one child Run per
+/// element of its input array. `parentRunId` points a child at the run that
+/// spawned it; `fanOutIndex` is that child's position in the source array
+/// (stable ordering for the reduce step). Both are null for an ordinary run.
 model Run {
   id                String      @id @default(cuid())
   workflowVersionId String
   status            RunStatus   @default(PENDING)
   idempotencyKey    String?     @unique
-  triggeredBy       String      // userId, 'schedule', 'api', etc.
+  triggeredBy       String      // userId, 'schedule', 'api', 'webhook', 'fanout'
   startedAt         DateTime?
   finishedAt        DateTime?
+
+  parentRunId String?
+  fanOutIndex Int?
+  parent      Run?  @relation("RunTree", fields: [parentRunId], references: [id])
+  children    Run[] @relation("RunTree")
 
   workflowVersion WorkflowVersion @relation(fields: [workflowVersionId], references: [id])
   nodeRuns        NodeRun[]
   events          RunEvent[]
+
+  /// Hot query for the fan-out join: "how many children of X are still running?"
+  @@index([parentRunId, status])
 }
 
 /// One execution of one node inside a Run. This is the atomic unit of work
