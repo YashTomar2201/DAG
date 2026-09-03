@@ -88,6 +88,129 @@ export async function createWorkflowVersion(
   });
 }
 
+// ─── Workflow CRUD (D1.1) ────────────────────────────────────────────────────
+
+export interface WorkflowListRow {
+  id: string;
+  name: string;
+  createdAt: Date;
+  versionCount: number;
+  /** The most recent `Run.startedAt` across all versions; null if never run. */
+  lastRunAt: Date | null;
+}
+
+/**
+ * Tenant-scoped, newest-first, cursor-paginated list of workflows.
+ *
+ * `versionCount` and `lastRunAt` are computed in ONE extra query (a
+ * `workflowVersion.findMany` that also pulls each version's most-recent run),
+ * not one query per row.
+ */
+export async function listWorkflows(
+  tenantId: string,
+  opts: { limit: number; cursor?: string },
+): Promise<{ workflows: WorkflowListRow[]; nextCursor: string | null }> {
+  const rows = await prisma.workflow.findMany({
+    where: { tenantId, deletedAt: null },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: opts.limit + 1,
+    ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+    select: { id: true, name: true, createdAt: true },
+  });
+
+  const hasMore = rows.length > opts.limit;
+  const page = hasMore ? rows.slice(0, opts.limit) : rows;
+  const ids = page.map((w) => w.id);
+
+  const agg = ids.length
+    ? await prisma.workflowVersion.findMany({
+        where: { workflowId: { in: ids } },
+        select: {
+          workflowId: true,
+          runs: { select: { startedAt: true }, orderBy: { startedAt: 'desc' }, take: 1 },
+        },
+      })
+    : [];
+
+  const versionCount = new Map<string, number>();
+  const lastRunAt = new Map<string, Date | null>();
+  for (const v of agg) {
+    versionCount.set(v.workflowId, (versionCount.get(v.workflowId) ?? 0) + 1);
+    const started = v.runs[0]?.startedAt ?? null;
+    const cur = lastRunAt.get(v.workflowId) ?? null;
+    if (started && (!cur || started > cur)) lastRunAt.set(v.workflowId, started);
+  }
+
+  return {
+    workflows: page.map((w) => ({
+      id: w.id,
+      name: w.name,
+      createdAt: w.createdAt,
+      versionCount: versionCount.get(w.id) ?? 0,
+      lastRunAt: lastRunAt.get(w.id) ?? null,
+    })),
+    nextCursor: hasMore ? page[page.length - 1]!.id : null,
+  };
+}
+
+/** A single workflow with its version list (newest first). 404s if soft-deleted. */
+export async function getWorkflowWithVersions(id: string, tenantId: string) {
+  return prisma.workflow.findFirst({
+    where: { id, tenantId, deletedAt: null },
+    select: {
+      id: true,
+      name: true,
+      createdAt: true,
+      versions: {
+        orderBy: { version: 'desc' },
+        select: { id: true, version: true, createdAt: true },
+      },
+    },
+  });
+}
+
+/** Just the version list for a workflow (D1.3). Returns null if not found. */
+export async function listWorkflowVersions(id: string, tenantId: string) {
+  const wf = await prisma.workflow.findFirst({
+    where: { id, tenantId, deletedAt: null },
+    select: {
+      versions: {
+        orderBy: { version: 'desc' },
+        select: { id: true, version: true, createdAt: true },
+      },
+    },
+  });
+  return wf ? wf.versions : null;
+}
+
+/**
+ * Renames a workflow. Returns the updated row, or null if it doesn't exist
+ * for this tenant (or is soft-deleted).
+ */
+export async function renameWorkflow(id: string, tenantId: string, name: string) {
+  const result = await prisma.workflow.updateMany({
+    where: { id, tenantId, deletedAt: null },
+    data: { name },
+  });
+  if (result.count === 0) return null;
+  return prisma.workflow.findUnique({
+    where: { id },
+    select: { id: true, name: true, createdAt: true },
+  });
+}
+
+/**
+ * Soft-deletes a workflow (sets `deletedAt`). Idempotent-ish: returns false if
+ * there was no matching non-deleted row. Runs stay readable by id.
+ */
+export async function softDeleteWorkflow(id: string, tenantId: string): Promise<boolean> {
+  const result = await prisma.workflow.updateMany({
+    where: { id, tenantId, deletedAt: null },
+    data: { deletedAt: new Date() },
+  });
+  return result.count > 0;
+}
+
 // ─── Run ─────────────────────────────────────────────────────────────────────
 
 /**

@@ -17,6 +17,12 @@ export {
   // Workflow
   createWorkflow,
   createWorkflowVersion,
+  // Workflow CRUD (D1.1)
+  listWorkflows,
+  getWorkflowWithVersions,
+  listWorkflowVersions,
+  renameWorkflow,
+  softDeleteWorkflow,
   // Run lifecycle
   createRun,
   tryTransitionRun,
@@ -42,4 +48,5 @@ export type {
   Tenant,
   Workflow,
 } from './repositories';
+export type { WorkflowListRow } from './repositories';
 export type { Prisma } from './generated/client';

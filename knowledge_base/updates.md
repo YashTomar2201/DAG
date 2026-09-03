@@ -5,6 +5,62 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — D1.1: the workflow CRUD API
+
+**Phase:** roadmap D1.1. The read/rename/delete side of workflow management —
+no UI yet (D1.2). Testable with `curl` alone.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** + migration
+  `20260903010421_workflow_soft_delete` — `Workflow.deletedAt DateTime?` (soft
+  delete: runs reference immutable versions, so a hard delete would cascade
+  away history or fail on the FK) and `@@index([tenantId, createdAt])` for the
+  list query.
+- **`packages/db/src/repositories.ts`** — `listWorkflows` (tenant-scoped,
+  newest-first, cursor-paginated; `versionCount` + `lastRunAt` computed in ONE
+  extra query — a `workflowVersion.findMany` that also pulls each version's
+  latest run — not one per row), `getWorkflowWithVersions`,
+  `listWorkflowVersions`, `renameWorkflow`, `softDeleteWorkflow`. Every one
+  filters `deletedAt: null` and scopes by `tenantId`. `lastRunAt` is the most
+  recent `Run.startedAt`.
+- **`apps/api/src/services/workflow.service.ts`** — thin services over those
+  (limit clamped 1–100, default 25; 404 via `NotFoundError` when a row is
+  missing / soft-deleted / wrong tenant).
+- **`apps/api/src/routes/workflow.routes.ts`** —
+  `GET /workflows` (`?tenantId=&limit=&cursor=`),
+  `GET /workflows/:id`, `GET /workflows/:id/versions`,
+  `PATCH /workflows/:id` `{ name }`, `DELETE /workflows/:id` → 204.
+  A `tenantOf(req)` shim reads `?tenantId=` (default `"default"`) — A3 swaps it
+  for `req.tenantId` from a verified key.
+- **`apps/api/src/integration/workflow-crud.integration.test.ts`** (new) —
+  create ×3 → list order / `versionCount` / `lastRunAt` → cursor pagination →
+  rename (no new version) → cross-tenant 404 → soft-delete (gone from list,
+  404 on read, **run still readable by id**) → double-delete 404.
+- **`apps/api/src/integration/fixtures.ts`** — `waitUntil` default 20s → 45s.
+  The A1.2–A1.4 pipeline scripts do real scikit-learn work (~20s serial), which
+  flaked the old cap when the whole integration suite ran back-to-back.
+
+### Verification
+
+- Full `curl` cycle on the live stack: create 3 → list (newest-first,
+  `versionCount`, `lastRunAt` only on the one with a started run) → `limit=2` +
+  `cursor` paginates → `PATCH` renames without adding a version → `DELETE` →
+  204, gone from list, `GET` → 404, but `GET /runs/:id` for the deleted
+  workflow's run → 200 SUCCEEDED. Empty name → 400, wrong tenant → 404,
+  re-delete → 404.
+- `pnpm -r typecheck` / `lint` clean; unit suites green (api 35); **all 6
+  integration files pass (11 tests)** including the new one.
+
+### Files
+
+`packages/db/prisma/{schema.prisma, migrations/20260903010421_workflow_soft_delete/}`,
+`packages/db/src/{repositories.ts, index.ts}`,
+`apps/api/src/{services/workflow.service.ts, routes/workflow.routes.ts}`,
+`apps/api/src/integration/{workflow-crud.integration.test.ts, fixtures.ts}`.
+
+---
+
 ## 2026-09-03 — A5: clear the lint backlog + add CI
 
 **Phase:** roadmap A5. Goal: `pnpm -r lint` is green so CI can catch

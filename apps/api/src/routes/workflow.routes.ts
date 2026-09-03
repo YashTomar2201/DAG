@@ -1,14 +1,29 @@
-import { Router, type Router as ExpressRouter } from 'express';
+import { Router, type Router as ExpressRouter, type Request } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
 import {
   createWorkflowService,
   createVersionService,
   validateGraphService,
+  listWorkflowsService,
+  getWorkflowService,
+  listWorkflowVersionsService,
+  renameWorkflowService,
+  deleteWorkflowService,
 } from '../services/workflow.service';
 import { logger } from '../logger';
 
 export const workflowRouter: ExpressRouter = Router();
+
+/**
+ * Tenant scoping shim. Until A3 (auth) lands, the tenant comes from a
+ * `?tenantId=` query param and defaults to "default" — the single-tenant
+ * editor's fixed id. A3 replaces this with `req.tenantId` from a verified key.
+ */
+function tenantOf(req: Request): string {
+  const q = req.query['tenantId'];
+  return typeof q === 'string' && q.length > 0 ? q : 'default';
+}
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -24,6 +39,89 @@ const CreateVersionBody = z.object({
 
 const ValidateGraphBody = z.object({
   graph: z.unknown(),
+});
+
+const RenameWorkflowBody = z.object({
+  name: z.string().min(1).max(255),
+});
+
+const ListWorkflowsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  cursor: z.string().min(1).optional(),
+});
+
+// ─── GET /workflows ──────────────────────────────────────────────────────────
+
+/**
+ * Paginated, tenant-scoped, newest-first list. Each row carries `versionCount`
+ * and `lastRunAt`. Response: { workflows: [...], nextCursor: string | null }.
+ */
+workflowRouter.get('/', async (req, res, next) => {
+  try {
+    const q = ListWorkflowsQuery.parse(req.query);
+    const result = await listWorkflowsService(tenantOf(req), q);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /workflows/:id ──────────────────────────────────────────────────────
+
+/** A single workflow with its version list (newest first). 404 if soft-deleted. */
+workflowRouter.get('/:id', async (req, res, next) => {
+  try {
+    const wf = await getWorkflowService(req.params['id'] as string, tenantOf(req));
+    res.json(wf);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /workflows/:id/versions ─────────────────────────────────────────────
+
+/** Just the version list (id, version, createdAt), newest first. For D1.3. */
+workflowRouter.get('/:id/versions', async (req, res, next) => {
+  try {
+    const versions = await listWorkflowVersionsService(req.params['id'] as string, tenantOf(req));
+    res.json({ versions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── PATCH /workflows/:id ────────────────────────────────────────────────────
+
+/** Rename a workflow. 404 if missing or soft-deleted. */
+workflowRouter.patch('/:id', validateBody(RenameWorkflowBody), async (req, res, next) => {
+  try {
+    const updated = await renameWorkflowService(
+      req.params['id'] as string,
+      tenantOf(req),
+      req.body.name,
+    );
+    logger.info({ workflowId: updated.id }, 'Workflow renamed');
+    res.json(updated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── DELETE /workflows/:id ───────────────────────────────────────────────────
+
+/**
+ * Soft-deletes a workflow (sets `deletedAt`). It vanishes from every list/read
+ * path, but its runs stay readable by id. 204 on success, 404 if there was
+ * nothing to delete.
+ */
+workflowRouter.delete('/:id', async (req, res, next) => {
+  try {
+    await deleteWorkflowService(req.params['id'] as string, tenantOf(req));
+    logger.info({ workflowId: req.params['id'] }, 'Workflow soft-deleted');
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ─── POST /workflows ──────────────────────────────────────────────────────────

@@ -53,13 +53,22 @@ model Tenant {
 
 /// A named workflow container. Mutable (name can change). Graph versions are
 /// immutable snapshots stored on WorkflowVersion.
+///
+/// `deletedAt` — soft delete. Runs reference immutable versions, so a hard
+///               delete would either cascade away run history or fail on the
+///               FK. Every list/read query filters `deletedAt: null`; the runs
+///               of a deleted workflow stay readable by id.
 model Workflow {
   id        String            @id @default(cuid())
   tenantId  String
   name      String
   createdAt DateTime          @default(now())
+  deletedAt DateTime?
   tenant    Tenant            @relation(fields: [tenantId], references: [id])
   versions  WorkflowVersion[]
+
+  /// Keeps the tenant-scoped, newest-first list query fast.
+  @@index([tenantId, createdAt])
 }
 
 /// An immutable snapshot of a graph at a point in time.

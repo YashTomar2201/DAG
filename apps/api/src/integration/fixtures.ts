@@ -145,10 +145,17 @@ export async function cleanupWorkflow(
   await prisma.tenant.delete({ where: { id: tenantId } });
 }
 
-/** Polls until `predicate` returns true or `timeoutMs` elapses. */
+/**
+ * Polls until `predicate` returns true or `timeoutMs` elapses.
+ *
+ * Default 45s: since A1.2–A1.4 the pipeline scripts do real scikit-learn work
+ * (preprocess + train + evaluate is ~20s serial on a cold host), so the old
+ * 20s default flaked when the full suite ran back-to-back. Still well under
+ * the 60s vitest `testTimeout`.
+ */
 export async function waitUntil(
   predicate: () => Promise<boolean>,
-  { timeoutMs = 20_000, intervalMs = 150 }: { timeoutMs?: number; intervalMs?: number } = {},
+  { timeoutMs = 45_000, intervalMs = 150 }: { timeoutMs?: number; intervalMs?: number } = {},
 ): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {

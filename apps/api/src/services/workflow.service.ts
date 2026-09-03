@@ -6,6 +6,11 @@ import {
   prisma,
   createWorkflow,
   createWorkflowVersion,
+  listWorkflows,
+  getWorkflowWithVersions,
+  listWorkflowVersions,
+  renameWorkflow,
+  softDeleteWorkflow,
 } from '@dag/db';
 import { CycleError, NotFoundError } from '../errors';
 
@@ -54,6 +59,47 @@ export async function createWorkflowService(input: CreateWorkflowInput) {
   const { graph, topoOrder } = validateAndProcessGraph(input.graph);
 
   return createWorkflow(input.tenantId, input.name, graph, topoOrder);
+}
+
+// ─── Workflow CRUD (D1.1) ────────────────────────────────────────────────────
+
+const MAX_LIST_LIMIT = 100;
+const DEFAULT_LIST_LIMIT = 25;
+
+/** Tenant-scoped, newest-first, cursor-paginated workflow list. */
+export async function listWorkflowsService(
+  tenantId: string,
+  opts: { limit?: number; cursor?: string } = {},
+) {
+  const limit = Math.min(Math.max(opts.limit ?? DEFAULT_LIST_LIMIT, 1), MAX_LIST_LIMIT);
+  return listWorkflows(tenantId, { limit, cursor: opts.cursor });
+}
+
+/** A workflow + its versions. 404 if missing or soft-deleted. */
+export async function getWorkflowService(id: string, tenantId: string) {
+  const wf = await getWorkflowWithVersions(id, tenantId);
+  if (!wf) throw new NotFoundError('Workflow', id);
+  return wf;
+}
+
+/** The version list for a workflow (D1.3). 404 if missing or soft-deleted. */
+export async function listWorkflowVersionsService(id: string, tenantId: string) {
+  const versions = await listWorkflowVersions(id, tenantId);
+  if (versions === null) throw new NotFoundError('Workflow', id);
+  return versions;
+}
+
+/** Rename. 404 if missing or soft-deleted. */
+export async function renameWorkflowService(id: string, tenantId: string, name: string) {
+  const updated = await renameWorkflow(id, tenantId, name);
+  if (!updated) throw new NotFoundError('Workflow', id);
+  return updated;
+}
+
+/** Soft delete. 404 if there was nothing (non-deleted) to delete. */
+export async function deleteWorkflowService(id: string, tenantId: string) {
+  const ok = await softDeleteWorkflow(id, tenantId);
+  if (!ok) throw new NotFoundError('Workflow', id);
 }
 
 // ─── WorkflowVersion (append a new version) ──────────────────────────────────
