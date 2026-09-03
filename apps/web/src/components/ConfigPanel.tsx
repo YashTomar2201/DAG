@@ -51,6 +51,7 @@ export function ConfigPanel() {
   const updateNodeLabel = useGraphStore((s) => s.updateNodeLabel);
   const removeNode = useGraphStore((s) => s.removeNode);
   const selectNode = useGraphStore((s) => s.selectNode);
+  const isReadOnly = useGraphStore((s) => s.isReadOnly);
 
   const node = nodes.find((n) => n.id === selectedNodeId);
 
@@ -113,6 +114,7 @@ export function ConfigPanel() {
           onChange={(e) => updateNodeLabel(node!.id, e.target.value)}
           className="input-dark"
           placeholder="Node label"
+          disabled={isReadOnly}
         />
         <span className="code" style={{ color: 'var(--color-on-dark-soft)', fontSize: 11, opacity: 0.55 }}>
           {node.data.nodeType}
@@ -132,6 +134,7 @@ export function ConfigPanel() {
               placeholder={field.placeholder}
               onChange={(e) => handleFieldChange(field.key, e.target.value)}
               className="input-dark"
+              disabled={isReadOnly}
             />
           </div>
         ))}
@@ -143,9 +146,12 @@ export function ConfigPanel() {
       </div>
 
       <div className="body-sm" style={{ color: 'var(--color-on-dark-soft)', opacity: 0.55, marginTop: 'auto', fontSize: 12 }}>
-        Edits apply to the canvas as you type. Hit <strong>Save Changes</strong> in the header to store a new version.
+        {isReadOnly
+          ? 'This is a historical version — read-only. Restore it from the banner to edit.'
+          : <>Edits apply to the canvas as you type. Hit <strong>Save Changes</strong> in the header to store a new version.</>}
       </div>
 
+      {!isReadOnly && (
       <button
         onClick={() => removeNode(node!.id)}
         style={{
@@ -170,6 +176,7 @@ export function ConfigPanel() {
         <IconTrash size={15} />
         Delete node
       </button>
+      )}
     </aside>
   );
 }

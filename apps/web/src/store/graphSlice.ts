@@ -41,6 +41,13 @@ export interface GraphSnapshot {
   edges: Edge[];
 }
 
+/** One entry in a workflow's version history (D1.3). */
+export interface VersionMeta {
+  id: string;
+  version: number;
+  createdAt: string;
+}
+
 /** How many structural edits we remember. */
 const HISTORY_LIMIT = 50;
 
@@ -58,6 +65,12 @@ export interface GraphState {
   workflowId: string | null;
   versionId: string | null;
   workflowName: string;
+
+  // ── Version history (D1.3) ───────────────────────────────────────────────
+  /** All versions of the open workflow, newest first. Empty until a save/open. */
+  versions: VersionMeta[];
+  /** True while viewing an old version — the canvas is frozen until restored. */
+  isReadOnly: boolean;
 
   // Undo / redo history (structural edits only: add/remove node, add/remove
   // edge, move node). `past` is oldest→newest; `future` is what redo replays.
@@ -85,13 +98,21 @@ export interface GraphState {
 
   // ── Workflow identity actions (D1.2) ──────────────────────────────────────
   /** Load a stored workflow: rebuild the canvas from `graph` and set identity. */
-  fromGraph: (graph: Graph, meta: { workflowId: string; versionId: string; name: string }) => void;
+  fromGraph: (
+    graph: Graph,
+    meta: { workflowId: string; versionId: string; name: string; readOnly?: boolean },
+  ) => void;
   /** Reset to the starter graph as a brand-new unsaved workflow. */
   newWorkflow: () => void;
-  /** Record ids/name after a save (or a server-side rename). */
-  setWorkflowMeta: (meta: Partial<{ workflowId: string; versionId: string; name: string }>) => void;
+  /** Record ids/name/read-only after a save, rename, or restore. */
+  setWorkflowMeta: (
+    meta: Partial<{ workflowId: string; versionId: string; name: string; isReadOnly: boolean }>,
+  ) => void;
   /** Update the display name only (the actual rename is an API call). */
   setWorkflowName: (name: string) => void;
+
+  // ── Version history actions (D1.3) ───────────────────────────────────────
+  setVersions: (versions: VersionMeta[]) => void;
 
   /** Push a caller-captured snapshot onto the undo stack (used for node drags). */
   pushSnapshot: (snap: GraphSnapshot) => void;
@@ -251,6 +272,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   workflowId: null,
   versionId: null,
   workflowName: DEFAULT_WORKFLOW_NAME,
+  versions: [],
+  isReadOnly: false,
   past: [],
   future: [],
 
@@ -303,13 +326,15 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   selectEdge: (id) =>
     set((s) => ({ selectedEdgeId: s.selectedEdgeId === id ? null : id })),
 
-  removeEdge: (id) =>
+  removeEdge: (id) => {
+    if (get().isReadOnly) return;
     set((s) => ({
       ...withHistory(s),
       edges: s.edges.filter((e) => e.id !== id),
       selectedEdgeId: s.selectedEdgeId === id ? null : s.selectedEdgeId,
       isDirty: true,
-    })),
+    }));
+  },
 
   /**
    * onConnect: called when the user draws an edge between two handles.
@@ -323,6 +348,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * it runs in the browser without any bundler shim.
    */
   onConnect: (connection) => {
+    if (get().isReadOnly) return false;
     const { nodes, edges } = get();
     const candidateEdges = [
       ...edges,
@@ -379,6 +405,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   addNode: (type, label, position) => {
+    if (get().isReadOnly) return;
     const id = nextId();
     const newNode: Node<NodeData> = {
       id,
@@ -395,7 +422,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * removeNode: removes a node and all edges that reference it.
    * Also clears selectedNodeId if the removed node was selected.
    */
-  removeNode: (id) =>
+  removeNode: (id) => {
+    if (get().isReadOnly) return;
     set((s) => {
       const edges = s.edges.filter((e) => e.source !== id && e.target !== id);
       const stillHasSelectedEdge = edges.some((e) => e.id === s.selectedEdgeId);
@@ -407,15 +435,18 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         selectedEdgeId: stillHasSelectedEdge ? s.selectedEdgeId : null,
         isDirty: true,
       };
-    }),
+    });
+  },
 
-  updateNodeConfig: (id, config) =>
+  updateNodeConfig: (id, config) => {
+    if (get().isReadOnly) return;
     set((s) => ({
       nodes: s.nodes.map((n) =>
         n.id === id ? { ...n, data: { ...n.data, config } } : n,
       ),
       isDirty: true,
-    })),
+    }));
+  },
 
   /**
    * updateNodeLabel: updates the visible label on a node.
@@ -423,13 +454,15 @@ export const useGraphStore = create<GraphState>((set, get) => ({
    * data.label (shown in the node header) whereas config holds
    * the execution parameters.
    */
-  updateNodeLabel: (id, label) =>
+  updateNodeLabel: (id, label) => {
+    if (get().isReadOnly) return;
     set((s) => ({
       nodes: s.nodes.map((n) =>
         n.id === id ? { ...n, data: { ...n.data, label } } : n,
       ),
       isDirty: true,
-    })),
+    }));
+  },
 
   updateNodeStatus: (nodeKey, status) =>
     set((s) => ({
@@ -451,6 +484,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       workflowId: meta.workflowId,
       versionId: meta.versionId,
       workflowName: meta.name,
+      isReadOnly: meta.readOnly ?? false,
       isDirty: false,
       selectedNodeId: null,
       selectedEdgeId: null,
@@ -468,6 +502,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       workflowId: null,
       versionId: null,
       workflowName: DEFAULT_WORKFLOW_NAME,
+      versions: [],
+      isReadOnly: false,
       isDirty: false,
       selectedNodeId: null,
       selectedEdgeId: null,
@@ -482,9 +518,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       workflowId: meta.workflowId ?? s.workflowId,
       versionId: meta.versionId ?? s.versionId,
       workflowName: meta.name ?? s.workflowName,
+      isReadOnly: meta.isReadOnly ?? s.isReadOnly,
     })),
 
   setWorkflowName: (name) => set({ workflowName: name }),
+
+  setVersions: (versions) => set({ versions }),
 
   // ── Undo / redo ────────────────────────────────────────────────────────────
 

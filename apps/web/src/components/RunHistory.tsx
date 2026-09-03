@@ -45,6 +45,11 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
     Object.fromEntries(s.nodes.map(n => [n.id, n.data.label])),
   );
 
+  // versionId → "v3", so each run row can show which version it ran (D1.3).
+  const versionLabel = useGraphStore(s =>
+    Object.fromEntries(s.versions.map(v => [v.id, `v${v.version}`])),
+  );
+
   // When a new active run ends (status becomes terminal), refresh its full detail
   // so the Gantt chart shows timing even for the just-completed run.
   const runStatus = useRunStore(s => s.runStatus);
@@ -170,8 +175,13 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
                 }}
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                  <span className="body-sm" style={{ color: 'var(--color-ink)', fontWeight: 500 }}>
+                  <span className="body-sm" style={{ color: 'var(--color-ink)', fontWeight: 500, display: 'flex', alignItems: 'baseline', gap: 8 }}>
                     {formatRunTime(run.startedAt ?? run.createdAt)}
+                    {versionLabel[run.workflowVersionId] && (
+                      <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-muted-soft)', letterSpacing: '0.03em' }}>
+                        {versionLabel[run.workflowVersionId]}
+                      </span>
+                    )}
                   </span>
                   <span style={{
                     display: 'flex',

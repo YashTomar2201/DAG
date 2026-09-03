@@ -20,6 +20,7 @@ import { ConfigPanel } from './components/ConfigPanel';
 import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
 import { WorkflowMenu } from './components/WorkflowMenu';
+import { VersionMenu } from './components/VersionMenu';
 
 import type { Graph } from '@dag/contracts';
 import {
@@ -66,10 +67,13 @@ function AppCanvas() {
   const workflowId = useGraphStore((s) => s.workflowId);
   const versionId = useGraphStore((s) => s.versionId);
   const workflowName = useGraphStore((s) => s.workflowName);
+  const versions = useGraphStore((s) => s.versions);
+  const isReadOnly = useGraphStore((s) => s.isReadOnly);
   const fromGraph = useGraphStore((s) => s.fromGraph);
   const newWorkflow = useGraphStore((s) => s.newWorkflow);
   const setWorkflowMeta = useGraphStore((s) => s.setWorkflowMeta);
   const setWorkflowName = useGraphStore((s) => s.setWorkflowName);
+  const setVersions = useGraphStore((s) => s.setVersions);
   const undo = useGraphStore((s) => s.undo);
   const redo = useGraphStore((s) => s.redo);
   const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
@@ -280,9 +284,11 @@ function AppCanvas() {
     setIsSaving(true);
     try {
       const graph = toGraph();
+      let savedWorkflowId = workflowId;
       if (!workflowId) {
         // POST /workflows → { workflowId, versionId }
         const result = await createWorkflow(workflowName.trim() || 'Untitled workflow', graph);
+        savedWorkflowId = result.workflowId;
         setWorkflowMeta({ workflowId: result.workflowId, versionId: result.versionId });
         try { localStorage.setItem(LS_LAST_WORKFLOW, result.workflowId); } catch { /* ignore */ }
         setNotice({ kind: 'success', text: 'Workflow saved.' });
@@ -293,6 +299,7 @@ function AppCanvas() {
         setNotice({ kind: 'success', text: `Saved as version ${version.version}.` });
       }
       markSaved();
+      if (savedWorkflowId) void refreshVersions(savedWorkflowId);
       setWorkflowsRefreshKey((k) => k + 1);
     } catch (err) {
       setNotice({ kind: 'error', text: describeError(err) });
@@ -316,6 +323,7 @@ function AppCanvas() {
         if (!latest) throw new Error('That workflow has no versions.');
         const version = await getWorkflowVersion(id, latest.id);
         fromGraph(version.graph as Graph, { workflowId: id, versionId: latest.id, name: wf.name });
+        setVersions(wf.versions);
         stopListening();
         try { localStorage.setItem(LS_LAST_WORKFLOW, id); } catch { /* ignore */ }
       } catch (err) {
@@ -357,6 +365,69 @@ function AppCanvas() {
       }
     }
   }
+
+  // ── Version history (D1.3) ────────────────────────────────────────────────
+
+  const refreshVersions = useCallback(
+    async (wfId: string) => {
+      try {
+        const wf = await getWorkflow(wfId);
+        setVersions(wf.versions);
+      } catch { /* non-critical — leave the stale list */ }
+    },
+    [setVersions],
+  );
+
+  const viewVersion = useCallback(
+    async (vId: string) => {
+      const s = useGraphStore.getState();
+      if (!s.workflowId || vId === s.versionId) return;
+      if (s.isDirty && !window.confirm('You have unsaved changes. Discard them and view another version?')) return;
+      setIsOpening(true);
+      setNotice(null);
+      try {
+        const version = await getWorkflowVersion(s.workflowId, vId);
+        const isOld = vId !== s.versions[0]?.id;
+        fromGraph(version.graph as Graph, {
+          workflowId: s.workflowId,
+          versionId: vId,
+          name: s.workflowName,
+          readOnly: isOld,
+        });
+        stopListening();
+      } catch (err) {
+        setNotice({ kind: 'error', text: describeError(err) });
+      } finally {
+        setIsOpening(false);
+      }
+    },
+    [fromGraph, stopListening],
+  );
+
+  async function restoreVersion() {
+    const s = useGraphStore.getState();
+    if (!s.workflowId) return;
+    setIsSaving(true);
+    setNotice(null);
+    try {
+      const version = await saveWorkflowVersion(s.workflowId, toGraph());
+      setWorkflowMeta({ versionId: version.id, isReadOnly: false });
+      markSaved();
+      await refreshVersions(s.workflowId);
+      setWorkflowsRefreshKey((k) => k + 1);
+      setNotice({ kind: 'success', text: `Restored — this is now version ${version.version}.` });
+    } catch (err) {
+      setNotice({ kind: 'error', text: describeError(err) });
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  const backToLatest = useCallback(() => {
+    const s = useGraphStore.getState();
+    const latest = s.versions[0];
+    if (latest) void viewVersion(latest.id);
+  }, [viewVersion]);
 
   // Resume the last workflow on load (once). A stale/deleted id is cleared by
   // openWorkflow's 404 handler.
@@ -488,6 +559,9 @@ function AppCanvas() {
               onFocus={(e) => { e.currentTarget.style.borderColor = 'var(--color-hairline)'; e.currentTarget.style.background = 'var(--color-surface)'; }}
               onMouseLeave={(e) => { if (document.activeElement !== e.currentTarget) { e.currentTarget.style.borderColor = 'transparent'; } }}
             />
+            {workflowId && versions.length > 0 && (
+              <VersionMenu versions={versions} currentVersionId={versionId} onView={viewVersion} />
+            )}
             {isOpening && <IconSpinner size={14} />}
             {workflowId ? null : (
               <span className="caption-uppercase" style={{ fontSize: 9, color: 'var(--color-muted-soft)', letterSpacing: '1px' }}>unsaved</span>
@@ -520,7 +594,7 @@ function AppCanvas() {
           <button
             className="btn-secondary"
             onClick={handleSave}
-            disabled={isSaving || (!isDirty && !!workflowId)}
+            disabled={isSaving || isReadOnly || (!isDirty && !!workflowId)}
           >
             {isSaving && <IconSpinner size={15} />}
             {!isSaving && !isDirty && !!workflowId && <IconCheck size={15} />}
@@ -586,6 +660,40 @@ function AppCanvas() {
           >
             <IconClose size={14} />
           </button>
+        </div>
+      )}
+
+      {/* Read-only banner — shown while viewing a historical version (D1.3) */}
+      {isReadOnly && (
+        <div
+          className="animate-in"
+          style={{
+            background: 'color-mix(in srgb, var(--color-warning) 14%, transparent)',
+            color: '#8a5a1a',
+            borderBottom: '1px solid color-mix(in srgb, var(--color-warning) 35%, transparent)',
+            padding: '10px 24px',
+            fontSize: 13,
+            fontWeight: 500,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 16,
+            flexShrink: 0,
+          }}
+        >
+          <span style={{ display: 'flex', gap: 9, alignItems: 'center' }}>
+            <IconAlert size={15} />
+            Viewing{versions.find((v) => v.id === versionId) ? ` version ${versions.find((v) => v.id === versionId)!.version}` : ' an old version'} — read-only. Restoring appends it as a new version; history is never changed.
+          </span>
+          <span style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+            <button className="btn-ghost" style={{ fontSize: 12, fontWeight: 600 }} onClick={backToLatest} disabled={isSaving}>
+              Back to latest
+            </button>
+            <button className="btn-secondary" style={{ fontSize: 12, height: 30 }} onClick={restoreVersion} disabled={isSaving}>
+              {isSaving ? <IconSpinner size={13} /> : null}
+              Restore this version
+            </button>
+          </span>
         </div>
       )}
 
@@ -667,10 +775,12 @@ function AppCanvas() {
               nodeTypes={nodeTypes}
               onDragOver={onDragOver}
               onDrop={onDrop}
+              nodesDraggable={!isReadOnly}
+              nodesConnectable={!isReadOnly}
               fitView
               fitViewOptions={{ padding: 0.2 }}
               nodeOrigin={[0.5, 0.5]}
-              deleteKeyCode={['Backspace', 'Delete']}
+              deleteKeyCode={isReadOnly ? null : ['Backspace', 'Delete']}
               proOptions={{ hideAttribution: true }}
             >
               <Background color="var(--color-surface-dark-elevated)" gap={18} size={1.5} />

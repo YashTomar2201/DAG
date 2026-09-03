@@ -5,6 +5,59 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-03 — D1.3: version history and restore
+
+**Phase:** roadmap D1.3. Browse a workflow's immutable version history, load an
+old one read-only, and restore it (which appends N+1 — never mutates history).
+Web-only: "restore" is just `POST /workflows/:id/versions` with the old graph,
+the version list reuses D1.2's `getWorkflow` / `getWorkflowVersion`.
+
+### Changes
+
+- **`store/graphSlice.ts`** — `versions: VersionMeta[]` + `setVersions`,
+  `isReadOnly` flag. `fromGraph` meta gains `readOnly?`; `setWorkflowMeta`
+  gains `isReadOnly`. The dirty-marking mutations (`updateNodeConfig`,
+  `updateNodeLabel`, `addNode`, `removeNode`, `removeEdge`, `onConnect`) bail
+  early when `isReadOnly` — belt to the ReactFlow-prop braces.
+- **`components/VersionMenu.tsx`** (new) — header dropdown showing `v4 latest`,
+  `v3`, `v2`, `v1` with timestamps; the button shows a `read-only` badge when
+  you're not on the latest.
+- **`App.tsx`** —
+  - `viewVersion(id)`: dirty-guard → `getWorkflowVersion` → `fromGraph` with
+    `readOnly = (id !== versions[0].id)` → stop any run stream. `localStorage`
+    is untouched (same workflow).
+  - `restoreVersion()`: `saveWorkflowVersion(workflowId, toGraph())` → new
+    version → clears read-only, `markSaved`, refetch versions.
+  - `refreshVersions()` after every open / save / restore.
+  - a warning banner while `isReadOnly` with **Restore this version** /
+    **Back to latest**; `<ReactFlow nodesDraggable={!isReadOnly}
+    nodesConnectable={!isReadOnly} deleteKeyCode={isReadOnly ? null : …}>`; Save
+    button disabled.
+- **`components/ConfigPanel.tsx`** — inputs `disabled` and the Delete-node
+  button hidden while read-only.
+- **`components/RunHistory.tsx`** — each run row shows the version it used
+  (`v3`), from the `versionId → "v{n}"` map.
+
+### Verification (browser, against the live stack)
+
+- Workflow with v1–v3; opened → loads **v3** (latest), `VersionMenu` shows
+  `v3 ▾`.
+- Pick **v1** → canvas swaps to v1's 4-node graph, `v1 read-only ▾`, banner
+  "Viewing version 1 — read-only…", Save disabled, nodes `selectable` but not
+  `draggable`, config inputs disabled.
+- **Restore this version** → notice "Restored — this is now version 4",
+  `VersionMenu` → `v4 latest / v3 / v2 / v1`, banner gone, editable again.
+  `GET .../versions` confirms **4** versions and **v1's graph is byte-for-byte
+  unchanged**.
+- `pnpm -r typecheck` / `lint` clean; all unit suites green.
+
+### Files
+
+`apps/web/src/{App.tsx, store/graphSlice.ts, components/{VersionMenu.tsx (new),
+ConfigPanel.tsx, RunHistory.tsx}}`.
+
+---
+
 ## 2026-09-03 — D1.2: workflow list + open/rename in the editor
 
 **Phase:** roadmap D1.2. The editor stops being a single hardcoded
