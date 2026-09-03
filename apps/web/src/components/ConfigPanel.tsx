@@ -43,6 +43,11 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'modelTag',    label: 'Model Tag',    type: 'text', placeholder: 'my-model:v1' },
     { key: 'weightsPath', label: 'Weights Ref (optional)', type: 'text', placeholder: '{{ nodes.<train>.output.weightsPath }}' },
   ],
+  'flow.map': [
+    { key: 'overSource', label: 'Over (array ref)',      type: 'text',   placeholder: '{{ nodes.split.output.chunks }}' },
+    { key: 'subgraph',   label: 'Subgraph node keys',    type: 'text',   placeholder: 'process, score  (comma-separated)' },
+    { key: 'maxFanOut',  label: 'Max fan-out',           type: 'number', placeholder: '1000' },
+  ],
 };
 
 export function ConfigPanel() {

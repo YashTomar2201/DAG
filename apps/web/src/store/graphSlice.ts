@@ -235,7 +235,9 @@ function graphToFlow(graph: Graph): { nodes: Node<NodeData>[]; edges: Edge[] } {
  * and coerces the few numeric fields the API expects as real numbers rather
  * than the strings an <input> produces.
  */
-const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy', 'testSize']);
+const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy', 'testSize', 'maxFanOut']);
+/** Config fields the API expects as a string array but the UI edits as a comma list. */
+const LIST_CONFIG_KEYS = new Set(['subgraph']);
 
 function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -244,6 +246,11 @@ function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown
     if (NUMERIC_CONFIG_KEYS.has(key) && typeof value === 'string') {
       const n = Number(value);
       if (!Number.isNaN(n)) out[key] = n;
+      continue;
+    }
+    if (LIST_CONFIG_KEYS.has(key) && typeof value === 'string') {
+      const items = value.split(',').map((s) => s.trim()).filter(Boolean);
+      if (items.length > 0) out[key] = items;
       continue;
     }
     out[key] = value;

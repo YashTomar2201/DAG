@@ -12,6 +12,7 @@ const PALETTE_ITEMS = [
   { type: 'torch.train',       label: 'Train',           accent: 'var(--node-train)' },
   { type: 'model.evaluate',    label: 'Evaluate',        accent: 'var(--node-evaluate)' },
   { type: 'registry.deploy',   label: 'Deploy',          accent: 'var(--node-deploy)' },
+  { type: 'flow.map',          label: 'Fan-out (map)',   accent: 'var(--node-preprocess)' },
 ];
 
 export function NodePalette() {

@@ -281,6 +281,89 @@ export async function findRunByIdempotencyKey(idempotencyKey: string): Promise<R
   return prisma.run.findUnique({ where: { idempotencyKey } });
 }
 
+/**
+ * Creates one fan-out child run (roadmap B3.2) in a single transaction:
+ *   - a `Run` with `parentRunId` / `fanOutIndex` (status PENDING),
+ *   - a pre-SUCCEEDED NodeRun for `seedNodeKey` (the `flow.map` node) carrying
+ *     the per-element input as its output, so the subgraph can reference it as
+ *     `{{ nodes.<seedNodeKey>.output.item }}`,
+ *   - one PENDING NodeRun per `subgraphKeys` entry.
+ *
+ * Idempotent on `idempotencyKey` (`${parentRunId}:${mapNodeKey}:${index}`): a
+ * crash mid-spawn that replays returns `{ created: false }` and the existing
+ * child, so children can never be double-created.
+ */
+export async function createFanOutChildRun(params: {
+  workflowVersionId: string;
+  parentRunId: string;
+  fanOutIndex: number;
+  subgraphKeys: string[];
+  seedNodeKey: string;
+  seedOutput: unknown;
+  idempotencyKey: string;
+}): Promise<{ run: Run; created: boolean }> {
+  const existing = await prisma.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+  if (existing) return { run: existing, created: false };
+
+  try {
+    const run = await prisma.$transaction(async (tx) => {
+      const child = await tx.run.create({
+        data: {
+          workflowVersionId: params.workflowVersionId,
+          triggeredBy: 'fanout',
+          idempotencyKey: params.idempotencyKey,
+          parentRunId: params.parentRunId,
+          fanOutIndex: params.fanOutIndex,
+        },
+      });
+      await tx.nodeRun.create({
+        data: {
+          runId: child.id,
+          nodeKey: params.seedNodeKey,
+          status: 'SUCCEEDED' as NodeStatus,
+          attempt: 0,
+          output: params.seedOutput as Prisma.InputJsonValue,
+          finishedAt: new Date(),
+        },
+      });
+      if (params.subgraphKeys.length > 0) {
+        await tx.nodeRun.createMany({
+          data: params.subgraphKeys.map((nodeKey) => ({
+            runId: child.id,
+            nodeKey,
+            status: 'PENDING' as NodeStatus,
+            attempt: 0,
+          })),
+        });
+      }
+      return child;
+    });
+    return { run, created: true };
+  } catch (err) {
+    // A concurrent spawn of the same index lost the unique-key race — return theirs.
+    const raced = await prisma.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+    if (raced) return { run: raced, created: false };
+    throw err;
+  }
+}
+
+/** Count of a parent's children that are not in a terminal RunStatus. Zero ⇒ join. */
+export async function countNonTerminalChildren(parentRunId: string): Promise<number> {
+  return prisma.run.count({
+    where: { parentRunId, status: { notIn: ['SUCCEEDED', 'FAILED', 'CANCELLED'] } },
+  });
+}
+
+/** Minimal parent-tree fields for a run, or null if the run doesn't exist. */
+export async function getRunTreeInfo(
+  runId: string,
+): Promise<{ parentRunId: string | null; fanOutIndex: number | null; idempotencyKey: string | null; status: string } | null> {
+  return prisma.run.findUnique({
+    where: { id: runId },
+    select: { parentRunId: true, fanOutIndex: true, idempotencyKey: true, status: true },
+  });
+}
+
 // ─── Fan-out run tree (roadmap B3) ──────────────────────────────────────────
 
 export interface ChildRunSummary {

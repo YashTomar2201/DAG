@@ -61,30 +61,28 @@ are not built — the webhook path is the extension point for them.
 
 ---
 
-## 3. Dynamic Fan-Out — schema landed (B3.1), execution pending (B3.2–B3.5)
+## 3. Dynamic Fan-Out — working (B3.1 + B3.2); output merge, cascade & UI pending (B3.3–B3.5)
 
-**Done (roadmap B3.1):** `Run` carries `parentRunId` / `fanOutIndex` with a self-relation and a
-`[parentRunId, status]` index; `GET /runs/:id` returns a `children` count summary (all-zero for
-an ordinary run) and `GET /runs/:id/children` pages child runs in `fanOutIndex` order. No
-execution behaviour changes yet — a `flow.map` node that actually spawns children is B3.2.
+**Done (roadmap B3.1 + B3.2):**
+- Run tree: `Run.parentRunId` / `fanOutIndex` self-relation + `[parentRunId, status]` index;
+  `GET /runs/:id` returns a `children` count summary, `GET /runs/:id/children` pages children.
+- `flow.map` node type (`{ overSource, subgraph, maxFanOut }`). When it succeeds, the
+  orchestrator spawns one child run per element of the resolved `overSource` array, each running
+  `subgraph` with the element seeded as `{{ nodes.<map>.output.item }}`. Children execute in
+  parallel across the worker fleet. The downstream node fires **exactly once**, after every child
+  is terminal, via an atomic Redis join claim, and receives
+  `map.output.fanOut = { childCount, succeeded, failed, cancelled }`. Spawn is idempotent
+  (`${parentRunId}:${mapKey}:${i}`), so a crash mid-spawn never double-creates children. Verified
+  by `apps/api/src/integration/fan-out.integration.test.ts`.
 
-**What exists:** The graph topology is fixed at version-creation time. Every node and edge is
-known before the run starts.
-
-**What is missing:** The ability for a node's output to determine how many downstream nodes run
-— e.g., "process each row in the dataset in parallel, with one worker per chunk." This pattern
-(map/reduce, scatter-gather, dynamic parallelism) is central to data pipeline use cases.
-
-**To close it:**
-- Extend `NodeRun` with a `parentRunId` / `fanOutIndex` so a single graph node can spawn a
-  sub-run of N clones of its downstream subgraph, one per output element.
-- The spawning node's completion handler would: (1) read `output.chunks[]`, (2) `createRun` N
-  child runs, (3) seed their in-degree counters, (4) dispatch them.
-- A collector/join node type would wait for all N child runs to reach a terminal state and merge
-  their outputs before the parent run's downstream nodes are unlocked.
-- This is a large surface-area change: it affects the schema (`Run.parentRunId`), the
-  orchestrator (`startRun` with a fan-out context), the UI (rendering nested run trees), and the
-  SSE event stream (hierarchical run events).
+**Still missing:**
+- **B3.3** — a `flow.reduce` node that aggregates the children's *outputs* (ordered by
+  `fanOutIndex`), respecting the 64 KB cap by passing artifact references not payloads. Today the
+  downstream node only gets the count summary.
+- **B3.4** — failure/cancellation cascade: fail-fast policy (one child fails → cancel siblings,
+  fail the parent), cancel propagating to child runs, and retry re-spawning only failed children.
+- **B3.5** — UI: a progress pill on the map node instead of N canvas nodes, and a child-run
+  drill-in.
 
 ---
 

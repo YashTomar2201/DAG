@@ -759,3 +759,56 @@ one key — no consumer breaks.
 finished first, and the UI list is far more readable indexed 0..N than by a
 jittery completion order. Cursor pagination is on `id` (unique), which is stable
 under that sort.
+
+---
+
+## B3.2 — Dynamic Fan-Out: Spawn & Summary Join (`apps/api`, `packages/queue`)
+
+### Decision: subgraph nodes live only in child runs; the parent run excludes them
+
+`startRun` computes the union of every `flow.map` node's `subgraph` and drops
+those keys from the parent run's NodeRuns *and* from its in-degree seeding
+(edges touching a subgraph key are ignored). Otherwise a subgraph node would
+sit `PENDING` in the parent forever and `allNodeRunsTerminal(parent)` could
+never be true. The parent run therefore only tracks the "control" nodes
+(the splitter, the `flow.map`, the downstream join); the per-element work
+happens entirely in child runs.
+
+**Authoring contract:** the parent graph is `… → map → downstream`. Subgraph
+nodes are connected only among themselves and reference the map node's
+per-element output as `{{ nodes.<mapKey>.output.item }}`. Wiring a subgraph node
+into the parent's edge flow is unsupported (a follow-up can validate it at
+version-creation time).
+
+### Decision: the per-element input is a pre-SUCCEEDED seed NodeRun, not a new resolver feature
+
+`createFanOutChildRun` seeds the child with a **SUCCEEDED** NodeRun for the
+`flow.map` key whose `output` is `{ item, index, count }`. The existing Phase-7
+context resolver then resolves `{{ nodes.<mapKey>.output.item }}` in the
+subgraph's config with zero changes — the resolver already walks the run's own
+NodeRun map. No `{{ fanout.* }}` special form, no schema column for the element.
+
+### Decision: the executor reports only a count; the orchestrator re-resolves the array
+
+`flow.map`'s executor returns `{ count }`, never the array. A 1000-element
+array would blow the 64 KB `assertOutputSize` cap. `spawnFanOut` re-resolves
+`overSource` itself via `resolveNodeInputs` — deterministic, because parent
+outputs are immutable once `SUCCEEDED`.
+
+### Decision: idempotency key `${parentRunId}:${mapKey}:${i}`; join claim in Redis
+
+Spawn is replay-safe: `createFanOutChildRun` returns `{ created: false }` for an
+existing key, so a crash mid-spawn that re-delivers the `flow.map` completion
+can't double-create children. The **join** is the real race — N children
+finishing at once all observe "no siblings left". `claimFanOutJoin` (`SADD`
+returns 1 once) picks the single winner that decrements the downstream node's
+in-degree. The count itself needs no lock: each child commits its terminal
+status before it queries, so the *last* committer always sees zero and fires
+the claim; the `SADD` only breaks ties among true simultaneous finishers.
+
+### Decision: B3.2 joins on a summary even when children fail
+
+A failed child still counts toward the join; the downstream node runs with
+`map.output.fanOut = { childCount, succeeded, failed, cancelled }`. The
+fail-fast policy ("one child fails → cancel siblings, fail the parent") is
+B3.4, opt-in via a `failureThreshold`.

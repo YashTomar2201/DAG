@@ -29,6 +29,7 @@ export {
   TorchTrainConfigSchema,
   ModelEvaluateConfigSchema,
   RegistryDeployConfigSchema,
+  FlowMapConfigSchema,
 } from './node-types';
 export type {
   NodeDef,
@@ -39,6 +40,7 @@ export type {
   TorchTrainConfig,
   ModelEvaluateConfig,
   RegistryDeployConfig,
+  FlowMapConfig,
 } from './node-types';
 
 // Graph schema with structural refinements (also exports EdgeDefSchema, EdgeDef)

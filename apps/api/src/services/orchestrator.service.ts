@@ -7,6 +7,10 @@ import {
   getNodeRunMap,
   allNodeRunsTerminal,
   appendRunEvent,
+  createFanOutChildRun,
+  countNonTerminalChildren,
+  getRunTreeInfo,
+  getChildRunSummary,
 } from '@dag/db';
 import type { Prisma, WorkflowVersion } from '@dag/db';
 import {
@@ -14,13 +18,14 @@ import {
   decrementInDegree,
   markParentActive,
   hasActiveParent,
+  claimFanOutJoin,
   queueForType,
   createJobId,
   publishRunEvent,
 } from '@dag/queue';
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
-import type { Graph, NodeDef, NodeType, RunEventType } from '@dag/contracts';
+import type { Graph, NodeDef, NodeType, RunEventType, FlowMapConfig } from '@dag/contracts';
 import type { NodeRun } from '@dag/db';
 import {
   resolveNodeInputs,
@@ -60,6 +65,39 @@ function getChildren(graph: Graph, nodeKey: string): string[] {
   return graph.edges.filter((e) => e.from === nodeKey).map((e) => e.to);
 }
 
+// ─── Fan-out helpers (roadmap B3.2) ──────────────────────────────────────────
+
+const DEFAULT_MAX_FAN_OUT = 1000;
+
+/**
+ * Node keys that belong to some `flow.map` node's `subgraph`. These run ONLY
+ * inside child runs — the parent run gets no NodeRun for them, and its
+ * in-degree seeding ignores every edge that touches one. Otherwise a subgraph
+ * node would sit PENDING in the parent forever and the parent run could never
+ * reach a terminal state.
+ */
+function fanOutSubgraphKeys(graph: Graph): Set<string> {
+  const keys = new Set<string>();
+  for (const n of graph.nodes) {
+    if (n.type === 'flow.map') {
+      for (const k of (n.config as FlowMapConfig).subgraph ?? []) keys.add(k);
+    }
+  }
+  return keys;
+}
+
+/** `${parentRunId}:${mapNodeKey}:${index}` → its parts. Node keys can't contain ':'. */
+function parseFanOutIdemKey(
+  key: string | null,
+): { parentRunId: string; mapNodeKey: string; index: number } | null {
+  if (!key) return null;
+  const parts = key.split(':');
+  if (parts.length !== 3) return null;
+  const index = Number(parts[2]);
+  if (!Number.isInteger(index)) return null;
+  return { parentRunId: parts[0]!, mapNodeKey: parts[1]!, index };
+}
+
 function emitAndLog(runId: string, type: RunEventType, payload: Record<string, unknown>, nodeKey?: string) {
   // 1. Fire and forget the Redis pub/sub for real-time UI
   publishRunEvent(runId, { runId, nodeKey, type, payload, ts: Date.now() })
@@ -85,10 +123,18 @@ export async function startRun(
   if (!version) throw new NotFoundError('WorkflowVersion', workflowVersionId);
 
   const graph = getGraphFromVersion(version);
-  const nodeKeys = graph.nodes.map((n) => n.key);
+
+  // Nodes that live inside a `flow.map` subgraph run only in child runs — the
+  // parent run gets no NodeRun for them and ignores their edges (B3.2).
+  const subgraphKeys = fanOutSubgraphKeys(graph);
+  const controlNodes = graph.nodes.filter((n) => !subgraphKeys.has(n.key));
+  const controlEdges = graph.edges.filter(
+    (e) => !subgraphKeys.has(e.from) && !subgraphKeys.has(e.to),
+  );
+  const nodeKeys = controlNodes.map((n) => n.key);
 
   // 1. Create Run + NodeRuns (idempotent). `triggeredBy` records the origin:
-  //    'api' (a POST /runs), 'schedule', or 'webhook'.
+  //    'api' (a POST /runs), 'schedule', 'webhook', or 'fanout' (a child run).
   const run = await createRun(
     workflowVersionId,
     opts.triggeredBy ?? 'api',
@@ -118,17 +164,17 @@ export async function startRun(
   logger.info({ runId: run.id }, 'Run started');
   emitAndLog(run.id, 'RUN_STARTED', { startedAt: new Date() });
 
-  // 2. Seed in-degrees in Redis
-  await seedInDegrees(run.id, graph.edges);
+  // 2. Seed in-degrees in Redis (control edges only)
+  await seedInDegrees(run.id, controlEdges);
 
   // 3. Find initial ready set (in-degree 0) and dispatch
   const inDegreeCounts = new Map<string, number>();
-  for (const edge of graph.edges) {
+  for (const edge of controlEdges) {
     inDegreeCounts.set(edge.to, (inDegreeCounts.get(edge.to) || 0) + 1);
   }
-  
-  const initialNodes = graph.nodes.filter((n) => !inDegreeCounts.has(n.key));
-  
+
+  const initialNodes = controlNodes.filter((n) => !inDegreeCounts.has(n.key));
+
   for (const node of initialNodes) {
     await dispatchNode(run.id, node.key, graph, version.id);
   }
@@ -234,11 +280,16 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
   const graph = getGraphFromVersion(version);
   observeNodeDuration(nr.startedAt, getNodeFromGraph(graph, nodeKey).type, 'succeeded');
 
-  // 2. Propagate to children — evaluate each outgoing edge's condition, mark
-  //    active parents, decrement in-degree (always), and dispatch / skip.
+  // 2. Propagate. A `flow.map` node spawns child runs instead of propagating to
+  //    its downstream node (that decrement is deferred to the fan-out join);
+  //    every other node type propagates normally.
   try {
     const nodeRunMap = await getNodeRunMap(runId); // includes this node's just-persisted output
-    await propagateToChildren(runId, nodeKey, graph, version.id, nodeRunMap, /* parentActive */ true);
+    if (getNodeFromGraph(graph, nodeKey).type === 'flow.map') {
+      await spawnFanOut(runId, nodeKey, graph, version.id, nodeRunMap);
+    } else {
+      await propagateToChildren(runId, nodeKey, graph, version.id, nodeRunMap, /* parentActive */ true);
+    }
   } catch (err) {
     if (err instanceof UnresolvedTemplateError || err instanceof ConditionTypeError) {
       logger.error({ runId, nodeKey, err: err.message }, 'Condition evaluation failed — aborting run');
@@ -256,6 +307,9 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
       emitAndLog(runId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
     }
   }
+
+  // 5. If this is a fan-out child that just went terminal, maybe fire the join.
+  await checkFanOutJoinIfChild(runId);
 }
 
 export interface NodeFailure {
@@ -319,6 +373,203 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
     if (failed) {
       logger.info({ runId }, 'Run failed');
       emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason: `Node ${nodeKey} failed` });
+    }
+  }
+
+  // A failed fan-out child still counts toward the join (B3.2 joins on a
+  // summary; B3.4 adds the fail-fast policy).
+  await checkFanOutJoinIfChild(runId);
+}
+
+// ─── Dynamic fan-out — spawn & join (roadmap B3.2) ───────────────────────────
+
+/**
+ * Called from `onNodeSucceeded` when a `flow.map` node completes. Resolves the
+ * `overSource` array, then for each element `i` creates a child run of the
+ * node's `subgraph` with the element seeded as
+ * `{{ nodes.<mapNodeKey>.output.item }}`. The downstream node's in-degree is
+ * NOT touched here — that happens once, at `joinFanOut`, after every child is
+ * terminal.
+ *
+ * Idempotency: each child's key is `${parentRunId}:${mapNodeKey}:${i}`, so a
+ * crash mid-spawn that replays re-enters here and `createFanOutChildRun`
+ * returns the already-created children untouched.
+ */
+export async function spawnFanOut(
+  runId: string,
+  mapNodeKey: string,
+  graph: Graph,
+  versionId: string,
+  nodeRunMap: Map<string, NodeRun>,
+): Promise<void> {
+  const mapNode = getNodeFromGraph(graph, mapNodeKey);
+  const config = mapNode.config as FlowMapConfig;
+
+  // The executor only reported a count; re-resolve the array here (immutable
+  // parent outputs make this deterministic, and it dodges the 64 KB output cap).
+  const resolved = resolveNodeInputs(graph, mapNodeKey, nodeRunMap);
+  const items = resolved['overSource'];
+  if (!Array.isArray(items)) {
+    await abortRun(runId, `flow.map "${mapNodeKey}": overSource did not resolve to an array`);
+    return;
+  }
+
+  const maxFanOut = config.maxFanOut ?? DEFAULT_MAX_FAN_OUT;
+  if (items.length > maxFanOut) {
+    await abortRun(
+      runId,
+      `flow.map "${mapNodeKey}": fan-out of ${items.length} exceeds maxFanOut ${maxFanOut}`,
+    );
+    return;
+  }
+
+  const subgraphKeys = config.subgraph ?? [];
+  const unknown = subgraphKeys.filter((k) => !graph.nodes.some((n) => n.key === k));
+  if (unknown.length > 0) {
+    await abortRun(runId, `flow.map "${mapNodeKey}": subgraph references unknown node(s) ${unknown.join(', ')}`);
+    return;
+  }
+  if (subgraphKeys.includes(mapNodeKey)) {
+    await abortRun(runId, `flow.map "${mapNodeKey}": subgraph cannot contain the map node itself`);
+    return;
+  }
+
+  // Edges internal to the subgraph → child-run in-degrees.
+  const subEdges = graph.edges.filter(
+    (e) => subgraphKeys.includes(e.from) && subgraphKeys.includes(e.to),
+  );
+  const inDeg = new Map<string, number>();
+  for (const e of subEdges) inDeg.set(e.to, (inDeg.get(e.to) ?? 0) + 1);
+  const roots = subgraphKeys.filter((k) => !inDeg.has(k));
+
+  emitAndLog(runId, 'NODE_LOG', { line: `flow.map: fanning out over ${items.length} element(s)` }, mapNodeKey);
+
+  // Zero elements: nothing to run — join straight away with an empty summary.
+  if (items.length === 0) {
+    await joinFanOut(runId, mapNodeKey, graph, versionId);
+    return;
+  }
+
+  for (let i = 0; i < items.length; i++) {
+    const idempotencyKey = `${runId}:${mapNodeKey}:${i}`;
+    const { run: child, created } = await createFanOutChildRun({
+      workflowVersionId: versionId,
+      parentRunId: runId,
+      fanOutIndex: i,
+      subgraphKeys,
+      seedNodeKey: mapNodeKey,
+      seedOutput: { item: items[i], index: i, count: items.length },
+      idempotencyKey,
+    });
+    if (!created) continue; // replay — this child already exists (and may be running/done)
+
+    await tryTransitionRun(child.id, 'PENDING', 'RUNNING', { startedAt: new Date() });
+    await seedInDegrees(child.id, subEdges);
+    for (const rootKey of roots) {
+      await dispatchNode(child.id, rootKey, graph, versionId);
+    }
+  }
+
+  // A replay after every child was already created still needs to check the
+  // join — the crash may have happened after the last child finished.
+  await maybeJoinAfterSpawn(runId, mapNodeKey, graph, versionId);
+}
+
+/** After a (possibly replayed) spawn, fire the join if every child is already terminal. */
+async function maybeJoinAfterSpawn(
+  parentRunId: string,
+  mapNodeKey: string,
+  graph: Graph,
+  versionId: string,
+): Promise<void> {
+  const remaining = await countNonTerminalChildren(parentRunId);
+  if (remaining === 0) {
+    const total = (await getChildRunSummary(parentRunId)).total;
+    if (total > 0) await joinFanOut(parentRunId, mapNodeKey, graph, versionId);
+  }
+}
+
+/**
+ * A fan-out child reached a terminal state. If no siblings remain non-terminal,
+ * fire the join exactly once (Redis `claimFanOutJoin` picks the single winner
+ * among simultaneous last-finishers).
+ */
+async function checkFanOutJoinIfChild(childRunId: string): Promise<void> {
+  const info = await getRunTreeInfo(childRunId);
+  if (!info?.parentRunId) return;
+  const parsed = parseFanOutIdemKey(info.idempotencyKey);
+  if (!parsed) return;
+  const { parentRunId, mapNodeKey } = parsed;
+
+  if (await countNonTerminalChildren(parentRunId) > 0) return;
+
+  const parent = await prisma.run.findUnique({
+    where: { id: parentRunId },
+    select: { workflowVersionId: true, status: true },
+  });
+  if (!parent) return;
+  const version = await prisma.workflowVersion.findUnique({ where: { id: parent.workflowVersionId } });
+  if (!version) return;
+
+  await joinFanOut(parentRunId, mapNodeKey, getGraphFromVersion(version), version.id);
+}
+
+/**
+ * The join. Merges a `{ childCount, succeeded, failed }` summary onto the map
+ * node's output, then propagates to the downstream node through the normal
+ * atomic in-degree path — so it fires exactly once, after all children.
+ */
+async function joinFanOut(
+  parentRunId: string,
+  mapNodeKey: string,
+  graph: Graph,
+  versionId: string,
+): Promise<void> {
+  if (!(await claimFanOutJoin(parentRunId, mapNodeKey))) return; // another finisher won
+
+  const summary = await getChildRunSummary(parentRunId);
+  const mapNr = await findNodeRun(parentRunId, mapNodeKey);
+  if (mapNr) {
+    const prev = (mapNr.output ?? {}) as Record<string, unknown>;
+    await prisma.nodeRun.update({
+      where: { id: mapNr.id },
+      data: {
+        output: {
+          ...prev,
+          fanOut: {
+            childCount: summary.total,
+            succeeded: summary.succeeded,
+            failed: summary.failed,
+            cancelled: summary.cancelled,
+          },
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  emitAndLog(
+    parentRunId,
+    'NODE_LOG',
+    { line: `flow.map: joined — ${summary.succeeded}/${summary.total} child run(s) succeeded` },
+    mapNodeKey,
+  );
+
+  try {
+    const nodeRunMap = await getNodeRunMap(parentRunId); // now carries the merged fanOut summary
+    await propagateToChildren(parentRunId, mapNodeKey, graph, versionId, nodeRunMap, /* parentActive */ true);
+  } catch (err) {
+    if (err instanceof UnresolvedTemplateError || err instanceof ConditionTypeError) {
+      await abortRun(parentRunId, err.message);
+      return;
+    }
+    throw err;
+  }
+
+  if (await allNodeRunsTerminal(parentRunId)) {
+    const done = await tryTransitionRun(parentRunId, 'RUNNING', 'SUCCEEDED', { finishedAt: new Date() });
+    if (done) {
+      logger.info({ runId: parentRunId }, 'Run succeeded');
+      emitAndLog(parentRunId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
     }
   }
 }
@@ -402,4 +653,7 @@ async function abortRun(runId: string, reason: string): Promise<void> {
     logger.info({ runId, reason }, 'Run failed (condition error)');
     emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason });
   }
+
+  // An aborted fan-out child is still terminal — let the parent's join proceed.
+  await checkFanOutJoinIfChild(runId);
 }

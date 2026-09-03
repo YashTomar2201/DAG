@@ -158,6 +158,18 @@ export function IconHistory(p: IconProps) {
   );
 }
 
+export function IconFanOut(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <circle cx="5" cy="12" r="2" />
+      <circle cx="19" cy="5" r="2" />
+      <circle cx="19" cy="12" r="2" />
+      <circle cx="19" cy="19" r="2" />
+      <path d="M7 12h4M11 12l6-6M11 12h6M11 12l6 6" />
+    </svg>
+  );
+}
+
 export function IconClock(p: IconProps) {
   return (
     <svg {...base(p)}>
@@ -230,4 +242,5 @@ export const NODE_ICON: Record<string, (p: IconProps) => JSX.Element> = {
   'torch.train': IconTrain,
   'model.evaluate': IconEvaluate,
   'registry.deploy': IconDeploy,
+  'flow.map': IconFanOut,
 };

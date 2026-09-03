@@ -91,6 +91,26 @@ export const RegistryDeployConfigSchema = z.object({
   weightsPath: z.string().min(1).optional(),
 });
 
+/**
+ * `flow.map` — dynamic fan-out (roadmap B3.2). The node's resolved
+ * `overSource` array decides how many child runs execute: one per element, each
+ * running `subgraph` (a set of node keys from the same graph) with the element
+ * injected as `{{ nodes.<this-key>.output.item }}`. The downstream node fires
+ * once, after every child reaches a terminal state, and receives a count
+ * summary on this node's output (`output.fanOut`).
+ *
+ * The heavy lifting is in the orchestrator, not the worker — the executor just
+ * validates that `overSource` resolved to an array and reports its length.
+ */
+export const FlowMapConfigSchema = z.object({
+  /** Template ref (or literal) that must resolve to an array, e.g. "{{ nodes.split.output.chunks }}". */
+  overSource: z.string().min(1),
+  /** Node keys (from this graph) that make up the per-element subgraph. Non-empty. */
+  subgraph: z.array(z.string().min(1)).min(1),
+  /** Hard cap on child runs; a longer array fails the run. Default 1000, absolute max 10000. */
+  maxFanOut: z.coerce.number().int().positive().max(10_000).optional(),
+});
+
 // ─── Node type discriminated union ─────────────────────────────────────────
 // Using z.discriminatedUnion so TypeScript narrows the config type when you
 // switch/match on `node.type`. The worker's executor registry switches on this
@@ -102,6 +122,7 @@ export const NODE_TYPES = [
   'torch.train',
   'model.evaluate',
   'registry.deploy',
+  'flow.map',
 ] as const;
 
 export type NodeType = (typeof NODE_TYPES)[number];
@@ -159,6 +180,10 @@ export const NodeDefSchema = z.discriminatedUnion('type', [
     type: z.literal('registry.deploy'),
     config: RegistryDeployConfigSchema,
   }),
+  NodeDefBaseSchema.extend({
+    type: z.literal('flow.map'),
+    config: FlowMapConfigSchema,
+  }),
 ]);
 
 export type NodeDef = z.infer<typeof NodeDefSchema>;
@@ -169,3 +194,4 @@ export type PandasPreprocessConfig = z.infer<typeof PandasPreprocessConfigSchema
 export type TorchTrainConfig = z.infer<typeof TorchTrainConfigSchema>;
 export type ModelEvaluateConfig = z.infer<typeof ModelEvaluateConfigSchema>;
 export type RegistryDeployConfig = z.infer<typeof RegistryDeployConfigSchema>;
+export type FlowMapConfig = z.infer<typeof FlowMapConfigSchema>;

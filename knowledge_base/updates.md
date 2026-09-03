@@ -5,6 +5,72 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B3.2: dynamic fan-out (spawn + summary join)
+
+**Phase:** roadmap B3.2. A `flow.map` node now spawns one child run per element
+of its resolved source array; the downstream node fires exactly once, after
+every child is terminal, with a count summary.
+
+### Changes
+
+- **`packages/contracts/src/node-types.ts`** — new `flow.map` node type +
+  `FlowMapConfigSchema` `{ overSource (template ref to an array), subgraph
+  (node keys, non-empty), maxFanOut? (default 1000, abs max 10000) }`. Added to
+  `NODE_TYPES` and the `NodeDef` discriminated union.
+- **`apps/worker/src/executors.ts`** — `flowMap` executor: fails fast if
+  `overSource` isn't an array or exceeds the 10 000 hard ceiling, logs the
+  length, returns `{ count }` only (the orchestrator re-resolves the array —
+  echoing 1000 elements would blow the 64 KB output cap). `queueForType` routes
+  `flow.map` to `ioQueue`.
+- **`packages/db/src/repositories.ts`** —
+  - `createFanOutChildRun({...})` — one transaction: a child `Run`
+    (`parentRunId` / `fanOutIndex`, `triggeredBy: 'fanout'`), a **pre-SUCCEEDED**
+    NodeRun for the map key carrying `{ item, index, count }` (so the subgraph
+    references it as `{{ nodes.<map>.output.item }}`), and PENDING NodeRuns for
+    the subgraph. Idempotent on `${parentRunId}:${mapKey}:${i}`.
+  - `countNonTerminalChildren(parentRunId)`, `getRunTreeInfo(runId)`.
+- **`packages/queue/src/lua.ts`** — `claimFanOutJoin(parentRunId, mapKey)`:
+  Redis `SADD` returns 1 for exactly one caller, so among simultaneous
+  last-finishers only one runs the join.
+- **`apps/api/src/services/orchestrator.service.ts`** —
+  - `startRun` excludes every `flow.map` subgraph key from the parent run's
+    NodeRuns and in-degree seeding (a subgraph node would otherwise sit PENDING
+    in the parent forever).
+  - `onNodeSucceeded`: a `flow.map` node calls `spawnFanOut` instead of
+    `propagateToChildren` — the downstream in-degree decrement is deferred to
+    the join.
+  - `spawnFanOut` re-resolves `overSource`, guards `maxFanOut` / unknown
+    subgraph keys (→ `abortRun`), then per element `createFanOutChildRun` →
+    `RUNNING` → seed subgraph in-degrees → dispatch subgraph roots. Replay-safe.
+  - `checkFanOutJoinIfChild` (called from `onNodeSucceeded` / `onNodeFailed` /
+    `abortRun` on every terminal run): if no siblings remain non-terminal,
+    `joinFanOut` merges `{ childCount, succeeded, failed, cancelled }` onto the
+    map node's output and runs the normal `propagateToChildren` — so the
+    downstream node dispatches once.
+- **`apps/web`** — `flow.map` in the palette (`Fan-out (map)`), `IconFanOut`,
+  `ConfigPanel` fields (over / subgraph / maxFanOut). `graphSlice.sanitizeConfig`
+  now coerces `maxFanOut` to a number and splits `subgraph` (`"a, b"` → `["a","b"]`).
+
+### Verification
+
+- `apps/api/src/integration/fan-out.integration.test.ts` (5), real
+  Postgres/Redis/2 workers: a `data.source → flow.map → data.source` graph with
+  `overSource = {{ nodes.split.output.columns }}` (the ~12-column titanic
+  header) → **12 child runs, all SUCCEEDED, `triggeredBy: 'fanout'`, contiguous
+  `fanOutIndex`**; `work` NodeRuns span **≥2 workerIds** (parallel); each
+  child's seed carries the right `item`/`index`; the downstream `merge` node ran
+  **once** (`attempt: 0`), after the last child, with
+  `map.output.fanOut = { childCount: 12, succeeded: 12, failed: 0 }`; the parent
+  has **no** `work` NodeRun; **replaying `spawnFanOut` creates zero duplicate
+  children** and doesn't re-run `merge`.
+- Full integration suite: 11 files / 33 tests green. `pnpm -r typecheck` /
+  `lint` / unit tests all green.
+
+### Rebuild note
+
+`@dag/contracts` changed → both `api` and `worker` images need
+`docker compose build api worker`. No schema change.
+
 ## 2026-09-04 — B3.1: run-tree schema + read paths
 
 **Phase:** roadmap B3.1. Purely additive groundwork for dynamic fan-out

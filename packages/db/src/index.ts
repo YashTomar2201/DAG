@@ -32,6 +32,9 @@ export {
   // Fan-out run tree (B3)
   getChildRunSummary,
   listChildRuns,
+  createFanOutChildRun,
+  countNonTerminalChildren,
+  getRunTreeInfo,
   // NodeRun lifecycle
   tryTransitionNodeRun,
   findNodeRun,

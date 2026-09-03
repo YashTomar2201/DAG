@@ -347,6 +347,36 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
   return receipt;
 }
 
+// ─── flow.map ────────────────────────────────────────────────────────────────
+
+/**
+ * `flow.map` (roadmap B3.2). The real fan-out work — spawning child runs and
+ * joining on them — lives in the orchestrator. All this executor does is fail
+ * fast if the source didn't resolve to an array, enforce an absolute ceiling,
+ * and report the length so the UI has a count. The orchestrator re-resolves
+ * the array itself, so it is deliberately NOT echoed here (a 1000-element
+ * array would blow the 64 KB output cap).
+ */
+const FLOW_MAP_HARD_CEILING = 10_000;
+
+async function flowMap(ctx: ExecutorContext): Promise<ExecutorOutput> {
+  const items = ctx.input['overSource'];
+  if (!Array.isArray(items)) {
+    throw new UnrecoverableError(
+      `flow.map: overSource did not resolve to an array (got ${items === null ? 'null' : typeof items}). ` +
+        `Point overSource at a node output that is an array, e.g. "{{ nodes.split.output.chunks }}".`,
+    );
+  }
+  if (items.length > FLOW_MAP_HARD_CEILING) {
+    throw new UnrecoverableError(
+      `flow.map: ${items.length} elements exceeds the absolute ${FLOW_MAP_HARD_CEILING} ceiling. ` +
+        `Chunk the input upstream.`,
+    );
+  }
+  ctx.onLog(`flow.map: ${items.length} element(s) to fan out over`);
+  return { count: items.length };
+}
+
 // ─── Registry ─────────────────────────────────────────────────────────────────
 
 /**
@@ -367,4 +397,5 @@ export const executors: ExecutorRegistry = {
   'torch.train': torchTrain,
   'model.evaluate': modelEvaluate,
   'registry.deploy': registryDeploy,
+  'flow.map': flowMap,
 };

@@ -122,3 +122,26 @@ export async function hasActiveParent(runId: string, childKey: string): Promise<
   const key = `run:${runId}:activeParents:${childKey}`;
   return (await connection.scard(key)) > 0;
 }
+
+// ─── Fan-out join claim (roadmap B3.2) ──────────────────────────────────────
+//
+// When the last of N fan-out child runs reaches a terminal state, several
+// siblings can observe "no children left" at the same instant. Exactly one of
+// them must run the join (decrement the downstream node's in-degree, merge the
+// summary). `claimFanOutJoin` is that gate: `SADD` returns 1 for the first
+// caller and 0 for every other, so only the winner proceeds. Keyed by
+// (parentRunId, mapNodeKey) so a graph with two `flow.map` nodes joins each
+// independently.
+
+const FANOUT_JOIN_TTL = 7 * 24 * 3600;
+
+/** Returns true for exactly one caller per (parentRunId, mapNodeKey); false for the rest. */
+export async function claimFanOutJoin(parentRunId: string, mapNodeKey: string): Promise<boolean> {
+  const key = `run:${parentRunId}:fanoutJoined`;
+  const p = connection.pipeline();
+  p.sadd(key, mapNodeKey);
+  p.expire(key, FANOUT_JOIN_TTL);
+  const res = await p.exec();
+  // res[0] = [err, saddResult]; sadd returns 1 if the member was added, 0 if it already existed
+  return res?.[0]?.[1] === 1;
+}
