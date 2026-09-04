@@ -12,7 +12,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
 import { UnrecoverableError } from 'bullmq';
 import type {
   DataSourceConfig,
@@ -25,31 +24,13 @@ import type {
 import type { ExecutorContext, ExecutorOutput, ExecutorRegistry } from './executor-types';
 import { runPython } from './python-bridge';
 import { logger } from './logger';
+import { joinKey, readJson, readText, writeJson, sha256, sha256OfPath, pathExists } from './artifact-store';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Computes SHA-256 of a file. Used for idempotency short-circuit checks:
- * if the file exists and its checksum matches the expected value, we know
- * the previous run completed correctly and we can skip re-downloading.
- */
-function sha256File(filePath: string): string {
-  const hash = crypto.createHash('sha256');
-  hash.update(fs.readFileSync(filePath));
-  return `sha256:${hash.digest('hex')}`;
-}
-
-/**
- * Atomic write: write to `{path}.tmp`, then `fs.renameSync`.
- * A crash between write and rename leaves the `.tmp` file, not a partial
- * target. On restart, the `.tmp` is ignored (the target doesn't exist yet),
- * so the executor re-runs cleanly.
- */
-function atomicWriteJson(targetPath: string, data: unknown): void {
-  const tmp = `${targetPath}.tmp`;
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, targetPath);
+/** Every executor's outputs live under this key prefix (roadmap C1.1). */
+function prefix(ctx: ExecutorContext): string {
+  return joinKey(ctx.runId, ctx.nodeKey);
 }
 
 /**
@@ -102,17 +83,17 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
     csvPath: (ctx.input['csvPath'] as string | undefined) ?? raw.csvPath,
     url: (ctx.input['url'] as string | undefined) ?? raw.url,
   };
-  const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const csvOut = path.join(destDir, 'data.csv');
-  const resultPath = path.join(destDir, 'result.json');
+  const key = prefix(ctx);
+  const csvKey = joinKey(key, 'data.csv');
+  const resultKey = joinKey(key, 'result.json');
 
   // Idempotency: a prior attempt in this run already fetched + validated it.
-  if (fs.existsSync(resultPath)) {
+  if (await ctx.store.exists(resultKey)) {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'data.source: cache hit');
-    return JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    return readJson(ctx.store, resultKey);
   }
 
-  fs.mkdirSync(destDir, { recursive: true });
+  const destDir = await ctx.store.localPath(key);
 
   let sourceType: 'url' | 'local';
   let source: string;
@@ -139,8 +120,7 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
       if (buf.byteLength > MAX_CSV_BYTES) {
         throw new UnrecoverableError(`data.source: ${config.url} is ${buf.byteLength} bytes, over the ${MAX_CSV_BYTES} limit`);
       }
-      fs.writeFileSync(`${csvOut}.tmp`, buf);
-      fs.renameSync(`${csvOut}.tmp`, csvOut);
+      await ctx.store.put(csvKey, buf);
     } catch (err) {
       if (err instanceof UnrecoverableError) throw err;
       const msg = err instanceof Error ? err.message : String(err);
@@ -150,6 +130,12 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
       ctx.signal.removeEventListener('abort', onCancel);
     }
   } else {
+    // A locally-configured or bundled CSV is an *external input*, not an
+    // artifact this store manages — it lives on the worker's own disk (the
+    // repo image or an operator-mounted path), so this is the one place an
+    // executor still touches `fs` directly. It gets read into a buffer and
+    // handed to `store.put()` immediately, so from here on it's a normal
+    // store-managed artifact like the URL branch above.
     sourceType = 'local';
     source = config.csvPath ?? path.relative(process.cwd(), BUNDLED_CSV);
     const src = config.csvPath ? resolveLocalCsv(config.csvPath) : BUNDLED_CSV;
@@ -160,12 +146,11 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
       throw new UnrecoverableError(`data.source: ${src} is over the ${MAX_CSV_BYTES}-byte limit`);
     }
     ctx.onLog(`[data.source] copying ${src}`);
-    fs.copyFileSync(src, `${csvOut}.tmp`);
-    fs.renameSync(`${csvOut}.tmp`, csvOut);
+    await ctx.store.put(csvKey, fs.readFileSync(src));
   }
 
   // ── Validate it parses as CSV ────────────────────────────────────────────
-  const text = fs.readFileSync(csvOut, 'utf8');
+  const text = await readText(ctx.store, csvKey);
   const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
   if (lines.length < 2) {
     throw new UnrecoverableError(`data.source: ${source} has no data rows (got ${lines.length} non-empty line(s))`);
@@ -177,17 +162,17 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const rows = lines.length - 1;
 
   const result: ExecutorOutput = {
-    csvPath: csvOut,
+    csvPath: await ctx.store.localPath(csvKey),
     rows,
     columns,
     bytes: Buffer.byteLength(text, 'utf8'),
-    checksum: sha256File(csvOut),
+    checksum: await sha256(ctx.store, csvKey),
     sourceType,
     source,
     outputDir: destDir,
   };
   ctx.onLog(`[data.source] ${sourceType}: ${rows} rows x ${columns.length} cols`);
-  atomicWriteJson(resultPath, result);
+  await writeJson(ctx.store, resultKey, result);
   return result;
 }
 
@@ -195,16 +180,16 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
 
 async function pandasPreprocess(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const config = ctx.config as PandasPreprocessConfig;
-  const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const resultPath = path.join(destDir, 'result.json');
+  const key = prefix(ctx);
+  const resultKey = joinKey(key, 'result.json');
 
   // Idempotency: if a previous run already wrote result.json, reuse it
-  if (fs.existsSync(resultPath)) {
+  if (await ctx.store.exists(resultKey)) {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'pandas.preprocess: cache hit');
-    return JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    return readJson(ctx.store, resultKey);
   }
 
-  fs.mkdirSync(destDir, { recursive: true });
+  const destDir = await ctx.store.localPath(key);
 
   const output = await runPython({
     scriptPath: config.scriptPath ?? 'preprocess.py',
@@ -217,8 +202,7 @@ async function pandasPreprocess(ctx: ExecutorContext): Promise<ExecutorOutput> {
     onLog: ctx.onLog,
   });
 
-  // Persist result atomically
-  atomicWriteJson(resultPath, output);
+  await writeJson(ctx.store, resultKey, output);
   return output as ExecutorOutput;
 }
 
@@ -226,17 +210,17 @@ async function pandasPreprocess(ctx: ExecutorContext): Promise<ExecutorOutput> {
 
 async function torchTrain(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const config = ctx.config as TorchTrainConfig;
-  const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const weightsPath = path.join(destDir, config.outputWeightsPath ?? 'model.pt');
-  const resultPath = path.join(destDir, 'result.json');
+  const key = prefix(ctx);
+  const resultKey = joinKey(key, 'result.json');
 
   // Idempotency: if weights exist, the training completed
-  if (fs.existsSync(resultPath)) {
+  if (await ctx.store.exists(resultKey)) {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'torch.train: cache hit');
-    return JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    return readJson(ctx.store, resultKey);
   }
 
-  fs.mkdirSync(destDir, { recursive: true });
+  const destDir = await ctx.store.localPath(key);
+  const weightsPath = path.join(destDir, config.outputWeightsPath ?? 'model.pt');
 
   // Long-running → send heartbeats every 15 s to prevent stall detection
   const stopHeartbeat = startHeartbeat(ctx, 15_000);
@@ -260,7 +244,7 @@ async function torchTrain(ctx: ExecutorContext): Promise<ExecutorOutput> {
       },
     });
 
-    atomicWriteJson(resultPath, output);
+    await writeJson(ctx.store, resultKey, output);
     return output as ExecutorOutput;
   } finally {
     stopHeartbeat();
@@ -271,19 +255,18 @@ async function torchTrain(ctx: ExecutorContext): Promise<ExecutorOutput> {
 
 async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const config = ctx.config as ModelEvaluateConfig;
-  const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const resultPath = path.join(destDir, 'result.json');
+  const key = prefix(ctx);
+  const resultKey = joinKey(key, 'result.json');
 
   // Idempotency: reuse the metrics from a prior attempt in this run so a retry
   // (e.g. after the quality gate below rejected the run) doesn't re-load the
   // model and re-score the test set. The gate is re-applied to the cached
   // metrics below — a cache hit must never let a sub-threshold model through.
   let output: Record<string, unknown>;
-  if (fs.existsSync(resultPath)) {
+  if (await ctx.store.exists(resultKey)) {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'model.evaluate: cache hit — re-checking gate');
-    output = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+    output = await readJson(ctx.store, resultKey);
   } else {
-    fs.mkdirSync(destDir, { recursive: true });
     output = (await runPython({
       scriptPath: config.scriptPath ?? 'evaluate.py',
       input: { ...ctx.input, kwargs: config.kwargs ?? {} },
@@ -292,7 +275,7 @@ async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
     })) as Record<string, unknown>;
     // Persist BEFORE the gate so a rejected run still leaves the real metrics
     // on disk for the retry short-circuit and for debugging.
-    atomicWriteJson(resultPath, output);
+    await writeJson(ctx.store, resultKey, output);
   }
 
   // Quality gate — enforced on every execution, cache hit or not.
@@ -313,16 +296,13 @@ async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
 
 async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
   const config = ctx.config as RegistryDeployConfig;
-  const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-  const receiptPath = path.join(destDir, 'deploy-receipt.json');
+  const receiptKey = joinKey(prefix(ctx), 'deploy-receipt.json');
 
   // Idempotency: check if already deployed by this exact run
-  if (fs.existsSync(receiptPath)) {
+  if (await ctx.store.exists(receiptKey)) {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'registry.deploy: already deployed');
-    return JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
+    return readJson(ctx.store, receiptKey);
   }
-
-  fs.mkdirSync(destDir, { recursive: true });
 
   // Locate the model weights from upstream input. The path can be threaded
   // explicitly via a `weightsPath` template in the node config
@@ -330,7 +310,7 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
   // a deploy receipt rather than failing the whole run — a missing checksum is
   // not a reason to red-flag an otherwise successful pipeline.
   const weightsPath = ctx.input['weightsPath'] as string | undefined;
-  const weightsExist = !!weightsPath && fs.existsSync(weightsPath);
+  const weightsExist = !!weightsPath && (await pathExists(weightsPath));
   if (weightsPath && !weightsExist) {
     logger.warn(
       { runId: ctx.runId, nodeKey: ctx.nodeKey, weightsPath },
@@ -344,7 +324,7 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
     );
   }
 
-  const checksum = weightsExist ? sha256File(weightsPath!) : null;
+  const checksum = weightsExist ? await sha256OfPath(weightsPath!) : null;
 
   // In production this would call the registry API; for now we write a receipt
   const receipt: ExecutorOutput = {
@@ -356,7 +336,7 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
     runId: ctx.runId,
   };
 
-  atomicWriteJson(receiptPath, receipt);
+  await writeJson(ctx.store, receiptKey, receipt);
   logger.info({ modelTag: config.modelTag, checksum }, 'registry.deploy: deployed');
   return receipt;
 }
@@ -435,18 +415,22 @@ async function flowReduce(ctx: ExecutorContext): Promise<ExecutorOutput> {
         `Set it to "{{ nodes.<map>.output.resultsPath }}".`,
     );
   }
-  if (!fs.existsSync(resultsPath)) {
+  // The orchestrator (apps/api) wrote this file directly under the same
+  // shared ARTIFACT_DIR root at the fan-out join — recover it as a store key
+  // rather than touching `fs`, so it goes through the same idempotency/read
+  // path as everything else here.
+  const resultsKey = path.relative(ctx.artifactDir, resultsPath).split(path.sep).join('/');
+  if (!(await ctx.store.exists(resultsKey))) {
     throw new UnrecoverableError(`flow.reduce: results file not found at ${resultsPath}`);
   }
-  const elements = JSON.parse(fs.readFileSync(resultsPath, 'utf8')) as unknown[];
+  const elements = await readJson<unknown[]>(ctx.store, resultsKey);
   ctx.onLog(`flow.reduce(${config.mode}): folding ${elements.length} element(s)`);
 
   if (config.mode === 'concat') {
     const flat = elements.flatMap((el) => (Array.isArray(el) ? el : [el]));
-    const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
-    const outPath = path.join(destDir, 'reduced.json');
-    atomicWriteJson(outPath, flat);
-    return { mode: 'concat', count: flat.length, resultsPath: outPath };
+    const outKey = joinKey(prefix(ctx), 'reduced.json');
+    await writeJson(ctx.store, outKey, flat);
+    return { mode: 'concat', count: flat.length, resultsPath: await ctx.store.localPath(outKey) };
   }
 
   const nums: number[] = [];

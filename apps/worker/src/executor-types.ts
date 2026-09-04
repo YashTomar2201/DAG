@@ -13,6 +13,7 @@
 
 import type { Job } from 'bullmq';
 import type { JobPayload, NodeType } from '@dag/contracts';
+import type { ArtifactStore } from './artifact-store';
 
 export interface ExecutorContext {
   /** The resolved, literal input (already had templates substituted in Phase 7) */
@@ -22,8 +23,10 @@ export interface ExecutorContext {
   /** `{runId}:{nodeKey}` — use this to build deterministic artifact paths */
   runId: string;
   nodeKey: string;
-  /** Artifact root on the shared volume */
+  /** Artifact root on the shared volume (roadmap C1.1: prefer `store` for reads/writes; this stays around only to compute relative keys). */
   artifactDir: string;
+  /** All artifact reads/writes go through this (roadmap C1.1) — never call `fs` directly in an executor. */
+  store: ArtifactStore;
   /** The BullMQ job — used for heartbeats (`job.extendLock()`, `job.updateProgress()`) */
   job: Job<JobPayload>;
   /**

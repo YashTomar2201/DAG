@@ -24,6 +24,10 @@ import { executors } from './executors';
 import type { ExecutorContext } from './executor-types';
 import { PythonCancelledError } from './python-bridge';
 import { exponentialJitter } from './backoff';
+import { createArtifactStore } from './artifact-store';
+
+/** One store for the whole process (roadmap C1.1) — cheap to construct, but no need to redo it per job. */
+const artifactStore = createArtifactStore(env.ARTIFACT_BACKEND, env.ARTIFACT_DIR);
 
 /** How often a running worker polls the run's hard-cancel flag (roadmap B4). */
 const CANCEL_POLL_MS = 5_000;
@@ -103,6 +107,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     input: (input ?? {}) as Record<string, unknown>,
     config: (config ?? {}) as Record<string, unknown>,
     artifactDir: env.ARTIFACT_DIR,
+    store: artifactStore,
     job,
     signal: controller.signal,
     onLog: (line: string) => {

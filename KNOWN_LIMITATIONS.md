@@ -96,7 +96,7 @@ already recursive for it), and `flow.reduce mode: 'custom'` (a user aggregation 
 
 ---
 
-## 4. Artifact Storage Is a Shared Volume, Not Object Storage
+## 4. Artifact Storage Is a Shared Volume, Not Object Storage — 🟡 IN PROGRESS (roadmap C1.1 done, C1.2 open)
 
 **What exists:** Workers write large outputs (datasets, model weights) to a shared Docker named
 volume (`artifact_data` mounted at `/data/artifacts` in every worker container). This works
@@ -108,15 +108,23 @@ containers on one node) or across cloud regions, a host-local or Compose-local v
 accessible from all workers. `preprocess` on Node A writing a file that `train` on Node B needs
 to read would fail silently — Node B simply would not have the file.
 
-**To close it:**
-- Replace the shared volume with an object-storage backend (S3, GCS, Azure Blob) as the artifact
-  store. Workers call `s3.putObject` on write and `s3.getObject` on read, with the artifact path
-  stored as the S3 key in `NodeRun.output`.
-- The `ARTIFACT_DIR` env var abstraction already exists — only the read/write implementation in
-  the executors and `python-bridge.ts` would change.
-- For a Kubernetes deployment: use a `PersistentVolumeClaim` with a `ReadWriteMany` storage class
-  (NFS, EFS, or a CSI driver) as a cheaper intermediate step, though object storage is the correct
-  long-term answer for elasticity.
+**C1.1 (done):** All five reference executors and `flow.reduce` now go through
+`apps/worker/src/artifact-store.ts` (`ArtifactStore` interface + `FsArtifactStore`) instead of
+calling `fs` directly — a pure refactor, behaviour unchanged, selected via `ARTIFACT_BACKEND=fs`.
+This makes the remaining gap a backend swap, not a rewrite of every executor.
+
+**To close it (C1.2, still open):**
+- Implement `S3ArtifactStore` against `@aws-sdk/client-s3`, selected via `ARTIFACT_BACKEND=s3`.
+  Add MinIO to `infra/docker-compose.yml` so local dev needs no cloud account; keep `fs` working
+  so tests don't need MinIO.
+- Python scripts stay backend-agnostic: the Node executor downloads inputs to a temp dir via
+  `localPath()` before spawning and uploads outputs via `put()` after — `boto3` never enters the
+  Python scripts themselves.
+- Store the S3 key (not a local path) in `NodeRun.output` so the UI can render a presigned
+  download link per artifact.
+- For a Kubernetes deployment without object storage: a `PersistentVolumeClaim` with a
+  `ReadWriteMany` storage class (NFS, EFS, or a CSI driver) is a cheaper intermediate step, though
+  object storage is the correct long-term answer for elasticity.
 
 ---
 

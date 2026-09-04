@@ -1011,3 +1011,50 @@ store, has its own `updateNodeRetryPolicy` action, and is spread onto the
 serialised `NodeDef` by `toGraph()` / restored by `graphToFlow()` — the same
 pattern edge `condition` uses (B1.2). A blank field is dropped so the engine
 default applies.
+
+---
+
+## C1.1 — Extract the Artifact-Store Interface (`apps/worker`)
+
+### Decision: one narrow interface (`put`/`get`/`exists`/`localPath`), not a full filesystem shim
+
+The temptation with an abstraction like this is to make it look like `fs` —
+`readdir`, `stat`, `mkdir`, arbitrary paths. That would leak the *filesystem's*
+shape into the interface, which defeats the point: an S3 bucket doesn't have
+directories, `stat`, or rename semantics. Every real call site only ever did
+one of four things to an artifact: write it, read it, check whether it
+exists, or get a real local path for a Python script to read/write through.
+So the interface is exactly those four operations, keyed by a `/`-joined
+string relative to the store's root — small enough that `FsArtifactStore` and
+a future `S3ArtifactStore` (C1.2) can both implement it completely, with
+nothing left over that only one of them can do.
+
+### Decision: `localPath()` does not create anything on disk
+
+An earlier draft had `FsArtifactStore.localPath(key)` eagerly `mkdir -p` its
+resolved path, on the theory that "give me a local path" implies "make sure
+it's usable." That broke `flow.reduce`: it writes `reduced.json` via
+`store.put()`, then calls `store.localPath()` on that same key just to report
+the path in its output — and `mkdir` on a path that already exists as a *file*
+throws `EEXIST`. The fix is that `localPath()` promises nothing about what
+exists at that path; it's a pure resolver (for `fs`) or a download-to-temp-dir
+step (for `s3`, in C1.2). Callers that need a *directory* to exist rely on
+what already made it true before this refactor — Python's own
+`os.makedirs(outputDir, exist_ok=True)` — and callers writing a single known
+file go through `put()`, which creates its own parent directory. No call site
+needed `localPath()` to have side effects; the bug was inventing a contract
+nothing actually required.
+
+### Decision: `data.source`'s *local/bundled* CSV lookup stays on `fs`, on purpose
+
+The "Done when" checkbox says no executor calls `fs` directly — but
+`resolveLocalCsv`/`BUNDLED_CSV` aren't reading a *stored artifact*, they're
+locating an external input that lives on the worker's own disk (an
+operator-configured path, or the dataset baked into the image). That file
+gets read into a `Buffer` and `store.put()`'d immediately — one line
+later it's a completely normal store-managed artifact like the URL-fetch
+branch. Routing the *lookup* itself through the store would mean inventing a
+second, parallel "external source" concept inside `ArtifactStore` for a case
+that will look identical under `S3ArtifactStore` (the worker's own disk is
+still local disk, regardless of where finished artifacts live) — not a
+meaningful step toward C1.2.

@@ -8,6 +8,8 @@ const EnvSchema = z.object({
   DATABASE_URL: z.string().url('DATABASE_URL must be a valid PostgreSQL connection string'),
   REDIS_URL: z.string().url('REDIS_URL must be a valid Redis connection string'),
   ARTIFACT_DIR: z.string().min(1).default('./artifacts'),
+  /** Which ArtifactStore backend to use (roadmap C1). Only 'fs' exists until C1.2 adds 's3'. */
+  ARTIFACT_BACKEND: z.enum(['fs']).default('fs'),
   /**
    * Number of concurrent jobs this worker process will handle.
    * Recommended: io=8, cpu=4, gpu=1 (set differently per container)

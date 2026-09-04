@@ -5,6 +5,62 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-05 — C1.1: extract the artifact-store interface
+
+**Phase:** roadmap C1.1. Pure refactor, no behaviour change. Every executor
+wrote artifacts (datasets, model weights, JSON results) straight to the shared
+Docker volume via raw `fs.readFileSync`/`writeFileSync`/`existsSync` calls
+scattered across `executors.ts`. That's fine on one host, but it hard-codes
+"all workers share a filesystem" into every executor — the assumption that
+breaks on Kubernetes (roadmap C1.2), where workers run on different physical
+nodes with no shared disk. This phase pulls every one of those calls behind a
+single narrow interface so C1.2 (an S3/MinIO backend) is a one-file addition
+instead of a re-audit of five executors.
+
+### Changes
+
+- **`apps/worker/src/artifact-store.ts`** (new) — `ArtifactStore` interface
+  (`put`/`get`/`exists`/`localPath`/optional `presignedUrl`), `FsArtifactStore`
+  (today's only implementation — same atomic `tmp → rename` write every
+  executor used to do by hand), plus convenience helpers (`readJson`,
+  `writeJson`, `sha256`, `joinKey`) so call sites read the same as before.
+  `sha256OfPath`/`pathExists` cover the one case that isn't a store-managed
+  key: `registry.deploy` checksumming an upstream node's `weightsPath`, which
+  is an absolute path handed in via resolved input, not a key this store
+  allocated.
+- **`apps/worker/src/executor-types.ts`** — `ExecutorContext.store: ArtifactStore`.
+  `artifactDir` stays (still needed to turn an absolute path — e.g. the
+  results file the orchestrator wrote — back into a relative store key).
+- **`apps/worker/src/env.ts`** — `ARTIFACT_BACKEND: z.enum(['fs']).default('fs')`.
+  Only `'fs'` exists until C1.2 adds `'s3'`.
+- **`apps/worker/src/worker.ts`** — constructs one `ArtifactStore` per process
+  (`createArtifactStore(env.ARTIFACT_BACKEND, env.ARTIFACT_DIR)`) and puts it
+  on every `ExecutorContext`.
+- **`apps/worker/src/executors.ts`** — `data.source`, `pandas.preprocess`,
+  `torch.train`, `model.evaluate`, `registry.deploy`, and `flow.reduce` all
+  route their idempotency checks, reads, and writes through `ctx.store`
+  instead of `fs`. The one remaining direct `fs` use is `data.source`
+  resolving a *locally-configured or bundled* CSV — that's an external input
+  living on the worker's own disk (the repo image, or an operator-mounted
+  path), not an artifact the store manages, so it's read into a buffer and
+  handed to `store.put()` immediately.
+- `localPath()` deliberately does **not** create anything on disk for the fs
+  backend — Python scripts already `os.makedirs(outputDir, exist_ok=True)`
+  themselves, and `put()` creates its own parent directory. Keeping it a pure
+  path resolver avoided a real bug during implementation: an earlier draft had
+  `localPath` eagerly `mkdir`-ing its resolved path, which corrupted the
+  `flow.reduce` "write `reduced.json`, then ask for its local path" sequence
+  (`mkdir` on an existing *file* path throws `EEXIST`).
+
+### Why this is safe to call "no behaviour change"
+
+Every produced file lands at the exact same disk path as before (`ARTIFACT_DIR/{runId}/{nodeKey}/...`) —
+`FsArtifactStore` just resolves `key` under that same root. The full
+integration suite (15 files / 45 tests, including `full-pipeline.integration.test.ts`,
+which runs all five reference executors end-to-end) passed unchanged.
+
+---
+
 ## 2026-09-04 — B5: per-node retry policy (was dead schema)
 
 **Phase:** roadmap B5. `RetryPolicySchema` (attempts / baseDelay / cap) sat on
