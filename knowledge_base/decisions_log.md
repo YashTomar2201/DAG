@@ -847,3 +847,49 @@ arbitrarily large, so it can't go inline either. `sum`/`mean` fold a numeric
 return `{ mode, field, value, count }`, which is always tiny. `custom` (a
 user script) is deferred — the roadmap lists it but B3.3's "real aggregate"
 bar is met by the built-in folds.
+
+---
+
+## B3.4 — Fan-Out Failure & Cancellation Cascade (`apps/api`)
+
+### Decision: fail-fast by default, `failureThreshold` to opt into tolerance
+
+`FlowMapConfig.failureThreshold` defaults to `0`: the first failed child run
+cancels every still-running sibling and aborts the parent (skipping the
+downstream reduce node). A pipeline where one shard's failure invalidates the
+aggregate — the common case — should stop wasting compute immediately. Setting
+`failureThreshold: N` flips to tolerate-partial: the join fires once every child
+is terminal as long as `failed <= N`, and the downstream node runs on
+`map.output.fanOut = { succeeded, failed, ... }` (the results file has `null`
+for each failed child's slot).
+
+### Decision: `abortRun` owns the child-run cancel; `spawnFanOut` sweeps the race
+
+`abortRun` (called on threshold breach, and on an unevaluable condition)
+`cancelChildRunsOf(runId)` before it skips pending nodes. But `spawnFanOut` runs
+on a *different* async stack — a child created in the window between abort's
+cancel query and spawn's next parent-status check would be left RUNNING. So
+`spawnFanOut` also checks the parent status every iteration (`break` if not
+RUNNING) and, after the loop, sweeps once more with `cancelChildRunsOf` if the
+parent is no longer RUNNING. Belt and suspenders; no orphan child survives a
+fail-fast.
+
+### Decision: retry resets failed children in place, keyed by the same idem key
+
+`retryFanOutChildren` finds a `flow.map`'s `FAILED`/`CANCELLED` children by
+`idempotencyKey` prefix (`${parentRunId}:${mapKey}:`), resets each in place —
+subgraph NodeRuns back to `PENDING` (`attempt++`), the pre-SUCCEEDED map seed
+left alone, Redis `dispatched` set cleared (`clearDispatched`), in-degrees
+re-seeded, roots re-dispatched — and releases the join claim
+(`clearFanOutJoinClaim`) so the join re-fires when the retried children finish.
+Reusing the child run (not deleting + recreating with a fresh key) keeps its
+history and its `fanOutIndex`, and matches how `retryFailedNodesService` already
+resets a FAILED node. Survivor children are never touched, so retry re-runs
+*only* what failed.
+
+### Decision: `data.source` reads resolved input for `csvPath` / `url`
+
+`data.source` was reading `ctx.config` (raw), so a `{{ … }}` ref in `csvPath` /
+`url` silently never resolved. It now prefers `ctx.input` (the control plane's
+resolved copy), falling back to `ctx.config` — the same pattern `registry.deploy`
+uses. Fixes a latent bug and is what lets a fan-out seed a per-child input path.

@@ -235,7 +235,7 @@ function graphToFlow(graph: Graph): { nodes: Node<NodeData>[]; edges: Edge[] } {
  * and coerces the few numeric fields the API expects as real numbers rather
  * than the strings an <input> produces.
  */
-const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy', 'testSize', 'maxFanOut']);
+const NUMERIC_CONFIG_KEYS = new Set(['epochs', 'minAccuracy', 'testSize', 'maxFanOut', 'failureThreshold']);
 /** Config fields the API expects as a string array but the UI edits as a comma list. */
 const LIST_CONFIG_KEYS = new Set(['subgraph']);
 

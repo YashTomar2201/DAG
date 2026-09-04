@@ -44,9 +44,10 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'weightsPath', label: 'Weights Ref (optional)', type: 'text', placeholder: '{{ nodes.<train>.output.weightsPath }}' },
   ],
   'flow.map': [
-    { key: 'overSource', label: 'Over (array ref)',      type: 'text',   placeholder: '{{ nodes.split.output.chunks }}' },
-    { key: 'subgraph',   label: 'Subgraph node keys',    type: 'text',   placeholder: 'process, score  (comma-separated)' },
-    { key: 'maxFanOut',  label: 'Max fan-out',           type: 'number', placeholder: '1000' },
+    { key: 'overSource',       label: 'Over (array ref)',        type: 'text',   placeholder: '{{ nodes.split.output.chunks }}' },
+    { key: 'subgraph',         label: 'Subgraph node keys',      type: 'text',   placeholder: 'process, score  (comma-separated)' },
+    { key: 'maxFanOut',        label: 'Max fan-out',             type: 'number', placeholder: '1000' },
+    { key: 'failureThreshold', label: 'Failed children allowed', type: 'number', placeholder: '0  (fail-fast)' },
   ],
   'flow.reduce': [
     { key: 'over',  label: 'Results ref',            type: 'text', placeholder: '{{ nodes.map.output.resultsPath }}' },

@@ -145,3 +145,18 @@ export async function claimFanOutJoin(parentRunId: string, mapNodeKey: string): 
   // res[0] = [err, saddResult]; sadd returns 1 if the member was added, 0 if it already existed
   return res?.[0]?.[1] === 1;
 }
+
+/** Releases a join claim so it can fire again — used when retrying failed children (B3.4). */
+export async function clearFanOutJoinClaim(parentRunId: string, mapNodeKey: string): Promise<void> {
+  await connection.srem(`run:${parentRunId}:fanoutJoined`, mapNodeKey);
+}
+
+/**
+ * Clears a run's `dispatched` set so its nodes can be re-enqueued (B3.4 retry).
+ * Without this, `decrementInDegree`'s `SADD dispatched` would return 0 for a
+ * node that ran on the first attempt and the retry would silently never
+ * re-dispatch it.
+ */
+export async function clearDispatched(runId: string): Promise<void> {
+  await connection.del(`run:${runId}:dispatched`);
+}

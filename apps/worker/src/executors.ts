@@ -94,7 +94,14 @@ function resolveLocalCsv(csvPath: string): string {
  * counts. No credentials, always runs.
  */
 async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
-  const config = ctx.config as DataSourceConfig;
+  const raw = ctx.config as DataSourceConfig;
+  // Prefer the resolved input: `csvPath` / `url` may be `{{ nodes.X.output.Y }}`
+  // template refs, which the control plane substitutes into `ctx.input` — the
+  // raw `ctx.config` still holds the un-substituted template.
+  const config: DataSourceConfig = {
+    csvPath: (ctx.input['csvPath'] as string | undefined) ?? raw.csvPath,
+    url: (ctx.input['url'] as string | undefined) ?? raw.url,
+  };
   const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
   const csvOut = path.join(destDir, 'data.csv');
   const resultPath = path.join(destDir, 'result.json');
@@ -361,11 +368,21 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
 const FLOW_MAP_HARD_CEILING = 10_000;
 
 async function flowMap(ctx: ExecutorContext): Promise<ExecutorOutput> {
-  const items = ctx.input['overSource'];
-  if (!Array.isArray(items)) {
+  const raw = ctx.input['overSource'];
+  let items: unknown[] | null = Array.isArray(raw) ? raw : null;
+  if (!items && typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) items = parsed;
+    } catch {
+      /* not a JSON array literal */
+    }
+  }
+  if (!items) {
     throw new UnrecoverableError(
-      `flow.map: overSource did not resolve to an array (got ${items === null ? 'null' : typeof items}). ` +
-        `Point overSource at a node output that is an array, e.g. "{{ nodes.split.output.chunks }}".`,
+      `flow.map: overSource did not resolve to an array (got ${raw === null ? 'null' : typeof raw}). ` +
+        `Point overSource at a node output that is an array, e.g. "{{ nodes.split.output.chunks }}", ` +
+        `or give it a JSON array literal.`,
     );
   }
   if (items.length > FLOW_MAP_HARD_CEILING) {

@@ -61,9 +61,9 @@ are not built — the webhook path is the extension point for them.
 
 ---
 
-## 3. Dynamic Fan-Out — working (B3.1–B3.3); failure cascade & UI pending (B3.4–B3.5)
+## 3. Dynamic Fan-Out — working (B3.1–B3.4); UI pending (B3.5)
 
-**Done (roadmap B3.1 + B3.2 + B3.3):**
+**Done (roadmap B3.1 – B3.4):**
 - Run tree: `Run.parentRunId` / `fanOutIndex` self-relation + `[parentRunId, status]` index;
   `GET /runs/:id` returns a `children` count summary, `GET /runs/:id/children` pages children.
 - `flow.map` node type (`{ overSource, subgraph, maxFanOut }`). When it succeeds, the
@@ -77,13 +77,15 @@ are not built — the webhook path is the extension point for them.
   sink output is collected (ordered by `fanOutIndex`) into a results file on the artifact volume
   and its path exposed as `map.output.resultsPath` — the array never touches `map.output`, so it
   is cap-safe for any N. `concat` flattens by reference; `sum`/`mean` fold a numeric dot-path
-  field. Verified by `apps/api/src/integration/fan-out{,-reduce}.integration.test.ts`.
+  field.
+- Failure & cancellation cascade: `FlowMapConfig.failureThreshold` (default 0 = fail-fast — the
+  first failed child cancels its siblings and fails the parent, skipping the downstream reduce
+  node; set N to tolerate up to N failures and join on a partial result). `POST /runs/:id/cancel`
+  cascades to the whole child-run subtree. `POST /runs/:id/retry-failed` re-spawns **only** the
+  failed/cancelled children of each `flow.map` node, in place. Verified by
+  `apps/api/src/integration/fan-out{,-reduce,-failure}.integration.test.ts`.
 
 **Still missing:**
-- **B3.4** — failure/cancellation cascade: fail-fast policy (one child fails → cancel siblings,
-  fail the parent, opt-in `failureThreshold`), cancel propagating to child runs, and retry
-  re-spawning only the failed children. Today a failed child still counts toward the join and the
-  downstream node runs on a partial summary.
 - **B3.5** — UI: a progress pill on the map node instead of N canvas nodes, and a child-run
   drill-in.
 

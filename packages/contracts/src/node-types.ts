@@ -109,6 +109,13 @@ export const FlowMapConfigSchema = z.object({
   subgraph: z.array(z.string().min(1)).min(1),
   /** Hard cap on child runs; a longer array fails the run. Default 1000, absolute max 10000. */
   maxFanOut: z.coerce.number().int().positive().max(10_000).optional(),
+  /**
+   * How many failed child runs to tolerate before the whole fan-out fails
+   * (roadmap B3.4). Default `0` = fail-fast: the first child failure cancels
+   * every still-running sibling and fails the parent run, skipping the
+   * downstream node. Set to N to let the join proceed with up to N failures.
+   */
+  failureThreshold: z.coerce.number().int().min(0).optional(),
 });
 
 /**

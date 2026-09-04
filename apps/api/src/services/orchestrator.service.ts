@@ -22,12 +22,15 @@ import {
   markParentActive,
   hasActiveParent,
   claimFanOutJoin,
+  clearFanOutJoinClaim,
+  clearDispatched,
   queueForType,
   createJobId,
   publishRunEvent,
 } from '@dag/queue';
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
+import { cancelChildRunsOf } from './cancel.service';
 import type { Graph, NodeDef, NodeType, RunEventType, FlowMapConfig } from '@dag/contracts';
 import type { NodeRun } from '@dag/db';
 import {
@@ -85,6 +88,17 @@ function subgraphSinkKeys(graph: Graph, subgraphKeys: string[]): string[] {
   return subgraphKeys.filter((k) => !hasSubOut.has(k));
 }
 
+/** The subgraph-internal edges and its root keys (no in-subgraph parent). */
+function subgraphExecPlan(
+  graph: Graph,
+  subgraphKeys: string[],
+): { subEdges: Graph['edges']; roots: string[] } {
+  const set = new Set(subgraphKeys);
+  const subEdges = graph.edges.filter((e) => set.has(e.from) && set.has(e.to));
+  const hasParent = new Set(subEdges.map((e) => e.to));
+  return { subEdges, roots: subgraphKeys.filter((k) => !hasParent.has(k)) };
+}
+
 /**
  * Node keys that belong to some `flow.map` node's `subgraph`. These run ONLY
  * inside child runs — the parent run gets no NodeRun for them, and its
@@ -100,6 +114,24 @@ function fanOutSubgraphKeys(graph: Graph): Set<string> {
     }
   }
   return keys;
+}
+
+/**
+ * Resolves a `flow.map` `overSource` to an array: either a template that
+ * resolved to an array, or a literal JSON array string (handy for small static
+ * fan-outs and test fixtures). Returns null if it is neither.
+ */
+function asFanOutArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      /* not JSON — fall through */
+    }
+  }
+  return null;
 }
 
 /** `${parentRunId}:${mapNodeKey}:${index}` → its parts. Node keys can't contain ':'. */
@@ -325,7 +357,7 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
   }
 
   // 5. If this is a fan-out child that just went terminal, maybe fire the join.
-  await checkFanOutJoinIfChild(runId);
+  await onFanOutChildTerminal(runId);
 }
 
 export interface NodeFailure {
@@ -394,7 +426,7 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
 
   // A failed fan-out child still counts toward the join (B3.2 joins on a
   // summary; B3.4 adds the fail-fast policy).
-  await checkFanOutJoinIfChild(runId);
+  await onFanOutChildTerminal(runId);
 }
 
 // ─── Dynamic fan-out — spawn & join (roadmap B3.2) ───────────────────────────
@@ -424,8 +456,8 @@ export async function spawnFanOut(
   // The executor only reported a count; re-resolve the array here (immutable
   // parent outputs make this deterministic, and it dodges the 64 KB output cap).
   const resolved = resolveNodeInputs(graph, mapNodeKey, nodeRunMap);
-  const items = resolved['overSource'];
-  if (!Array.isArray(items)) {
+  const items = asFanOutArray(resolved['overSource']);
+  if (!items) {
     await abortRun(runId, `flow.map "${mapNodeKey}": overSource did not resolve to an array`);
     return;
   }
@@ -451,12 +483,7 @@ export async function spawnFanOut(
   }
 
   // Edges internal to the subgraph → child-run in-degrees.
-  const subEdges = graph.edges.filter(
-    (e) => subgraphKeys.includes(e.from) && subgraphKeys.includes(e.to),
-  );
-  const inDeg = new Map<string, number>();
-  for (const e of subEdges) inDeg.set(e.to, (inDeg.get(e.to) ?? 0) + 1);
-  const roots = subgraphKeys.filter((k) => !inDeg.has(k));
+  const { subEdges, roots } = subgraphExecPlan(graph, subgraphKeys);
 
   emitAndLog(runId, 'NODE_LOG', { line: `flow.map: fanning out over ${items.length} element(s)` }, mapNodeKey);
 
@@ -467,6 +494,18 @@ export async function spawnFanOut(
   }
 
   for (let i = 0; i < items.length; i++) {
+    // Fail-fast (B3.4) can abort the parent while we are still spawning — an
+    // early child failure may already have run its course. Stop creating more
+    // children into a run that is no longer RUNNING.
+    const parentStatus = await prisma.run.findUnique({
+      where: { id: runId },
+      select: { status: true },
+    });
+    if (parentStatus?.status !== 'RUNNING') {
+      logger.info({ runId, mapNodeKey, spawned: i }, 'Fan-out spawn halted — parent no longer running');
+      break;
+    }
+
     const idempotencyKey = `${runId}:${mapNodeKey}:${i}`;
     const { run: child, created } = await createFanOutChildRun({
       workflowVersionId: versionId,
@@ -484,6 +523,15 @@ export async function spawnFanOut(
     for (const rootKey of roots) {
       await dispatchNode(child.id, rootKey, graph, versionId);
     }
+  }
+
+  // If a concurrent fail-fast aborted the parent while we spawned, a child
+  // created in the race window between abortRun's cancel sweep and our loop's
+  // status check can still be RUNNING — sweep it up.
+  const finalStatus = await prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
+  if (finalStatus?.status !== 'RUNNING') {
+    await cancelChildRunsOf(runId);
+    return;
   }
 
   // A replay after every child was already created still needs to check the
@@ -506,28 +554,59 @@ async function maybeJoinAfterSpawn(
 }
 
 /**
- * A fan-out child reached a terminal state. If no siblings remain non-terminal,
- * fire the join exactly once (Redis `claimFanOutJoin` picks the single winner
- * among simultaneous last-finishers).
+ * A fan-out child reached a terminal state. Two responsibilities (B3.4):
+ *
+ *   1. Failure policy — if this child FAILED and the number of failed children
+ *      now exceeds the map node's `failureThreshold` (default 0 = fail-fast),
+ *      cancel every still-running sibling and abort the parent run (which skips
+ *      the downstream reduce node).
+ *   2. Otherwise, fire the join once every sibling is terminal.
  */
-async function checkFanOutJoinIfChild(childRunId: string): Promise<void> {
+async function onFanOutChildTerminal(childRunId: string): Promise<void> {
   const info = await getRunTreeInfo(childRunId);
   if (!info?.parentRunId) return;
   const parsed = parseFanOutIdemKey(info.idempotencyKey);
   if (!parsed) return;
   const { parentRunId, mapNodeKey } = parsed;
 
-  if (await countNonTerminalChildren(parentRunId) > 0) return;
-
   const parent = await prisma.run.findUnique({
     where: { id: parentRunId },
     select: { workflowVersionId: true, status: true },
   });
-  if (!parent) return;
+  if (!parent || parent.status !== 'RUNNING') return; // parent already terminal — nothing to do
   const version = await prisma.workflowVersion.findUnique({ where: { id: parent.workflowVersionId } });
   if (!version) return;
+  const graph = getGraphFromVersion(version);
 
-  await joinFanOut(parentRunId, mapNodeKey, getGraphFromVersion(version), version.id);
+  // 1. Failure policy.
+  if (info.status === 'FAILED') {
+    const config = getNodeFromGraph(graph, mapNodeKey).config as FlowMapConfig;
+    const threshold = config.failureThreshold ?? 0;
+    const summary = await getChildRunSummary(parentRunId);
+    if (summary.failed > threshold) {
+      logger.warn(
+        { parentRunId, mapNodeKey, failed: summary.failed, threshold },
+        'Fan-out failure threshold exceeded — cancelling siblings and failing the run',
+      );
+      emitAndLog(
+        parentRunId,
+        'NODE_LOG',
+        { line: `flow.map: ${summary.failed} child run(s) failed (threshold ${threshold}) — aborting` },
+        mapNodeKey,
+      );
+      // abortRun cancels the child-run subtree, skips the pending downstream
+      // nodes, and fails the parent.
+      await abortRun(
+        parentRunId,
+        `flow.map "${mapNodeKey}": ${summary.failed} child run(s) failed (threshold ${threshold})`,
+      );
+      return;
+    }
+  }
+
+  // 2. Join once all siblings are terminal.
+  if ((await countNonTerminalChildren(parentRunId)) > 0) return;
+  await joinFanOut(parentRunId, mapNodeKey, graph, version.id);
 }
 
 /**
@@ -542,6 +621,17 @@ async function joinFanOut(
   versionId: string,
 ): Promise<void> {
   if (!(await claimFanOutJoin(parentRunId, mapNodeKey))) return; // another finisher won
+
+  // A fail-fast abort (B3.4) can land between the claim and here; never resume
+  // a run that is no longer RUNNING.
+  const parentStatus = await prisma.run.findUnique({
+    where: { id: parentRunId },
+    select: { status: true },
+  });
+  if (parentStatus?.status !== 'RUNNING') {
+    await clearFanOutJoinClaim(parentRunId, mapNodeKey);
+    return;
+  }
 
   const summary = await getChildRunSummary(parentRunId);
 
@@ -612,6 +702,79 @@ async function joinFanOut(
   }
 }
 
+/**
+ * Re-spawns ONLY the FAILED / CANCELLED child runs of each `flow.map` node in a
+ * run (roadmap B3.4). Called by `retryFailedNodesService` after it has reset the
+ * parent's own FAILED / SKIPPED nodes and flipped the run back to RUNNING.
+ *
+ * Each bad child is reset in place — its subgraph NodeRuns go back to PENDING
+ * (attempt++), the pre-SUCCEEDED map-seed NodeRun is left untouched, its Redis
+ * dispatch state is cleared and in-degrees re-seeded, and its roots are
+ * re-dispatched. The map node's join claim is released so the join fires again
+ * once every child (old survivors + retried ones) is terminal.
+ */
+export async function retryFanOutChildren(parentRunId: string, versionId: string): Promise<number> {
+  const version = await prisma.workflowVersion.findUnique({ where: { id: versionId } });
+  if (!version) return 0;
+  const graph = getGraphFromVersion(version);
+  const mapNodes = graph.nodes.filter((n) => n.type === 'flow.map');
+  if (mapNodes.length === 0) return 0;
+
+  let respawned = 0;
+  for (const mapNode of mapNodes) {
+    const subgraphKeys = (mapNode.config as FlowMapConfig).subgraph ?? [];
+    const { subEdges, roots } = subgraphExecPlan(graph, subgraphKeys);
+
+    const badChildren = await prisma.run.findMany({
+      where: {
+        parentRunId,
+        idempotencyKey: { startsWith: `${parentRunId}:${mapNode.key}:` },
+        status: { in: ['FAILED', 'CANCELLED'] },
+      },
+      select: { id: true },
+    });
+    if (badChildren.length === 0) continue;
+
+    for (const child of badChildren) {
+      const nrs = await prisma.nodeRun.findMany({
+        where: { runId: child.id, nodeKey: { in: subgraphKeys } },
+        select: { id: true, attempt: true },
+      });
+      for (const nr of nrs) {
+        await prisma.nodeRun.update({
+          where: { id: nr.id },
+          data: {
+            status: 'PENDING',
+            attempt: nr.attempt + 1,
+            error: undefined,
+            startedAt: null,
+            finishedAt: null,
+          },
+        });
+      }
+      await prisma.run.update({
+        where: { id: child.id },
+        data: { status: 'RUNNING', startedAt: new Date(), finishedAt: null },
+      });
+      await clearDispatched(child.id);
+      await seedInDegrees(child.id, subEdges);
+      for (const rootKey of roots) {
+        try {
+          await dispatchNode(child.id, rootKey, graph, versionId);
+        } catch (err) {
+          logger.error({ childRunId: child.id, rootKey, err }, 'retry: fan-out child root dispatch failed');
+        }
+      }
+      respawned += 1;
+    }
+
+    await clearFanOutJoinClaim(parentRunId, mapNode.key);
+  }
+
+  if (respawned > 0) logger.info({ parentRunId, respawned }, 'Re-spawned failed fan-out children');
+  return respawned;
+}
+
 // ─── Conditional-edge propagation (B1.1) ──────────────────────────────────────
 
 /**
@@ -673,12 +836,14 @@ async function skipNode(
 }
 
 /**
- * Aborts a run when a condition can't be evaluated (unresolved ref / type
- * error). Skips every still-pending node and transitions the run to FAILED —
- * a broken condition is the user's graph bug, surfaced loudly, not silently
- * treated as false.
+ * Aborts a run: cancels its fan-out child-run subtree (B3.4), skips every
+ * still-pending node, and transitions the run to FAILED. Used for an
+ * unevaluable condition (the user's graph bug, surfaced loudly) and for a
+ * fan-out that breached its failure threshold.
  */
 async function abortRun(runId: string, reason: string): Promise<void> {
+  await cancelChildRunsOf(runId);
+
   const nodeRunMap = await getNodeRunMap(runId);
   for (const [key, nr] of nodeRunMap) {
     if (nr.status === 'PENDING' || nr.status === 'QUEUED') {
@@ -693,5 +858,5 @@ async function abortRun(runId: string, reason: string): Promise<void> {
   }
 
   // An aborted fan-out child is still terminal — let the parent's join proceed.
-  await checkFanOutJoinIfChild(runId);
+  await onFanOutChildTerminal(runId);
 }

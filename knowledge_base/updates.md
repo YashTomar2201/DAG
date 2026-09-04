@@ -5,6 +5,72 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B3.4: fan-out failure & cancellation cascade
+
+**Phase:** roadmap B3.4. A failed child now fails the fan-out (or is tolerated
+per config); cancelling the parent cancels the whole child subtree; retry
+re-spawns only the failed children.
+
+### Changes
+
+- **`packages/contracts`** — `FlowMapConfig.failureThreshold` (default `0` =
+  fail-fast: the first failed child cancels its siblings and fails the parent;
+  set to N to tolerate up to N failures and let the join proceed on a partial
+  result).
+- **`apps/api/src/services/cancel.service.ts`** (new) — `cancelOneRun`,
+  `cancelChildRunsOf` (depth-first over `parentRunId`), `cancelRunTree`. Own
+  module so `run.service` and `orchestrator.service` share it without an import
+  cycle. `run.service.cancelRunService` is now a thin wrapper over
+  `cancelRunTree` — `POST /runs/:id/cancel` cascades to child runs.
+- **`apps/api/src/services/orchestrator.service.ts`** —
+  - `checkFanOutJoinIfChild` → `onFanOutChildTerminal`: if a child FAILED and
+    `failed > threshold`, `abortRun(parent)`; otherwise join once all siblings
+    are terminal. Guards added so a join can't resume a parent that a race
+    aborted.
+  - `abortRun` now cancels the run's child-run subtree first (via
+    `cancelChildRunsOf`) before skipping pending nodes.
+  - `spawnFanOut` checks the parent status each iteration and sweeps any
+    race-window child after the loop — fail-fast can't leave an orphan child
+    RUNNING.
+  - `retryFanOutChildren(parentRunId, versionId)` (exported): for each
+    `flow.map` node, reset every FAILED/CANCELLED child in place (subgraph
+    NodeRuns → PENDING, attempt++), clear its Redis dispatch state, re-seed
+    in-degrees, re-dispatch roots, and release the join claim. Called by
+    `retryFailedNodesService` after it resets the parent's own FAILED/SKIPPED
+    nodes.
+  - `overSource` now also accepts a **JSON array literal** (small static
+    fan-outs / fixtures), not only a template that resolves to an array.
+- **`packages/queue/src/lua.ts`** — `clearFanOutJoinClaim` (SREM) and
+  `clearDispatched` (DEL `run:{id}:dispatched`, so retried nodes re-enqueue).
+- **`apps/worker/src/executors.ts`** — `data.source` now reads the **resolved**
+  `csvPath` / `url` from `ctx.input` (falling back to `ctx.config`), so a
+  `{{ nodes.X.output.Y }}` ref in those fields actually resolves — matches how
+  `registry.deploy` already reads its input. (Latent bug fixed in passing;
+  needed for per-child fan-out inputs.)
+- **`apps/web`** — `flow.map` config panel gains a "Failed children allowed"
+  field; `failureThreshold` added to the numeric-coercion set.
+
+### Verification
+
+- `apps/api/src/integration/fan-out-failure.integration.test.ts` (4):
+  - **A. fail-fast** — one child fails at its gate, siblings (sitting in a slow
+    node) are CANCELLED, the parent run FAILS, `reduce` + `merge` are SKIPPED.
+  - **B. tolerate-partial** — `failureThreshold: 6` with 3 real + 3 bogus
+    children → join proceeds, `map.output.fanOut = { succeeded: 3, failed: 3 }`,
+    `reduce` + `merge` SUCCEEDED.
+  - **C. cancel cascade** — `cancelRunService(parent)` while 8 children run →
+    parent CANCELLED, every child terminal, ≥1 CANCELLED.
+  - **D. retry only failed** — a fail-fast run with 1 survivor + 1 failed child;
+    after the cause is removed, `retryFailedNodesService` re-spawns **only** the
+    failed child (`respawnedChildren === 1`, survivor's NodeRun `attempt`
+    unchanged), it recovers, and the parent run SUCCEEDS.
+- Full integration suite: 13 files / 40 tests green. `pnpm -r typecheck` /
+  `lint` / unit all green.
+
+### Rebuild note
+
+`@dag/contracts` + worker executor change → `docker compose build api worker`.
+
 ## 2026-09-04 — B3.3: fan-out output aggregation (flow.reduce)
 
 **Phase:** roadmap B3.3. A `flow.reduce` node now folds a `flow.map`'s

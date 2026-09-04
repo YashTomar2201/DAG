@@ -1,7 +1,7 @@
 import { prisma, getRunEvents, getChildRunSummary, listChildRuns } from '@dag/db';
 import { NotFoundError } from '../errors';
-import { ioQueue, cpuQueue, gpuQueue, createJobId } from '@dag/queue';
-import { dispatchNode } from './orchestrator.service';
+import { dispatchNode, retryFanOutChildren } from './orchestrator.service';
+import { cancelRunTree } from './cancel.service';
 import { logger } from '../logger';
 
 // ─── Run reads ────────────────────────────────────────────────────────────────
@@ -78,60 +78,20 @@ export async function getRunEventsService(runId: string, afterId?: string) {
   return getRunEvents(runId, cursorId);
 }
 
-// ─── Run cancellation (Phase 6 will add orchestration logic here) ─────────────
+// ─── Run cancellation ────────────────────────────────────────────────────────
 
 /**
- * Marks a run as CANCELLED. Full orchestration (removing queue jobs, transitioning
- * NodeRuns) is implemented in Phase 6 when the orchestrator is wired up.
- * This stub sets the DB status so the API surface is complete for Phase 4.
+ * Cancels a run and its entire fan-out child-run subtree (roadmap B3.4): each
+ * run is marked CANCELLED, its still-queued BullMQ jobs are removed, and its
+ * non-terminal NodeRuns are CANCELLED. See `cancel.service.ts`.
  */
 export async function cancelRunService(runId: string) {
-  const run = await prisma.run.findUnique({
-    where: { id: runId },
-    select: { id: true, status: true },
-  });
+  const run = await prisma.run.findUnique({ where: { id: runId }, select: { id: true } });
   if (!run) throw new NotFoundError('Run', runId);
 
-  // Only cancel a non-terminal run
-  const terminalStatuses = ['SUCCEEDED', 'FAILED', 'CANCELLED'] as const;
-  if ((terminalStatuses as readonly string[]).includes(run.status)) {
-    return { alreadyTerminal: true, status: run.status };
-  }
-
-  await prisma.run.update({
-    where: { id: runId },
-    data: { status: 'CANCELLED', finishedAt: new Date() },
-  });
-
-  // Phase 6: Remove pending jobs from BullMQ
-  const activeNodes = await prisma.nodeRun.findMany({
-    where: {
-      runId,
-      status: { in: ['PENDING', 'QUEUED'] },
-    },
-    select: { nodeKey: true, attempt: true },
-  });
-
-  for (const node of activeNodes) {
-    const jobId = createJobId(runId, node.nodeKey, node.attempt);
-    // Best effort removal across all queues since we don't have the node type handy
-    await Promise.allSettled([
-      ioQueue.remove(jobId),
-      cpuQueue.remove(jobId),
-      gpuQueue.remove(jobId),
-    ]);
-  }
-
-  // Cancel all non-terminal NodeRuns
-  await prisma.nodeRun.updateMany({
-    where: {
-      runId,
-      status: { notIn: ['SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED'] },
-    },
-    data: { status: 'CANCELLED', finishedAt: new Date() },
-  });
-
-  return { alreadyTerminal: false, status: 'CANCELLED' };
+  const result = await cancelRunTree(runId);
+  logger.info({ runId, ...result }, 'Run cancel');
+  return result;
 }
 
 // ─── Retry failed nodes (Phase 9) ────────────────────────────────────────────
@@ -225,9 +185,23 @@ export async function retryFailedNodesService(runId: string) {
     }
   }
 
+  // ── Fan-out (B3.4) ──────────────────────────────────────────────────────
+  // A fan-out that failed fast has no FAILED nodes in the parent run — the
+  // failure is in child runs. Re-spawn ONLY the failed/cancelled children of
+  // each flow.map node and release its join claim so the join can re-fire.
+  let respawnedChildren = 0;
+  try {
+    respawnedChildren = await retryFanOutChildren(runId, run.workflowVersionId);
+  } catch (err) {
+    logger.error({ runId, err }, 'retry-failed: fan-out child re-spawn failed');
+  }
+
   return {
     retried: failedNodes.length,
     resetSkipped: skippedNodes.length,
-    message: `${failedNodes.length} node(s) queued for retry`,
+    respawnedChildren,
+    message:
+      `${failedNodes.length} node(s) queued for retry` +
+      (respawnedChildren > 0 ? `; ${respawnedChildren} fan-out child run(s) re-spawned` : ''),
   };
 }
