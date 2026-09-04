@@ -24,7 +24,7 @@ import type {
 import type { ExecutorContext, ExecutorOutput, ExecutorRegistry } from './executor-types';
 import { runPython } from './python-bridge';
 import { logger } from './logger';
-import { joinKey, readJson, readText, writeJson, sha256, sha256OfPath, pathExists } from './artifact-store';
+import { joinKey, readJson, readText, writeJson, sha256, resolveIfStored } from './artifact-store';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -93,8 +93,6 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
     return readJson(ctx.store, resultKey);
   }
 
-  const destDir = await ctx.store.localPath(key);
-
   let sourceType: 'url' | 'local';
   let source: string;
 
@@ -161,15 +159,19 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
   }
   const rows = lines.length - 1;
 
+  // `csvPath`/`outputDir` are store KEYS, not resolved local paths — the node
+  // that reads them next (pandas.preprocess) may run on a different worker
+  // than this one under the S3 backend, so it must call `store.localPath()`
+  // (or `resolveIfStored()`) itself at the point of use (roadmap C1.2).
   const result: ExecutorOutput = {
-    csvPath: await ctx.store.localPath(csvKey),
+    csvPath: csvKey,
     rows,
     columns,
     bytes: Buffer.byteLength(text, 'utf8'),
     checksum: await sha256(ctx.store, csvKey),
     sourceType,
     source,
-    outputDir: destDir,
+    outputDir: key,
   };
   ctx.onLog(`[data.source] ${sourceType}: ${rows} rows x ${columns.length} cols`);
   await writeJson(ctx.store, resultKey, result);
@@ -189,18 +191,24 @@ async function pandasPreprocess(ctx: ExecutorContext): Promise<ExecutorOutput> {
     return readJson(ctx.store, resultKey);
   }
 
-  const destDir = await ctx.store.localPath(key);
+  // `csvPath` may be a template ref to data.source's output (a store key —
+  // resolve it to a real local path) or a literal path the script resolves
+  // itself (see `resolveIfStored`'s doc comment).
+  const csvPath = await resolveIfStored(ctx.store, ctx.input['csvPath']);
 
-  const output = await runPython({
-    scriptPath: config.scriptPath ?? 'preprocess.py',
-    input: {
-      ...ctx.input,
-      kwargs: config.kwargs ?? {},
-      outputDir: destDir,
-    },
-    signal: ctx.signal,
-    onLog: ctx.onLog,
-  });
+  const output = await ctx.store.withOutputDir(key, (destDir) =>
+    runPython({
+      scriptPath: config.scriptPath ?? 'preprocess.py',
+      input: {
+        ...ctx.input,
+        csvPath,
+        kwargs: config.kwargs ?? {},
+        outputDir: destDir,
+      },
+      signal: ctx.signal,
+      onLog: ctx.onLog,
+    }),
+  );
 
   await writeJson(ctx.store, resultKey, output);
   return output as ExecutorOutput;
@@ -219,29 +227,33 @@ async function torchTrain(ctx: ExecutorContext): Promise<ExecutorOutput> {
     return readJson(ctx.store, resultKey);
   }
 
-  const destDir = await ctx.store.localPath(key);
-  const weightsPath = path.join(destDir, config.outputWeightsPath ?? 'model.pt');
+  // Template ref to preprocess's output (a store key) — resolve before use.
+  const trainPath = await resolveIfStored(ctx.store, ctx.input['trainPath']);
 
   // Long-running → send heartbeats every 15 s to prevent stall detection
   const stopHeartbeat = startHeartbeat(ctx, 15_000);
 
   try {
-    const output = await runPython({
-      scriptPath: config.scriptPath ?? 'train.py',
-      input: {
-        ...ctx.input,
-        epochs: config.epochs ?? 10,
-        kwargs: config.kwargs ?? {},
-        outputDir: destDir,
-        weightsPath,
-      },
-      signal: ctx.signal,
-      timeoutMs: 4 * 60 * 60 * 1000, // 4 hours max
-      onLog: (line) => {
-        ctx.onLog(line);
-        // Forward progress updates from the script (e.g. "epoch 3/10")
-        ctx.job.updateProgress(0).catch(() => {});
-      },
+    const output = await ctx.store.withOutputDir(key, (destDir) => {
+      const weightsPath = path.join(destDir, config.outputWeightsPath ?? 'model.pt');
+      return runPython({
+        scriptPath: config.scriptPath ?? 'train.py',
+        input: {
+          ...ctx.input,
+          trainPath,
+          epochs: config.epochs ?? 10,
+          kwargs: config.kwargs ?? {},
+          outputDir: destDir,
+          weightsPath,
+        },
+        signal: ctx.signal,
+        timeoutMs: 4 * 60 * 60 * 1000, // 4 hours max
+        onLog: (line) => {
+          ctx.onLog(line);
+          // Forward progress updates from the script (e.g. "epoch 3/10")
+          ctx.job.updateProgress(0).catch(() => {});
+        },
+      });
     });
 
     await writeJson(ctx.store, resultKey, output);
@@ -267,9 +279,12 @@ async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
     logger.info({ runId: ctx.runId, nodeKey: ctx.nodeKey }, 'model.evaluate: cache hit — re-checking gate');
     output = await readJson(ctx.store, resultKey);
   } else {
+    // Template refs to train's/preprocess's output (store keys) — resolve before use.
+    const weightsPath = await resolveIfStored(ctx.store, ctx.input['weightsPath']);
+    const testPath = await resolveIfStored(ctx.store, ctx.input['testPath']);
     output = (await runPython({
       scriptPath: config.scriptPath ?? 'evaluate.py',
-      input: { ...ctx.input, kwargs: config.kwargs ?? {} },
+      input: { ...ctx.input, weightsPath, testPath, kwargs: config.kwargs ?? {} },
       signal: ctx.signal,
       onLog: ctx.onLog,
     })) as Record<string, unknown>;
@@ -304,13 +319,13 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
     return readJson(ctx.store, receiptKey);
   }
 
-  // Locate the model weights from upstream input. The path can be threaded
-  // explicitly via a `weightsPath` template in the node config
-  // (`{{ nodes.<train>.output.weightsPath }}`); when it isn't, we still record
-  // a deploy receipt rather than failing the whole run — a missing checksum is
-  // not a reason to red-flag an otherwise successful pipeline.
+  // Locate the model weights from upstream input — a store key from train's
+  // output (`{{ nodes.<train>.output.weightsPath }}`); when it isn't wired,
+  // we still record a deploy receipt rather than failing the whole run — a
+  // missing checksum is not a reason to red-flag an otherwise successful
+  // pipeline.
   const weightsPath = ctx.input['weightsPath'] as string | undefined;
-  const weightsExist = !!weightsPath && (await pathExists(weightsPath));
+  const weightsExist = !!weightsPath && (await ctx.store.exists(weightsPath));
   if (weightsPath && !weightsExist) {
     logger.warn(
       { runId: ctx.runId, nodeKey: ctx.nodeKey, weightsPath },
@@ -324,7 +339,7 @@ async function registryDeploy(ctx: ExecutorContext): Promise<ExecutorOutput> {
     );
   }
 
-  const checksum = weightsExist ? await sha256OfPath(weightsPath!) : null;
+  const checksum = weightsExist ? await sha256(ctx.store, weightsPath!) : null;
 
   // In production this would call the registry API; for now we write a receipt
   const receipt: ExecutorOutput = {

@@ -5,6 +5,130 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-05 — C1.2: S3/MinIO artifact backend + download links
+
+**Phase:** roadmap C1.2. Where C1.1 made every executor go through an
+`ArtifactStore` interface without changing behaviour, this phase adds the
+second implementation the interface existed for: `S3ArtifactStore`, so a
+worker's `preprocess` step and another worker's `train` step no longer need
+to share a filesystem — the actual Kubernetes blocker `KNOWN_LIMITATIONS.md`
+§4 named.
+
+### The output-shape change (the part that took real thought)
+
+Under C1.1, an executor's path-shaped outputs (`csvPath`, `trainPath`,
+`weightsPath`, ...) were resolved *local filesystem paths* — safe, because
+the fs backend's shared volume made every path valid on every worker. That
+assumption cannot survive S3: a `torch.train` step's `weightsPath` might get
+consumed by a `model.evaluate` step running on a different machine entirely,
+so what gets persisted to `NodeRun.output` (and read back by
+`context-resolver.ts` at the next node's dispatch) has to be something
+*every* worker can resolve for itself — a **store key**, not a path.
+
+So every path-shaped output field is now a key (`{runId}/{nodeKey}/file`)
+under both backends, and whoever needs the actual bytes resolves it
+immediately before use:
+- **`resolveIfStored(store, value)`** (new) — if `value` is a key the store
+  actually holds, downloads it to a local path (a no-op resolve for `fs`, a
+  real download for `s3`); otherwise returns it unchanged. That "otherwise"
+  matters: `pandas.preprocess`'s own `csvPath` config field can be a literal
+  path Python resolves itself (relative to its own `python/` directory), not
+  only a template ref to `data.source`'s output — trying the store first and
+  falling through handles both without the executor needing to know which
+  one it got.
+- **`ArtifactStore.withOutputDir(prefix, fn)`** (new interface method) — runs
+  `fn` against a local directory and returns whatever `fn` returns, with
+  every path inside that directory rewritten to a key. `FsArtifactStore`
+  hands `fn` the real persistent directory (no upload, just a rewrite of
+  Python's absolute-path return values back to keys); `S3ArtifactStore` hands
+  `fn` a scratch temp dir, uploads every file written into it once `fn`
+  resolves, deletes the temp dir, and rewrites the same way. This is what
+  roadmap C1.2 step 3 meant by "the Node executor downloads inputs to a temp
+  dir before spawning and uploads outputs after" — Python itself never
+  changes; it always just gets a real directory to read/write.
+
+### Changes
+
+- **`apps/worker/src/artifact-store.ts`** — `S3ArtifactStore` (`@aws-sdk/client-s3`):
+  `put`/`get`/`exists` map directly to S3 calls; `localPath()` downloads to a
+  per-key local cache under `os.tmpdir()` (so reading the same input twice in
+  one process doesn't refetch it, and a `put()` invalidates the cache entry);
+  `withOutputDir()` per above; `presignedUrl()` via `@aws-sdk/s3-request-presigner`.
+  Creates its bucket on first use if missing (idempotent under races). Also:
+  `resolveIfStored()` helper, `FsArtifactStore.withOutputDir()` gained the
+  same path-rewriting `S3ArtifactStore` does (see below — this was a real bug
+  caught during verification, not a day-one design). `sha256OfPath`/`pathExists`
+  from C1.1 are gone — `registry.deploy`'s `weightsPath` is a proper key now,
+  so it goes through the same `store.exists`/`sha256` every other artifact does.
+- **`apps/worker/src/executors.ts`** — `data.source` returns `csvKey` directly
+  (was `store.localPath(csvKey)`); `pandas.preprocess`/`torch.train` wrap
+  their `runPython` call in `store.withOutputDir()` and resolve their
+  upstream path input (`csvPath`/`trainPath`) via `resolveIfStored()` first;
+  `model.evaluate` resolves `weightsPath`/`testPath` the same way;
+  `registry.deploy` checks/checksums `weightsPath` via `store.exists`/`sha256`
+  instead of the now-removed `pathExists`/`sha256OfPath`.
+- **`apps/worker/src/env.ts`**, **`apps/api/src/env.ts`** — `ARTIFACT_BACKEND`
+  gains `'s3'`; `ARTIFACT_S3_BUCKET`/`_ENDPOINT`/`_REGION`/`_ACCESS_KEY_ID`/
+  `_SECRET_ACCESS_KEY`. The API additionally has `ARTIFACT_S3_PUBLIC_ENDPOINT`
+  (see the download-route bug below).
+- **`apps/api/src/services/artifact-download.service.ts`** (new) +
+  `GET /runs/:id/nodes/:nodeKey/artifacts/:field/download` in `run.routes.ts`
+  — resolves one output key into a working download: a presigned S3 redirect,
+  or a direct file stream for `fs`. Validates the key's own `{runId}/...`
+  prefix matches the run being queried before serving anything.
+- **Web**: `runSlice`'s `NodeStatus` gained `output` (populated from
+  `NODE_SUCCEEDED`'s payload, which already carried it — no new backend
+  plumbing needed); `ConfigPanel` shows an "Artifacts" section with download
+  links once a node succeeds, using a `looks-like-a-key` heuristic
+  (`isArtifactKey`) purely for display — the route itself re-validates.
+- **`infra/docker-compose.s3.yml`** (new) — an opt-in overlay adding MinIO;
+  the base `docker-compose.yml` is untouched and still defaults to `fs`.
+
+### Two real bugs caught by testing against actual MinIO, not just mocks
+
+1. **Presigned URLs pointed at a host the browser can't reach.** The API
+   signs with `ARTIFACT_S3_ENDPOINT=http://minio:9000` (the Docker-internal
+   name both containers use to talk to MinIO) — but that hostname embeds
+   itself into the presigned URL, and a browser on the host machine can't
+   resolve `minio`. Fixed with a second, presign-only S3 client pointed at
+   `ARTIFACT_S3_PUBLIC_ENDPOINT` (`http://localhost:9000` in the compose
+   overlay) — real AWS S3 never has this split since it has one public DNS
+   name, so this only exists for local MinIO.
+2. **`registry.deploy`'s checksum silently went `null` under the `fs`
+   backend.** `weightsPath` was still an *absolute* path
+   (`/data/artifacts/{runId}/train/model.pt`) because `FsArtifactStore.withOutputDir`
+   originally just handed Python the real directory and returned its output
+   verbatim — no rewrite. `registry.deploy` then called `store.exists(weightsPath)`,
+   which double-joined the already-absolute path onto the store root
+   (`/data/artifacts/data/artifacts/...`), found nothing, and silently
+   treated the model as "no weights available." The pipeline still
+   *completed* (the full-pipeline integration test only asserts literal
+   equality of `weightsPath` across nodes, not that the checksum is
+   non-null), so this shipped past the test suite and was only caught by a
+   live curl smoke run against the actual stack. Fixed by giving
+   `FsArtifactStore.withOutputDir` the same path→key rewrite
+   `S3ArtifactStore` already had, making every executor's output shape
+   identical across backends — which is what C1.2 should have delivered from
+   the start.
+
+### Verification
+
+- `S3ArtifactStore` unit-tested against a mocked `S3Client`
+  (`aws-sdk-client-mock`) — no MinIO needed for `pnpm test`/CI.
+- fs-backend integration suite: 15 files / 45 tests, unchanged, green.
+- Live smoke, `ARTIFACT_BACKEND=s3` against real MinIO
+  (`docker compose -f infra/docker-compose.yml -f infra/docker-compose.s3.yml up`):
+  full 5-node pipeline SUCCEEDED, `model.evaluate` reported `synthetic: false`
+  (proving real cross-node data actually flowed through S3, not a fallback),
+  every artifact confirmed present in the bucket via `mc ls -r`, and the
+  download route returned the real 218 KB `model.pt` (200, matching byte
+  count).
+- Live smoke, `ARTIFACT_BACKEND=fs`: same pipeline, `deploy.output.checksum`
+  now matches `train.output.checksum` (the bug above, confirmed fixed), and
+  the download route streamed the same file successfully.
+
+---
+
 ## 2026-09-05 — C1.1: extract the artifact-store interface
 
 **Phase:** roadmap C1.1. Pure refactor, no behaviour change. Every executor

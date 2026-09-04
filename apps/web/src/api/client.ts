@@ -380,6 +380,16 @@ export function webhookUrl(token: string): string {
   return `${API_BASE}/triggers/${token}`;
 }
 
+/**
+ * Download URL for one artifact referenced by a NodeRun's output (roadmap
+ * C1.2) — a plain `<a href>` works regardless of backend: the API redirects
+ * to a presigned S3 URL, or streams the file directly, depending on
+ * `ARTIFACT_BACKEND`.
+ */
+export function artifactDownloadUrl(runId: string, nodeKey: string, field: string): string {
+  return `${API_BASE}/runs/${runId}/nodes/${encodeURIComponent(nodeKey)}/artifacts/${encodeURIComponent(field)}/download`;
+}
+
 // ─── SSE ─────────────────────────────────────────────────────────────────────
 
 /**

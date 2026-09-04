@@ -16,6 +16,8 @@ export interface NodeStatus {
   finishedAt: string | null;
   attempt: number;
   error: unknown;
+  /** The executor's returned output (roadmap C1.2) — only ever set by NODE_SUCCEEDED. */
+  output: Record<string, unknown> | null;
 }
 
 export interface LogLine {
@@ -131,6 +133,10 @@ export const useRunStore = create<RunState>((set, get) => ({
               finishedAt: (payload['finishedAt'] as string) ?? null,
               attempt: (payload['attempt'] as number) ?? 1,
               error: payload['error'] ?? null,
+              output:
+                type === 'NODE_SUCCEEDED'
+                  ? ((payload['output'] as Record<string, unknown>) ?? null)
+                  : (s.nodeStatuses[nodeKey]?.output ?? null),
             },
           },
         };

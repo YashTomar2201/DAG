@@ -7,8 +7,20 @@
  */
 
 import { useGraphStore } from '../store/graphSlice';
+import { useRunStore } from '../store/runSlice';
+import { artifactDownloadUrl } from '../api/client';
 import { EdgeInspector } from './EdgeInspector';
 import { NODE_ICON, IconNode, IconClose, IconTrash } from './icons';
+
+/**
+ * Roadmap C1.2: an executor's output fields that are store keys (not literal
+ * values) always look like `{runId}/{nodeKey}/...` — at least two `/`s, and
+ * the API itself re-validates the `{runId}` prefix before serving anything,
+ * so this is just a display heuristic, not a security boundary.
+ */
+function isArtifactKey(value: unknown): value is string {
+  return typeof value === 'string' && value.split('/').length >= 3;
+}
 
 // Config field metadata per node type
 // In a full implementation these would be derived from the Zod schema itself
@@ -72,6 +84,9 @@ export function ConfigPanel() {
   const removeNode = useGraphStore((s) => s.removeNode);
   const selectNode = useGraphStore((s) => s.selectNode);
   const isReadOnly = useGraphStore((s) => s.isReadOnly);
+
+  const activeRunId = useRunStore((s) => s.activeRunId);
+  const nodeStatus = useRunStore((s) => (selectedNodeId ? s.nodeStatuses[selectedNodeId] : undefined));
 
   const node = nodes.find((n) => n.id === selectedNodeId);
 
@@ -167,6 +182,31 @@ export function ConfigPanel() {
           </div>
         )}
       </div>
+
+      {/* Artifacts — download links for this run's output (roadmap C1.2) */}
+      {activeRunId && nodeStatus?.status === 'SUCCEEDED' && nodeStatus.output && (
+        <div style={{ borderTop: '1px solid var(--color-surface-dark-soft)', paddingTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <span className="caption-uppercase" style={{ color: 'var(--color-on-dark-soft)', fontSize: 10, letterSpacing: '1.2px' }}>
+            Artifacts
+          </span>
+          {Object.entries(nodeStatus.output)
+            .filter(([, value]) => isArtifactKey(value))
+            .map(([field, value]) => (
+              <a
+                key={field}
+                href={artifactDownloadUrl(activeRunId, node.id, field)}
+                target="_blank"
+                rel="noreferrer"
+                className="body-sm"
+                style={{ color: 'var(--color-primary)', textDecoration: 'none', display: 'flex', justifyContent: 'space-between', gap: 8 }}
+                title={value as string}
+              >
+                <span>{field}</span>
+                <span style={{ opacity: 0.7 }}>Download</span>
+              </a>
+            ))}
+        </div>
+      )}
 
       {/* Advanced — per-node retry policy (B5) */}
       <details style={{ borderTop: '1px solid var(--color-surface-dark-soft)', paddingTop: 12 }}>

@@ -9,6 +9,7 @@ import {
 } from '../services/run.service';
 import { streamRunEvents } from '../services/sse.service';
 import { startRun } from '../services/orchestrator.service';
+import { resolveArtifactDownload } from '../services/artifact-download.service';
 import { logger } from '../logger';
 
 export const runRouter: ExpressRouter = Router();
@@ -89,6 +90,28 @@ runRouter.get('/:id/events', async (req, res, next) => {
     const lastEventId = req.headers['last-event-id'] as string | undefined;
     // streamRunEvents sets SSE headers, replays history, and holds the connection
     await streamRunEvents(runId, res, lastEventId);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /runs/:id/nodes/:nodeKey/artifacts/:field/download ──────────────────
+
+/**
+ * Downloads one artifact referenced by a NodeRun's output (roadmap C1.2),
+ * e.g. `GET /runs/abc/nodes/train/artifacts/weightsPath/download`.
+ * `ARTIFACT_BACKEND=s3` redirects to a 15-minute presigned URL;
+ * `ARTIFACT_BACKEND=fs` streams the file directly.
+ */
+runRouter.get('/:id/nodes/:nodeKey/artifacts/:field/download', async (req, res, next) => {
+  try {
+    const { id: runId, nodeKey, field } = req.params as { id: string; nodeKey: string; field: string };
+    const download = await resolveArtifactDownload(runId, nodeKey, field);
+    if (download.kind === 'redirect') {
+      res.redirect(download.url);
+    } else {
+      res.download(download.absolutePath, download.filename);
+    }
   } catch (err) {
     next(err);
   }

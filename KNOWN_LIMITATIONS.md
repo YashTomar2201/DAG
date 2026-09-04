@@ -96,35 +96,46 @@ already recursive for it), and `flow.reduce mode: 'custom'` (a user aggregation 
 
 ---
 
-## 4. Artifact Storage Is a Shared Volume, Not Object Storage — 🟡 IN PROGRESS (roadmap C1.1 done, C1.2 open)
+## 4. Artifact Storage Is a Shared Volume, Not Object Storage — ✅ CLOSED (roadmap C1.1 + C1.2)
 
-**What exists:** Workers write large outputs (datasets, model weights) to a shared Docker named
-volume (`artifact_data` mounted at `/data/artifacts` in every worker container). This works
-correctly for any deployment on a single host or in a Compose cluster where all replicas share
-the same physical volume.
+**What existed:** Workers wrote large outputs (datasets, model weights) to a shared Docker named
+volume (`artifact_data` mounted at `/data/artifacts` in every worker container). That worked on a
+single host or a Compose cluster where all replicas share the same physical volume, but not on
+Kubernetes (workers on different *nodes*) or across cloud regions — `preprocess` on Node A writing
+a file that `train` on Node B needs to read would fail silently.
 
-**What is missing:** On Kubernetes (where workers run on different *nodes*, not just different
-containers on one node) or across cloud regions, a host-local or Compose-local volume is not
-accessible from all workers. `preprocess` on Node A writing a file that `train` on Node B needs
-to read would fail silently — Node B simply would not have the file.
+**Done:**
+- **C1.1** — extracted `apps/worker/src/artifact-store.ts`'s `ArtifactStore` interface
+  (`put`/`get`/`exists`/`localPath`/`withOutputDir`). Every executor's reads/writes/idempotency
+  checks go through it instead of raw `fs`. `FsArtifactStore` reproduces the old shared-volume
+  behaviour exactly.
+- **C1.2** — added `S3ArtifactStore` (`@aws-sdk/client-s3`), selected via `ARTIFACT_BACKEND=s3`,
+  plus a MinIO service (`infra/docker-compose.s3.yml`, an opt-in overlay — the base
+  `docker-compose.yml` still defaults to `fs`, so no test needs MinIO). Every path-shaped output
+  field (`csvPath`, `trainPath`, `weightsPath`, `outputDir`, ...) is now a **store key**
+  (`{runId}/{nodeKey}/file`) under *both* backends — not a resolved local path — so an executor's
+  output means the same thing regardless of which worker or backend produced it. Python itself
+  stays backend-agnostic: `withOutputDir()` hands it a real local directory (a temp dir for S3,
+  the persistent volume for fs) and uploads/rewrites its return value into keys afterward;
+  `resolveIfStored()` downloads an upstream key back to a local path immediately before a script
+  needs to read it.
+- `GET /runs/:id/nodes/:nodeKey/artifacts/:field/download` resolves a key to a working download:
+  a 15-minute presigned S3 URL (redirect) under `s3`, a direct file stream under `fs`. Wired into
+  the canvas's node inspector (`ConfigPanel`'s "Artifacts" section) once a node succeeds.
+- **Known follow-up, not fixed here:** `flow.map`/`flow.reduce`'s fan-out join
+  (`orchestrator.service.ts`) still writes its `results.json` straight to `ARTIFACT_DIR` on local
+  disk rather than through the store — fan-out only works under `ARTIFACT_BACKEND=fs`. It fails
+  loudly (`UnrecoverableError: results file not found`), not silently, under `s3`.
+- **Lifecycle:** neither backend expires anything — every artifact from every run accumulates
+  forever. Cheap on a local volume, real money on S3. No TTL/lifecycle policy exists yet; a
+  bucket lifecycle rule (e.g. expire objects under `*/deploy-receipt.json` after 90 days) or a
+  periodic sweep job keyed off `Run.finishedAt` would close this.
 
-**C1.1 (done):** All five reference executors and `flow.reduce` now go through
-`apps/worker/src/artifact-store.ts` (`ArtifactStore` interface + `FsArtifactStore`) instead of
-calling `fs` directly — a pure refactor, behaviour unchanged, selected via `ARTIFACT_BACKEND=fs`.
-This makes the remaining gap a backend swap, not a rewrite of every executor.
-
-**To close it (C1.2, still open):**
-- Implement `S3ArtifactStore` against `@aws-sdk/client-s3`, selected via `ARTIFACT_BACKEND=s3`.
-  Add MinIO to `infra/docker-compose.yml` so local dev needs no cloud account; keep `fs` working
-  so tests don't need MinIO.
-- Python scripts stay backend-agnostic: the Node executor downloads inputs to a temp dir via
-  `localPath()` before spawning and uploads outputs via `put()` after — `boto3` never enters the
-  Python scripts themselves.
-- Store the S3 key (not a local path) in `NodeRun.output` so the UI can render a presigned
-  download link per artifact.
-- For a Kubernetes deployment without object storage: a `PersistentVolumeClaim` with a
-  `ReadWriteMany` storage class (NFS, EFS, or a CSI driver) is a cheaper intermediate step, though
-  object storage is the correct long-term answer for elasticity.
+Verified: the full reference pipeline (`data.source → pandas.preprocess → torch.train →
+model.evaluate → registry.deploy`) run live against real MinIO, with objects confirmed landing at
+their expected keys and the download route round-tripping a real file; the fs-backend integration
+suite (15 files / 45 tests) green unchanged; `S3ArtifactStore` unit-tested against a mocked
+`S3Client` (no MinIO needed in CI).
 
 ---
 

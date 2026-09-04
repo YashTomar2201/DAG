@@ -1058,3 +1058,127 @@ second, parallel "external source" concept inside `ArtifactStore` for a case
 that will look identical under `S3ArtifactStore` (the worker's own disk is
 still local disk, regardless of where finished artifacts live) — not a
 meaningful step toward C1.2.
+
+---
+
+## C1.2 — S3/MinIO Artifact Backend (`apps/worker`, `apps/api`)
+
+### Decision: executor outputs hold store KEYS, not resolved paths — under both backends
+
+This is the one C1.1 assumption C1.2 had to overturn. Under `fs`, an
+executor's path-shaped output (`csvPath`, `weightsPath`, ...) was a resolved
+absolute path — safe, because the shared volume made that path valid on
+*any* worker. Under `s3` that assumption is false by construction: the node
+consuming that output might dispatch to a different worker, possibly a
+different machine, and a local temp path from one worker's `withOutputDir`
+call means nothing to another. The fix generalizes past S3, though — a key
+(`{runId}/{nodeKey}/file`) is a stable, backend-independent name for "this
+artifact," and resolving it to something a Python script can actually open
+happens exactly once, immediately before that script runs
+(`resolveIfStored()`), on whichever worker needs it. `NodeRun.output` (and
+therefore the UI, and the download route) now sees the same shape regardless
+of `ARTIFACT_BACKEND` — one less thing that's allowed to differ between the
+two.
+
+**Consequence:** `sha256OfPath`/`pathExists` from C1.1 (added specifically
+because `registry.deploy`'s `weightsPath` was "an arbitrary upstream absolute
+path, not a key this store allocated") are gone. Under the new scheme
+`weightsPath` **is** a key like everything else, so `registry.deploy` uses
+plain `store.exists`/`sha256`. C1.1's special-casing wasn't wrong — it was
+correct for what was true *at the time*; C1.2 changed the premise.
+
+### Decision: `resolveIfStored()` tries the store first, falls through on a miss — no per-field special-casing
+
+Every "template ref" field (`torch.train`'s `trainPath`, `model.evaluate`'s
+`weightsPath`/`testPath`, `registry.deploy`'s `weightsPath`) is documented in
+`packages/contracts/src/node-types.ts` as coming *only* from an upstream
+node's output — always a key once resolved. But `pandas.preprocess`'s own
+`csvPath` is dual-purpose: it can equally be a literal path the script
+resolves itself (relative to its own `python/` directory, or the bundled
+default), unrelated to any upstream `data.source`. Hard-coding "treat this
+field as a key" per node type would need to know which of the two a given
+config actually is. Instead, `resolveIfStored(store, value)` just tries
+`store.exists(value)` — if the store recognizes it as a key, resolve it;
+otherwise return `value` untouched and let Python's own resolution logic
+(which already handled literal/relative/bundled paths before any of this
+existed) take it from there. One function, no per-field knowledge, correct
+for both cases.
+
+### Decision: `withOutputDir()` as a new interface method, not implied by `localPath()`
+
+The roadmap's sketch interface only listed `put`/`get`/`exists`/`localPath`/
+`presignedUrl`. In practice, `pandas.preprocess` and `torch.train` don't need
+"the local path of one key" — Python writes *several* files into a directory
+it's handed (`train.parquet` + `test.parquet`; `model.pt`), and only after it
+returns does anyone know which files exist or what to call them. `localPath()`
+resolves one key; it can't also mean "give me a scratch directory and, once
+I'm done, turn whatever ended up in it into properly-keyed artifacts." Those
+are two different contracts, so they're two different methods.
+`FsArtifactStore.withOutputDir` hands back the real persistent directory
+(nothing to upload — but see the bug below, it still has to rewrite Python's
+return value); `S3ArtifactStore.withOutputDir` hands back a temp directory,
+uploads everything written into it once the callback resolves, and deletes
+the temp directory unconditionally (`finally`), so a thrown error from Python
+doesn't leak scratch directories on disk.
+
+### Bug: presigned URLs signed with the wrong endpoint
+
+The API's S3 client is configured with `ARTIFACT_S3_ENDPOINT=http://minio:9000`
+— correct for the API and worker CONTAINERS talking to MinIO over the Docker
+network, wrong for a presigned URL, because the host embedded in a presigned
+URL's signature comes from whatever endpoint signed it, and a browser on the
+host machine cannot resolve the hostname `minio`. Real AWS S3 never has this
+split (one public DNS name, reachable identically from everywhere), so this
+is purely a local-MinIO artifact. Fixed with a second S3 client, used only
+for `getSignedUrl()`, pointed at a separate `ARTIFACT_S3_PUBLIC_ENDPOINT`
+(`http://localhost:9000` in the compose overlay) — the internal client (used
+for the actual `put`/`get`/`exists` calls) keeps using the internal endpoint.
+
+### Bug: `registry.deploy`'s checksum silently `null` under `fs`, caught only by live testing
+
+`FsArtifactStore.withOutputDir`'s first implementation didn't rewrite
+anything — it just handed Python the real directory and returned whatever
+Python returned. Under `fs` that meant `weightsPath` stayed an *absolute*
+path. `registry.deploy` then called `store.exists(weightsPath)`, and
+`FsArtifactStore.exists` unconditionally `path.join(root, key)`s — joining an
+already-absolute path onto the root produces a nonsense double-prefixed path
+(`/data/artifacts/data/artifacts/...`) that obviously doesn't exist. The
+result wasn't a crash: `registry.deploy` is written to tolerate a missing
+checksum (a missing checksum is deliberately not a reason to fail an
+otherwise-successful deploy), so the pipeline completed normally with
+`checksum: null` and no error anywhere. The existing
+`full-pipeline.integration.test.ts` didn't catch it because it only asserts
+`weightsPath` is literally equal between `train` and `deploy`'s output, never
+that the checksum is non-null. It surfaced only when a live curl run against
+the actual running stack was inspected by hand. **Fix:** give
+`FsArtifactStore.withOutputDir` the same absolute-path→key rewrite
+`S3ArtifactStore.withOutputDir` already had. **Lesson reinforced:** a green
+integration suite proves the *paths already covered* still work; a live
+smoke run against the real stack is what catches the assumption nobody wrote
+a test for. This is the second time this exact pattern has caught a real bug
+in this project (the first was B5's phantom-success retry bug) — worth
+treating as a standing practice, not a one-off.
+
+### Note: fan-out (`flow.map`/`flow.reduce`) is not part of the S3 migration
+
+The fan-out join (`orchestrator.service.ts`'s `joinFanOut`) writes
+`results.json` straight to `ARTIFACT_DIR` on local disk — it predates the
+`ArtifactStore` abstraction and lives in `apps/api`, not `apps/worker`, out
+of C1's stated scope (`apps/worker/src/artifact-store.ts`). Under
+`ARTIFACT_BACKEND=s3`, `flow.reduce`'s `ctx.store.exists(resultsKey)` check
+will correctly report "not found" (the orchestrator never uploaded it) and
+fail the run with a clear `UnrecoverableError` — a loud, honest failure, not
+silent data loss. Extending fan-out's join to go through `ArtifactStore` is
+a real follow-up, not done here.
+
+### Note: no artifact lifecycle/TTL policy
+
+Neither backend expires anything. On the shared volume this is cheap
+(disk is disk); on S3 it is not (storage cost accrues per byte, forever,
+across every run this system has ever executed). Roadmap C1.2 flagged this
+as a documentation-only follow-up rather than a build item for this phase —
+the two real options are an S3 bucket lifecycle rule (expire under a given
+prefix pattern after N days) or a periodic sweep keyed off `Run.finishedAt`
+that calls `store` deletes directly; the former is simpler and doesn't need
+this codebase to run anything on a schedule, so it's the more likely answer
+when this is actually built.

@@ -1,0 +1,63 @@
+# ─── S3/MinIO overlay (roadmap C1.2) ───────────────────────────────────────────
+#
+# Switches the artifact store from the shared Docker volume to MinIO — an
+# S3-compatible object store that runs locally, so trying `ARTIFACT_BACKEND=s3`
+# needs no cloud account. Apply on top of the base stack:
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.s3.yml \
+#     up --build --scale worker=4 -d
+#
+# The base `docker-compose.yml` is untouched and still defaults to the `fs`
+# backend — this overlay is opt-in, exactly like the roadmap's "keep fs
+# working so tests don't need MinIO" requirement.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: dag-minio
+      MINIO_ROOT_PASSWORD: dag-minio-secret
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  api:
+    environment:
+      ARTIFACT_BACKEND: s3
+      ARTIFACT_S3_BUCKET: dag-artifacts
+      ARTIFACT_S3_ENDPOINT: http://minio:9000
+      # The browser downloading a presigned link runs on the host, not inside
+      # the compose network — it needs MinIO's host-mapped port, not the
+      # internal service name embedded by ARTIFACT_S3_ENDPOINT above.
+      ARTIFACT_S3_PUBLIC_ENDPOINT: http://localhost:9000
+      ARTIFACT_S3_ACCESS_KEY_ID: dag-minio
+      ARTIFACT_S3_SECRET_ACCESS_KEY: dag-minio-secret
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  worker:
+    environment:
+      ARTIFACT_BACKEND: s3
+      ARTIFACT_S3_BUCKET: dag-artifacts
+      ARTIFACT_S3_ENDPOINT: http://minio:9000
+      ARTIFACT_S3_ACCESS_KEY_ID: dag-minio
+      ARTIFACT_S3_SECRET_ACCESS_KEY: dag-minio-secret
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio_data:

@@ -26,8 +26,8 @@ import { PythonCancelledError } from './python-bridge';
 import { exponentialJitter } from './backoff';
 import { createArtifactStore } from './artifact-store';
 
-/** One store for the whole process (roadmap C1.1) — cheap to construct, but no need to redo it per job. */
-const artifactStore = createArtifactStore(env.ARTIFACT_BACKEND, env.ARTIFACT_DIR);
+/** One store for the whole process (roadmap C1.1/C1.2) — cheap to construct, but no need to redo it per job. */
+const artifactStore = createArtifactStore(env);
 
 /** How often a running worker polls the run's hard-cancel flag (roadmap B4). */
 const CANCEL_POLL_MS = 5_000;
