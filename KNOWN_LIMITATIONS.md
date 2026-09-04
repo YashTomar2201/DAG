@@ -61,7 +61,7 @@ are not built — the webhook path is the extension point for them.
 
 ---
 
-## 3. Dynamic Fan-Out — working (B3.1–B3.4); UI pending (B3.5)
+## 3. Dynamic Fan-Out — ✅ CLOSED (roadmap B3.1–B3.5)
 
 **Done (roadmap B3.1 – B3.4):**
 - Run tree: `Run.parentRunId` / `fanOutIndex` self-relation + `[parentRunId, status]` index;
@@ -85,9 +85,12 @@ are not built — the webhook path is the extension point for them.
   failed/cancelled children of each `flow.map` node, in place. Verified by
   `apps/api/src/integration/fan-out{,-reduce,-failure}.integration.test.ts`.
 
-**Still missing:**
-- **B3.5** — UI: a progress pill on the map node instead of N canvas nodes, and a child-run
-  drill-in.
+- UI (B3.5): the `flow.map` node renders a `done / total` progress pill + bar (live over SSE
+  `RUN_SPAWNED` / `RUN_CHILD_COMPLETED`); selecting it opens a paginated child-run list with a
+  click-to-expand `GanttChart` per child. A 1000-element fan-out is still one canvas node.
+
+**Nice-to-have not built:** nested fan-out (`flow.map` inside a subgraph — the cancel traversal is
+already recursive for it), and `flow.reduce mode: 'custom'` (a user aggregation script).
 
 ---
 

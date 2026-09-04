@@ -486,6 +486,7 @@ export async function spawnFanOut(
   const { subEdges, roots } = subgraphExecPlan(graph, subgraphKeys);
 
   emitAndLog(runId, 'NODE_LOG', { line: `flow.map: fanning out over ${items.length} element(s)` }, mapNodeKey);
+  emitAndLog(runId, 'RUN_SPAWNED', { mapNodeKey, total: items.length }, mapNodeKey);
 
   // Zero elements: nothing to run — join straight away with an empty summary.
   if (items.length === 0) {
@@ -578,11 +579,29 @@ async function onFanOutChildTerminal(childRunId: string): Promise<void> {
   if (!version) return;
   const graph = getGraphFromVersion(version);
 
+  // Live progress for the UI (B3.5): one event per child reaching a terminal
+  // state, carrying the running per-status totals.
+  const summary = await getChildRunSummary(parentRunId);
+  emitAndLog(
+    parentRunId,
+    'RUN_CHILD_COMPLETED',
+    {
+      mapNodeKey,
+      childRunId,
+      fanOutIndex: info.fanOutIndex,
+      status: info.status,
+      total: summary.total,
+      succeeded: summary.succeeded,
+      failed: summary.failed,
+      cancelled: summary.cancelled,
+    },
+    mapNodeKey,
+  );
+
   // 1. Failure policy.
   if (info.status === 'FAILED') {
     const config = getNodeFromGraph(graph, mapNodeKey).config as FlowMapConfig;
     const threshold = config.failureThreshold ?? 0;
-    const summary = await getChildRunSummary(parentRunId);
     if (summary.failed > threshold) {
       logger.warn(
         { parentRunId, mapNodeKey, failed: summary.failed, threshold },
@@ -853,9 +872,15 @@ async function abortRun(runId: string, reason: string): Promise<void> {
   }
   const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', { finishedAt: new Date() });
   if (failed) {
-    logger.info({ runId, reason }, 'Run failed (condition error)');
+    logger.info({ runId, reason }, 'Run aborted');
     emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason });
   }
+
+  // Second child sweep AFTER the FAILED transition: a concurrent `spawnFanOut`
+  // sees FAILED on its per-iteration status check and stops, but may have
+  // created one more child in the window since the first sweep — catch it here
+  // (and `spawnFanOut`'s own post-loop sweep is the third backstop).
+  await cancelChildRunsOf(runId);
 
   // An aborted fan-out child is still terminal — let the parent's join proceed.
   await onFanOutChildTerminal(runId);

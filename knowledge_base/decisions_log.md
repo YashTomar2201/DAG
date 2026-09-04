@@ -893,3 +893,36 @@ resets a FAILED node. Survivor children are never touched, so retry re-runs
 `url` silently never resolved. It now prefers `ctx.input` (the control plane's
 resolved copy), falling back to `ctx.config` — the same pattern `registry.deploy`
 uses. Fixes a latent bug and is what lets a fan-out seed a per-child input path.
+
+---
+
+## B3.5 — Fan-Out in the UI (`apps/web`, `apps/api`)
+
+### Decision: two run-level SSE events, not per-child node events
+
+`RUN_SPAWNED` fires once (carrying `total`), `RUN_CHILD_COMPLETED` fires per
+child terminal (carrying the running per-status tallies, not a delta). Both go
+on the *parent* run's SSE channel — the editor already subscribes there. The
+client just overwrites `fanOut[mapNodeKey]` with the latest tallies, so a
+dropped or out-of-order event self-heals on the next one. Child runs keep their
+own event streams; the UI doesn't subscribe to 100 of them.
+
+### Decision: one node + a pill + a drawer, never N canvas nodes
+
+The `flow.map` node renders a `done / total` progress pill and bar in place
+(`CustomNode`), and selecting it opens `FanOutPanel` — a paginated child list
+(`GET /runs/:id/children`, 50/page) where clicking a row loads that child's full
+run and renders its existing `GanttChart`. This reuses the run-detail + Gantt
+machinery already built for the parent; a child run is just a run.
+
+### Decision: `abortRun` sweeps children twice (before and after the FAILED transition)
+
+B3.4 put the child-run cancel before `abortRun`'s FAILED transition, which
+reintroduced a flaky orphan under load (a concurrent `spawnFanOut` reads the
+parent as still RUNNING and keeps creating children after the sweep). Moving the
+transition first broke the *condition-error* abort path (B1.1) — its
+skip-pending-nodes loop began racing a stale `getNodeRunMap`. Resolution: keep
+B3.4's order (cancel → skip → transition) and add a **second**
+`cancelChildRunsOf` after the transition. With `spawnFanOut` also checking the
+parent status every iteration and once more after its loop, three sweeps cover
+every interleaving and neither path regresses.

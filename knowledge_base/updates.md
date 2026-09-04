@@ -5,6 +5,52 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B3.5: fan-out in the UI
+
+**Phase:** roadmap B3.5. A fan-out now renders as **one** node with live progress
+plus a drill-in to any child run's timeline — never N canvas nodes.
+
+### Changes
+
+- **`packages/contracts/src/events.ts`** — two SSE event types: `RUN_SPAWNED`
+  (`{ mapNodeKey, total }`, emitted once when `spawnFanOut` starts) and
+  `RUN_CHILD_COMPLETED` (`{ mapNodeKey, childRunId, fanOutIndex, status, total,
+  succeeded, failed, cancelled }`, emitted per child reaching a terminal state).
+- **`apps/api/src/services/orchestrator.service.ts`** — emits both on the
+  **parent** run's channel (`spawnFanOut` / `onFanOutChildTerminal`). Also a
+  `abortRun` hardening: a **second child-run sweep after** the FAILED
+  transition, so a fail-fast can't leave an orphan child RUNNING behind a
+  still-spawning `spawnFanOut` (its per-iteration status check + post-loop sweep
+  are the other two backstops).
+- **`apps/web/src/api/client.ts`** — the two new types added to the SSE
+  listener set.
+- **`apps/web/src/store/runSlice.ts`** — `fanOut: Record<mapNodeKey,
+  { total, succeeded, failed, cancelled, done }>`; `RUN_SPAWNED` seeds `total`,
+  `RUN_CHILD_COMPLETED` folds in the running tallies; `startListening` clears it.
+- **`apps/web/src/components/CustomNode.tsx`** — a `flow.map` node with fan-out
+  progress renders a `done / total` pill + a thin bar (green, amber if any
+  failed) + a failure count.
+- **`apps/web/src/components/FanOutPanel.tsx`** (new) — a slide-in that opens
+  when a `flow.map` node is selected: the progress header, then a paginated
+  child-run list (`GET /runs/:id/children`); click a child → its own
+  `GanttChart` inline. Re-fetches as `progress.done` climbs.
+
+### Verification
+
+- `apps/api/src/integration/fan-out.integration.test.ts` gains an assertion:
+  one `RUN_SPAWNED` (`total == columnCount`) and one `RUN_CHILD_COMPLETED` per
+  child, the last carrying the fully-tallied summary, each with a numeric
+  `fanOutIndex`. Full integration suite: 13 files / 41 tests green.
+- `apps/web/src/store/runSlice.test.ts` (new, 5): `RUN_SPAWNED` seeds total;
+  `RUN_CHILD_COMPLETED` updates tallies + derives `done`; two map nodes tracked
+  independently; `startListening` clears fan-out state.
+- `pnpm -r typecheck` / `lint` green.
+
+### Rebuild note
+
+`@dag/contracts` changed → `docker compose build api worker`. Web needs
+`docker compose build web` for the baked editor.
+
 ## 2026-09-04 — B3.4: fan-out failure & cancellation cascade
 
 **Phase:** roadmap B3.4. A failed child now fails the fan-out (or is tolerated

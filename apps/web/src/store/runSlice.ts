@@ -24,10 +24,21 @@ export interface LogLine {
   ts: number;
 }
 
+/** Live fan-out progress for one `flow.map` node (roadmap B3.5). */
+export interface FanOutProgress {
+  total: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  /** succeeded + failed + cancelled */
+  done: number;
+}
+
 export interface RunState {
   activeRunId: string | null;
   runStatus: string | null;
   nodeStatuses: Record<string, NodeStatus>; // keyed by nodeKey
+  fanOut: Record<string, FanOutProgress>;   // keyed by the flow.map node's key
   logs: LogLine[];
   runs: RunRecord[];       // history list — bare RunRecord; RunHistory fetches full detail on demand
   sseCleanup: (() => void) | null;
@@ -46,6 +57,7 @@ export const useRunStore = create<RunState>((set, get) => ({
   activeRunId: null,
   runStatus: null,
   nodeStatuses: {},
+  fanOut: {},
   logs: [],
   runs: [],
   sseCleanup: null,
@@ -53,7 +65,7 @@ export const useRunStore = create<RunState>((set, get) => ({
   startListening: (runId, cleanup) => {
     const { sseCleanup } = get();
     sseCleanup?.(); // close any previous stream
-    set({ activeRunId: runId, runStatus: 'RUNNING', nodeStatuses: {}, logs: [], sseCleanup: cleanup });
+    set({ activeRunId: runId, runStatus: 'RUNNING', nodeStatuses: {}, fanOut: {}, logs: [], sseCleanup: cleanup });
   },
 
   applyEvent: (type, data) => {
@@ -65,6 +77,43 @@ export const useRunStore = create<RunState>((set, get) => ({
       if (type === 'RUN_SUCCEEDED') return { runStatus: 'SUCCEEDED' };
       if (type === 'RUN_FAILED')    return { runStatus: 'FAILED' };
       if (type === 'RUN_CANCELLED') return { runStatus: 'CANCELLED' };
+
+      // ── Fan-out progress (B3.5) ────────────────────────────────────────
+      if (type === 'RUN_SPAWNED') {
+        const key = payload['mapNodeKey'] as string;
+        const total = (payload['total'] as number) ?? 0;
+        const prev = s.fanOut[key];
+        return {
+          fanOut: {
+            ...s.fanOut,
+            [key]: {
+              total,
+              succeeded: prev?.succeeded ?? 0,
+              failed: prev?.failed ?? 0,
+              cancelled: prev?.cancelled ?? 0,
+              done: prev?.done ?? 0,
+            },
+          },
+        };
+      }
+      if (type === 'RUN_CHILD_COMPLETED') {
+        const key = payload['mapNodeKey'] as string;
+        const succeeded = (payload['succeeded'] as number) ?? 0;
+        const failed = (payload['failed'] as number) ?? 0;
+        const cancelled = (payload['cancelled'] as number) ?? 0;
+        return {
+          fanOut: {
+            ...s.fanOut,
+            [key]: {
+              total: (payload['total'] as number) ?? s.fanOut[key]?.total ?? 0,
+              succeeded,
+              failed,
+              cancelled,
+              done: succeeded + failed + cancelled,
+            },
+          },
+        };
+      }
 
       // ── Node-level status events ────────────────────────────────────────
       if (nodeKey && ['NODE_QUEUED','NODE_RUNNING','NODE_SUCCEEDED','NODE_FAILED','NODE_SKIPPED','NODE_CANCELLED'].includes(type)) {

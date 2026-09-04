@@ -21,6 +21,8 @@ export const RUN_EVENT_TYPES = [
   'NODE_SKIPPED',
   'NODE_CANCELLED',
   'NODE_LOG',       // streaming stdout chunk from a worker
+  'RUN_SPAWNED',        // a flow.map node spawned N child runs (roadmap B3.5)
+  'RUN_CHILD_COMPLETED', // one fan-out child reached a terminal state
 ] as const;
 
 export type RunEventType = (typeof RUN_EVENT_TYPES)[number];

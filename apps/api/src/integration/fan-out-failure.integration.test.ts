@@ -117,6 +117,16 @@ describe('B3.4 — fan-out failure & cancellation', () => {
     const runId = await start(vid);
     await waitTerminal(runId, 'FAILED');
 
+    // Fail-fast tears children down asynchronously across two sweeps; give it a
+    // moment to settle rather than racing the last cancel.
+    await waitUntil(
+      async () =>
+        (await ctx.db.prisma.run.count({
+          where: { parentRunId: runId, status: { in: ['PENDING', 'RUNNING'] } },
+        })) === 0,
+      { timeoutMs: 20_000 },
+    );
+
     const kids = await children(runId);
     expect(kids.length).toBeGreaterThanOrEqual(1);
     expect(kids.every((k) => ['FAILED', 'CANCELLED', 'SUCCEEDED'].includes(k.status))).toBe(true);

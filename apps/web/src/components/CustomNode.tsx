@@ -34,6 +34,7 @@ const STATUS_PULSE: Record<string, boolean> = { RUNNING: true, QUEUED: true };
 
 export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
   const nodeStatus = useRunStore((s) => s.nodeStatuses[id]);
+  const fanOut = useRunStore((s) => s.fanOut[id]);
   const cycleHighlight = useGraphStore((s) => s.cycleHighlight);
   const selectNode = useGraphStore((s) => s.selectNode);
   const removeNode = useGraphStore((s) => s.removeNode);
@@ -152,6 +153,32 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
           }}
         >
           {String(nodeStatus.error).slice(0, 60)}
+        </div>
+      )}
+
+      {/* Fan-out progress pill (B3.5) — one node, live "done / total", not N nodes */}
+      {nodeType === 'flow.map' && fanOut && fanOut.total > 0 && (
+        <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span style={{ fontSize: 10, fontFamily: 'var(--font-code)', fontWeight: 600, color: 'var(--color-on-dark)' }}>
+              {fanOut.done} / {fanOut.total}
+            </span>
+            {fanOut.failed > 0 && (
+              <span style={{ fontSize: 9.5, fontWeight: 600, color: 'var(--color-error)' }}>
+                {fanOut.failed} failed
+              </span>
+            )}
+          </div>
+          <div style={{ height: 4, borderRadius: 2, background: 'var(--color-surface-dark-elevated)', overflow: 'hidden' }}>
+            <div
+              style={{
+                height: '100%',
+                width: `${Math.round((fanOut.done / fanOut.total) * 100)}%`,
+                background: fanOut.failed > 0 ? 'var(--color-warning)' : 'var(--color-success)',
+                transition: 'width 0.3s ease',
+              }}
+            />
+          </div>
         </div>
       )}
 

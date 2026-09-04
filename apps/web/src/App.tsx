@@ -21,6 +21,7 @@ import { ConfigPanel } from './components/ConfigPanel';
 import { LogDrawer } from './components/LogDrawer';
 import { RunHistory } from './components/RunHistory';
 import { AutomationPanel } from './components/AutomationPanel';
+import { FanOutPanel } from './components/FanOutPanel';
 import { WorkflowMenu } from './components/WorkflowMenu';
 import { VersionMenu } from './components/VersionMenu';
 
@@ -794,6 +795,7 @@ function AppCanvas() {
 
           <RunHistory workflowId={workflowId} />
           <AutomationPanel workflowId={workflowId} />
+          <FanOutPanel />
 
           {/* Product Surface: DAG Canvas */}
           <div

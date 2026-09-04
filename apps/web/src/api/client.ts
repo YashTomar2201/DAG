@@ -421,6 +421,7 @@ export function openRunEventStream(
     'RUN_STARTED', 'RUN_SUCCEEDED', 'RUN_FAILED', 'RUN_CANCELLED',
     'NODE_QUEUED', 'NODE_RUNNING', 'NODE_SUCCEEDED', 'NODE_FAILED',
     'NODE_SKIPPED', 'NODE_CANCELLED', 'NODE_LOG', 'NODE_LOG_BATCH',
+    'RUN_SPAWNED', 'RUN_CHILD_COMPLETED',
   ];
   for (const type of EVENT_TYPES) {
     es.addEventListener(type, handler as EventListener);

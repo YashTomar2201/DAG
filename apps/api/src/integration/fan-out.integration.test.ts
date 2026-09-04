@@ -164,6 +164,29 @@ describe('B3.2 — dynamic fan-out', () => {
     expect(parentWork).toBeNull();
   });
 
+  it('emits RUN_SPAWNED once and RUN_CHILD_COMPLETED per child (B3.5)', async () => {
+    const events = await ctx.db.prisma.runEvent.findMany({
+      where: { runId, type: { in: ['RUN_SPAWNED', 'RUN_CHILD_COMPLETED'] } },
+      orderBy: { id: 'asc' },
+    });
+    const spawned = events.filter((e) => e.type === 'RUN_SPAWNED');
+    const childDone = events.filter((e) => e.type === 'RUN_CHILD_COMPLETED');
+
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.payload).toMatchObject({ mapNodeKey: 'map', total: columnCount });
+
+    expect(childDone).toHaveLength(columnCount);
+    // the last one carries the fully-tallied summary
+    expect(childDone.at(-1)!.payload).toMatchObject({
+      mapNodeKey: 'map',
+      total: columnCount,
+      succeeded: columnCount,
+      failed: 0,
+    });
+    // fanOutIndex is present on every child-completed event
+    expect(childDone.every((e) => typeof (e.payload as { fanOutIndex?: unknown }).fanOutIndex === 'number')).toBe(true);
+  });
+
   it('replaying the spawn creates no duplicate children', async () => {
     const before = await ctx.db.prisma.run.count({ where: { parentRunId: runId } });
 
