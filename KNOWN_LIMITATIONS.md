@@ -61,9 +61,9 @@ are not built — the webhook path is the extension point for them.
 
 ---
 
-## 3. Dynamic Fan-Out — working (B3.1 + B3.2); output merge, cascade & UI pending (B3.3–B3.5)
+## 3. Dynamic Fan-Out — working (B3.1–B3.3); failure cascade & UI pending (B3.4–B3.5)
 
-**Done (roadmap B3.1 + B3.2):**
+**Done (roadmap B3.1 + B3.2 + B3.3):**
 - Run tree: `Run.parentRunId` / `fanOutIndex` self-relation + `[parentRunId, status]` index;
   `GET /runs/:id` returns a `children` count summary, `GET /runs/:id/children` pages children.
 - `flow.map` node type (`{ overSource, subgraph, maxFanOut }`). When it succeeds, the
@@ -72,15 +72,18 @@ are not built — the webhook path is the extension point for them.
   parallel across the worker fleet. The downstream node fires **exactly once**, after every child
   is terminal, via an atomic Redis join claim, and receives
   `map.output.fanOut = { childCount, succeeded, failed, cancelled }`. Spawn is idempotent
-  (`${parentRunId}:${mapKey}:${i}`), so a crash mid-spawn never double-creates children. Verified
-  by `apps/api/src/integration/fan-out.integration.test.ts`.
+  (`${parentRunId}:${mapKey}:${i}`), so a crash mid-spawn never double-creates children.
+- `flow.reduce` node type (`{ over, mode: concat|sum|mean, field? }`). At the join, every child's
+  sink output is collected (ordered by `fanOutIndex`) into a results file on the artifact volume
+  and its path exposed as `map.output.resultsPath` — the array never touches `map.output`, so it
+  is cap-safe for any N. `concat` flattens by reference; `sum`/`mean` fold a numeric dot-path
+  field. Verified by `apps/api/src/integration/fan-out{,-reduce}.integration.test.ts`.
 
 **Still missing:**
-- **B3.3** — a `flow.reduce` node that aggregates the children's *outputs* (ordered by
-  `fanOutIndex`), respecting the 64 KB cap by passing artifact references not payloads. Today the
-  downstream node only gets the count summary.
 - **B3.4** — failure/cancellation cascade: fail-fast policy (one child fails → cancel siblings,
-  fail the parent), cancel propagating to child runs, and retry re-spawning only failed children.
+  fail the parent, opt-in `failureThreshold`), cancel propagating to child runs, and retry
+  re-spawning only the failed children. Today a failed child still counts toward the join and the
+  downstream node runs on a partial summary.
 - **B3.5** — UI: a progress pill on the map node instead of N canvas nodes, and a child-run
   drill-in.
 

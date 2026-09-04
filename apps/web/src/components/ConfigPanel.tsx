@@ -48,6 +48,11 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
     { key: 'subgraph',   label: 'Subgraph node keys',    type: 'text',   placeholder: 'process, score  (comma-separated)' },
     { key: 'maxFanOut',  label: 'Max fan-out',           type: 'number', placeholder: '1000' },
   ],
+  'flow.reduce': [
+    { key: 'over',  label: 'Results ref',            type: 'text', placeholder: '{{ nodes.map.output.resultsPath }}' },
+    { key: 'mode',  label: 'Mode (concat/sum/mean)', type: 'text', placeholder: 'mean' },
+    { key: 'field', label: 'Field (for sum/mean)',   type: 'text', placeholder: 'accuracy  (dot-path, optional)' },
+  ],
 };
 
 export function ConfigPanel() {

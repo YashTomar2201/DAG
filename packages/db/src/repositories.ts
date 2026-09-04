@@ -364,6 +364,46 @@ export async function getRunTreeInfo(
   });
 }
 
+/**
+ * Every fan-out child's sink-node output(s), ordered by `fanOutIndex` (roadmap
+ * B3.3). One `run.findMany` + one `nodeRun.findMany` regardless of child count.
+ * `element` is the sink's output when the subgraph has a single sink, else a
+ * `{ [sinkKey]: output }` map; `null` when the child did not succeed.
+ */
+export async function getFanOutChildOutputs(
+  parentRunId: string,
+  sinkKeys: string[],
+): Promise<Array<{ fanOutIndex: number; status: string; element: unknown }>> {
+  const children = await prisma.run.findMany({
+    where: { parentRunId },
+    orderBy: { fanOutIndex: 'asc' },
+    select: { id: true, fanOutIndex: true, status: true },
+  });
+  if (children.length === 0) return [];
+
+  const nodeRuns = await prisma.nodeRun.findMany({
+    where: { runId: { in: children.map((c) => c.id) }, nodeKey: { in: sinkKeys } },
+    select: { runId: true, nodeKey: true, status: true, output: true },
+  });
+  const byRun = new Map<string, Map<string, unknown>>();
+  for (const nr of nodeRuns) {
+    if (nr.status !== 'SUCCEEDED') continue;
+    let m = byRun.get(nr.runId);
+    if (!m) byRun.set(nr.runId, (m = new Map()));
+    m.set(nr.nodeKey, nr.output);
+  }
+
+  const single = sinkKeys.length === 1 ? sinkKeys[0]! : null;
+  return children.map((c) => {
+    const outs = byRun.get(c.id);
+    let element: unknown = null;
+    if (outs && outs.size > 0) {
+      element = single ? (outs.get(single) ?? null) : Object.fromEntries(outs);
+    }
+    return { fanOutIndex: c.fanOutIndex ?? 0, status: c.status, element };
+  });
+}
+
 // ─── Fan-out run tree (roadmap B3) ──────────────────────────────────────────
 
 export interface ChildRunSummary {

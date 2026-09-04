@@ -60,6 +60,7 @@ export const queueForType = (type: NodeType): Queue<JobPayload> => {
     case 'data.source':
     case 'registry.deploy':
     case 'flow.map': // trivial control-plane echo; no heavy work
+    case 'flow.reduce': // reads a results file + folds it; light
       return ioQueue;
     case 'pandas.preprocess':
     case 'model.evaluate':

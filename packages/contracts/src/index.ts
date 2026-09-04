@@ -30,6 +30,7 @@ export {
   ModelEvaluateConfigSchema,
   RegistryDeployConfigSchema,
   FlowMapConfigSchema,
+  FlowReduceConfigSchema,
 } from './node-types';
 export type {
   NodeDef,
@@ -41,6 +42,7 @@ export type {
   ModelEvaluateConfig,
   RegistryDeployConfig,
   FlowMapConfig,
+  FlowReduceConfig,
 } from './node-types';
 
 // Graph schema with structural refinements (also exports EdgeDefSchema, EdgeDef)

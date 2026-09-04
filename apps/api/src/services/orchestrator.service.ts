@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   prisma,
   createRun,
@@ -11,6 +13,7 @@ import {
   countNonTerminalChildren,
   getRunTreeInfo,
   getChildRunSummary,
+  getFanOutChildOutputs,
 } from '@dag/db';
 import type { Prisma, WorkflowVersion } from '@dag/db';
 import {
@@ -68,6 +71,19 @@ function getChildren(graph: Graph, nodeKey: string): string[] {
 // ─── Fan-out helpers (roadmap B3.2) ──────────────────────────────────────────
 
 const DEFAULT_MAX_FAN_OUT = 1000;
+
+/** Shared artifact volume — same path the workers mount. Read directly (like
+ *  packages/queue reads REDIS_URL) so a missing var can't `process.exit` here. */
+const ARTIFACT_DIR = process.env['ARTIFACT_DIR'] || './artifacts';
+
+/** Subgraph nodes with no outgoing edge to another subgraph node (the leaves). */
+function subgraphSinkKeys(graph: Graph, subgraphKeys: string[]): string[] {
+  const set = new Set(subgraphKeys);
+  const hasSubOut = new Set(
+    graph.edges.filter((e) => set.has(e.from) && set.has(e.to)).map((e) => e.from),
+  );
+  return subgraphKeys.filter((k) => !hasSubOut.has(k));
+}
 
 /**
  * Node keys that belong to some `flow.map` node's `subgraph`. These run ONLY
@@ -528,22 +544,44 @@ async function joinFanOut(
   if (!(await claimFanOutJoin(parentRunId, mapNodeKey))) return; // another finisher won
 
   const summary = await getChildRunSummary(parentRunId);
+
+  // B3.3: if a `flow.reduce` node is downstream, collect every child's sink
+  // output (ordered by fanOutIndex) into a results file on the artifact volume
+  // and hand the reduce node its path. The array never touches the map node's
+  // own output, so a 1000-child fan-out can't blow the 64 KB cap.
+  const mergedOutput: Record<string, unknown> = {
+    fanOut: {
+      childCount: summary.total,
+      succeeded: summary.succeeded,
+      failed: summary.failed,
+      cancelled: summary.cancelled,
+    },
+  };
+
+  const hasReduceDownstream = getChildren(graph, mapNodeKey).some(
+    (k) => getNodeFromGraph(graph, k).type === 'flow.reduce',
+  );
+  if (hasReduceDownstream) {
+    const mapConfig = getNodeFromGraph(graph, mapNodeKey).config as FlowMapConfig;
+    const sinks = subgraphSinkKeys(graph, mapConfig.subgraph ?? []);
+    const rows = await getFanOutChildOutputs(parentRunId, sinks);
+    const elements = rows.map((r) => r.element); // ordered by fanOutIndex, null for a failed child
+
+    const resultsPath = path.join(ARTIFACT_DIR, parentRunId, mapNodeKey, 'results.json');
+    fs.mkdirSync(path.dirname(resultsPath), { recursive: true });
+    fs.writeFileSync(`${resultsPath}.tmp`, JSON.stringify(elements));
+    fs.renameSync(`${resultsPath}.tmp`, resultsPath);
+
+    mergedOutput['resultsPath'] = resultsPath;
+    mergedOutput['resultsCount'] = elements.length;
+  }
+
   const mapNr = await findNodeRun(parentRunId, mapNodeKey);
   if (mapNr) {
     const prev = (mapNr.output ?? {}) as Record<string, unknown>;
     await prisma.nodeRun.update({
       where: { id: mapNr.id },
-      data: {
-        output: {
-          ...prev,
-          fanOut: {
-            childCount: summary.total,
-            succeeded: summary.succeeded,
-            failed: summary.failed,
-            cancelled: summary.cancelled,
-          },
-        } as unknown as Prisma.InputJsonValue,
-      },
+      data: { output: { ...prev, ...mergedOutput } as unknown as Prisma.InputJsonValue },
     });
   }
 

@@ -170,6 +170,19 @@ export function IconFanOut(p: IconProps) {
   );
 }
 
+export function IconFanIn(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <circle cx="5" cy="5" r="2" />
+      <circle cx="5" cy="12" r="2" />
+      <circle cx="5" cy="19" r="2" />
+      <circle cx="19" cy="12" r="2" />
+      <path d="M7 5l6 6M7 12h6M7 19l6-6" />
+      <path d="M13 12h4" />
+    </svg>
+  );
+}
+
 export function IconClock(p: IconProps) {
   return (
     <svg {...base(p)}>
@@ -243,4 +256,5 @@ export const NODE_ICON: Record<string, (p: IconProps) => JSX.Element> = {
   'model.evaluate': IconEvaluate,
   'registry.deploy': IconDeploy,
   'flow.map': IconFanOut,
+  'flow.reduce': IconFanIn,
 };

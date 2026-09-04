@@ -20,6 +20,7 @@ import type {
   TorchTrainConfig,
   ModelEvaluateConfig,
   RegistryDeployConfig,
+  FlowReduceConfig,
 } from '@dag/contracts';
 import type { ExecutorContext, ExecutorOutput, ExecutorRegistry } from './executor-types';
 import { runPython } from './python-bridge';
@@ -377,6 +378,71 @@ async function flowMap(ctx: ExecutorContext): Promise<ExecutorOutput> {
   return { count: items.length };
 }
 
+// ─── flow.reduce ─────────────────────────────────────────────────────────────
+
+/** Walk a dot-path into a value; returns undefined if any segment is missing. */
+function dotGet(value: unknown, dotPath: string | undefined): unknown {
+  if (!dotPath) return value;
+  let cur: unknown = value;
+  for (const seg of dotPath.split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+function asNumber(v: unknown): number | undefined {
+  if (typeof v === 'number' && !Number.isNaN(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return Number(v);
+  return undefined;
+}
+
+/**
+ * `flow.reduce` (roadmap B3.3). Reads the ordered results file the orchestrator
+ * wrote at the fan-out join and folds it: `concat` flattens into one array
+ * (written back by reference, never inline), `sum`/`mean` aggregate a numeric
+ * `field` (dot-path) across the elements.
+ */
+async function flowReduce(ctx: ExecutorContext): Promise<ExecutorOutput> {
+  const config = ctx.config as FlowReduceConfig;
+  const resultsPath = ctx.input['over'];
+  if (typeof resultsPath !== 'string') {
+    throw new UnrecoverableError(
+      `flow.reduce: "over" did not resolve to a results-file path (got ${typeof resultsPath}). ` +
+        `Set it to "{{ nodes.<map>.output.resultsPath }}".`,
+    );
+  }
+  if (!fs.existsSync(resultsPath)) {
+    throw new UnrecoverableError(`flow.reduce: results file not found at ${resultsPath}`);
+  }
+  const elements = JSON.parse(fs.readFileSync(resultsPath, 'utf8')) as unknown[];
+  ctx.onLog(`flow.reduce(${config.mode}): folding ${elements.length} element(s)`);
+
+  if (config.mode === 'concat') {
+    const flat = elements.flatMap((el) => (Array.isArray(el) ? el : [el]));
+    const destDir = path.join(ctx.artifactDir, ctx.runId, ctx.nodeKey);
+    const outPath = path.join(destDir, 'reduced.json');
+    atomicWriteJson(outPath, flat);
+    return { mode: 'concat', count: flat.length, resultsPath: outPath };
+  }
+
+  const nums: number[] = [];
+  for (const el of elements) {
+    const n = asNumber(dotGet(el, config.field));
+    if (n !== undefined) nums.push(n);
+  }
+  if (nums.length === 0) {
+    throw new UnrecoverableError(
+      `flow.reduce(${config.mode}): found no numeric values` +
+        (config.field ? ` at field "${config.field}"` : '') +
+        ` across ${elements.length} element(s).`,
+    );
+  }
+  const sum = nums.reduce((a, b) => a + b, 0);
+  const value = config.mode === 'sum' ? sum : sum / nums.length;
+  return { mode: config.mode, field: config.field ?? null, value, count: nums.length };
+}
+
 // ─── Registry ─────────────────────────────────────────────────────────────────
 
 /**
@@ -398,4 +464,5 @@ export const executors: ExecutorRegistry = {
   'model.evaluate': modelEvaluate,
   'registry.deploy': registryDeploy,
   'flow.map': flowMap,
+  'flow.reduce': flowReduce,
 };

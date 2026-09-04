@@ -111,6 +111,24 @@ export const FlowMapConfigSchema = z.object({
   maxFanOut: z.coerce.number().int().positive().max(10_000).optional(),
 });
 
+/**
+ * `flow.reduce` — aggregate a `flow.map`'s children (roadmap B3.3). At the
+ * fan-out join the orchestrator writes every child's sink-node output, ordered
+ * by `fanOutIndex`, to a results file on the artifact volume and exposes its
+ * path as `<mapNode>.output.resultsPath`. This node's `over` points there; the
+ * executor reads the file and folds it:
+ *   - `concat` — flatten the elements into one array (written by reference)
+ *   - `sum` / `mean` — over `field` (dot-path into each element; omit if the
+ *     elements are themselves numbers)
+ */
+export const FlowReduceConfigSchema = z.object({
+  /** Template ref to the results file, e.g. "{{ nodes.map.output.resultsPath }}". */
+  over: z.string().min(1),
+  mode: z.enum(['concat', 'sum', 'mean']),
+  /** Dot-path into each element for `sum`/`mean` (e.g. "rows" or "score.accuracy"). */
+  field: z.string().min(1).optional(),
+});
+
 // ─── Node type discriminated union ─────────────────────────────────────────
 // Using z.discriminatedUnion so TypeScript narrows the config type when you
 // switch/match on `node.type`. The worker's executor registry switches on this
@@ -123,6 +141,7 @@ export const NODE_TYPES = [
   'model.evaluate',
   'registry.deploy',
   'flow.map',
+  'flow.reduce',
 ] as const;
 
 export type NodeType = (typeof NODE_TYPES)[number];
@@ -184,6 +203,10 @@ export const NodeDefSchema = z.discriminatedUnion('type', [
     type: z.literal('flow.map'),
     config: FlowMapConfigSchema,
   }),
+  NodeDefBaseSchema.extend({
+    type: z.literal('flow.reduce'),
+    config: FlowReduceConfigSchema,
+  }),
 ]);
 
 export type NodeDef = z.infer<typeof NodeDefSchema>;
@@ -195,3 +218,4 @@ export type TorchTrainConfig = z.infer<typeof TorchTrainConfigSchema>;
 export type ModelEvaluateConfig = z.infer<typeof ModelEvaluateConfigSchema>;
 export type RegistryDeployConfig = z.infer<typeof RegistryDeployConfigSchema>;
 export type FlowMapConfig = z.infer<typeof FlowMapConfigSchema>;
+export type FlowReduceConfig = z.infer<typeof FlowReduceConfigSchema>;

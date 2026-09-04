@@ -5,6 +5,57 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B3.3: fan-out output aggregation (flow.reduce)
+
+**Phase:** roadmap B3.3. A `flow.reduce` node now folds a `flow.map`'s
+children's *outputs* — not just the count summary B3.2 gave the downstream node.
+
+### Changes
+
+- **`packages/contracts`** — `flow.reduce` node type + `FlowReduceConfigSchema`
+  `{ over (template ref to the results file), mode: 'concat'|'sum'|'mean',
+  field? (dot-path for sum/mean) }`. (`custom`/script mode is a follow-up.)
+- **`apps/api/src/services/orchestrator.service.ts`** — at `joinFanOut`, if any
+  downstream node is `flow.reduce`, collect every child's **sink-node output**
+  (subgraph leaves), ordered by `fanOutIndex`, write it to
+  `${ARTIFACT_DIR}/${parentRunId}/${mapKey}/results.json` (atomic tmp+rename)
+  and add `resultsPath` / `resultsCount` to the map node's output. The array
+  never touches `map.output` itself, so a 1000-child fan-out stays under the
+  64 KB cap. `subgraphSinkKeys` helper; `ARTIFACT_DIR` read straight off
+  `process.env` (no `env.ts` `process.exit` risk).
+- **`packages/db/src/repositories.ts`** — `getFanOutChildOutputs(parentRunId,
+  sinkKeys)`: one `run.findMany` + one `nodeRun.findMany`, grouped in memory,
+  ordered by `fanOutIndex`; `element` is the single sink's output, or a
+  `{ [sinkKey]: output }` map, or `null` for a child that didn't succeed.
+- **`apps/worker/src/executors.ts`** — `flowReduce`: reads the results file;
+  `concat` flattens into one array written **by reference**
+  (`{ mode, count, resultsPath }`); `sum` / `mean` fold a numeric `field`
+  (dot-path via `dotGet`) → `{ mode, field, value, count }`; a missing file or
+  no numeric values → `UnrecoverableError`. Routed to `ioQueue`.
+- **`apps/web`** — `flow.reduce` palette entry (`Reduce`), `IconFanIn`,
+  `ConfigPanel` fields (over / mode / field).
+
+### Verification
+
+- `apps/api/src/integration/fan-out-reduce.integration.test.ts` (3), real
+  Postgres/Redis/workers: `split → map → reduce → merge` over the ~12-column
+  titanic header —
+  - the join writes `results.json` with all 12 child `work` outputs **ordered
+    by `fanOutIndex`**; `map.output` carries only `{ fanOut, resultsPath,
+    resultsCount }` and stays **< 2 KB**;
+  - `mode: 'mean'` on `field: 'rows'` → `{ mode:'mean', field:'rows', value:<row
+    count>, count:12 }`, `merge` ran once after `reduce`;
+  - `mode: 'concat'` → `{ mode:'concat', count:12, resultsPath }`, the flattened
+    file has 12 entries.
+- Full integration suite: 12 files / 36 tests green. `pnpm -r typecheck` /
+  `lint` / unit all green.
+
+### Rebuild note
+
+`@dag/contracts` changed → `docker compose build api worker`. No schema change.
+The API container already mounts the `artifact_data` volume, so the join's
+`results.json` lands where the reduce worker reads it.
+
 ## 2026-09-04 — B3.2: dynamic fan-out (spawn + summary join)
 
 **Phase:** roadmap B3.2. A `flow.map` node now spawns one child run per element

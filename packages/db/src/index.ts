@@ -35,6 +35,7 @@ export {
   createFanOutChildRun,
   countNonTerminalChildren,
   getRunTreeInfo,
+  getFanOutChildOutputs,
   // NodeRun lifecycle
   tryTransitionNodeRun,
   findNodeRun,

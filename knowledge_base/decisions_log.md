@@ -812,3 +812,38 @@ A failed child still counts toward the join; the downstream node runs with
 `map.output.fanOut = { childCount, succeeded, failed, cancelled }`. The
 fail-fast policy ("one child fails → cancel siblings, fail the parent") is
 B3.4, opt-in via a `failureThreshold`.
+
+---
+
+## B3.3 — Fan-Out Output Aggregation (`apps/api`, `apps/worker`)
+
+### Decision: the join writes a results file; the map node's output only holds its path
+
+At `joinFanOut`, when a `flow.reduce` node is downstream, the orchestrator
+collects every child's sink output into one array (ordered by `fanOutIndex`)
+and writes it to `${ARTIFACT_DIR}/${parentRunId}/${mapKey}/results.json`. The
+`flow.map` node's own `output` gets only `{ resultsPath, resultsCount }` plus
+the B3.2 `fanOut` summary — a couple hundred bytes regardless of child count.
+100 children each returning 10 KB would be 1 MB; inline on `map.output` it would
+blow `assertOutputSize`'s 64 KB cap. This is the same "large data travels by
+reference" discipline every other node already follows — the API just happens
+to be the writer here, and it already mounts the shared `artifact_data` volume.
+
+### Decision: aggregate the subgraph *sink* outputs, ordered by fanOutIndex
+
+`getFanOutChildOutputs` gathers each child's subgraph-leaf NodeRun output
+(a node with no outgoing edge to another subgraph node). Single sink → that
+output; multiple sinks → `{ [sinkKey]: output }`; child didn't succeed → `null`.
+Order is `fanOutIndex`, never completion time, so `reduce` sees element `i`
+where `flow.map` put source element `i`. The whole thing is two queries
+(`run.findMany` + `nodeRun.findMany`), grouped in memory — no N+1.
+
+### Decision: concat writes by reference too; sum/mean return a scalar inline
+
+`concat` flattens the elements and writes the result to the reduce node's own
+artifact dir, returning `{ mode, count, resultsPath }` — a concatenation can be
+arbitrarily large, so it can't go inline either. `sum`/`mean` fold a numeric
+`field` (dot-path, e.g. `score.accuracy`; omit if the elements are numbers) and
+return `{ mode, field, value, count }`, which is always tiny. `custom` (a
+user script) is deferred — the roadmap lists it but B3.3's "real aggregate"
+bar is met by the built-in folds.

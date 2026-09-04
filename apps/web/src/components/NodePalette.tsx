@@ -13,6 +13,7 @@ const PALETTE_ITEMS = [
   { type: 'model.evaluate',    label: 'Evaluate',        accent: 'var(--node-evaluate)' },
   { type: 'registry.deploy',   label: 'Deploy',          accent: 'var(--node-deploy)' },
   { type: 'flow.map',          label: 'Fan-out (map)',   accent: 'var(--node-preprocess)' },
+  { type: 'flow.reduce',       label: 'Reduce',          accent: 'var(--node-evaluate)' },
 ];
 
 export function NodePalette() {
