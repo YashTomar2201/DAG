@@ -123,22 +123,37 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
         </div>
       </div>
 
-      {/* Status badge */}
-      {status !== 'PENDING' && (
-        <div
-          style={{
-            marginTop: 8,
-            fontSize: 10,
-            color: ringColor,
-            fontFamily: 'var(--font-code)',
-            fontWeight: 600,
-            letterSpacing: '0.06em',
-          }}
-        >
-          {status}
-          {nodeStatus?.attempt && nodeStatus.attempt > 1 ? `  ·  attempt ${nodeStatus.attempt}` : ''}
-        </div>
-      )}
+      {/* Status badge — includes B5 retry/taxonomy context */}
+      {status !== 'PENDING' && (() => {
+        const err = nodeStatus?.error as
+          | { message?: string; taxonomy?: string; attempt?: number; maxAttempts?: number }
+          | null;
+        const attempt = err?.attempt ?? nodeStatus?.attempt;
+        const tail =
+          status === 'FAILED' && err?.taxonomy === 'unrecoverable'
+            ? '  ·  permanent'
+            : status === 'FAILED' && attempt && attempt > 1
+            ? `  ·  after ${attempt} attempts`
+            : status === 'QUEUED' && attempt && attempt > 1
+            ? `  ·  retry ${attempt}`
+            : attempt && attempt > 1
+            ? `  ·  attempt ${attempt}`
+            : '';
+        return (
+          <div
+            style={{
+              marginTop: 8,
+              fontSize: 10,
+              color: ringColor,
+              fontFamily: 'var(--font-code)',
+              fontWeight: 600,
+              letterSpacing: '0.06em',
+            }}
+          >
+            {status}{tail}
+          </div>
+        );
+      })()}
 
       {status === 'FAILED' && !!nodeStatus?.error && (
         <div
@@ -152,7 +167,11 @@ export function CustomNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
             maxWidth: 150,
           }}
         >
-          {String(nodeStatus.error).slice(0, 60)}
+          {(() => {
+            const e = nodeStatus.error as { message?: string } | string;
+            const msg = typeof e === 'string' ? e : e?.message ?? JSON.stringify(e);
+            return String(msg).slice(0, 60);
+          })()}
         </div>
       )}
 

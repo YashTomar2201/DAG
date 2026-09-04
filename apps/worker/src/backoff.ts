@@ -35,25 +35,36 @@ const CAP_MS = 30_000;
  * Formula: `min(cap, random(0, base * 2^attempt))`
  *
  * @param attemptsMade  Number of attempts already made (0-indexed on first call)
+ * @param base          Base delay (ms) — from the node's `retryPolicy.baseDelay`
+ * @param cap           Hard ceiling (ms) — from the node's `retryPolicy.cap`
  */
-export function exponentialJitterDelay(attemptsMade: number): number {
+export function exponentialJitterDelay(
+  attemptsMade: number,
+  base = BASE_MS,
+  cap = CAP_MS,
+): number {
   // `attemptsMade` is the number of *completed* attempts, so attempt 1 is the
   // first retry. We clamp the exponent to avoid Infinity for very high counts.
   const exponent = Math.min(attemptsMade, 10); // cap at 2^10 = 1024x
-  const ceiling = Math.min(CAP_MS, BASE_MS * Math.pow(2, exponent));
+  const ceiling = Math.min(cap, base * Math.pow(2, exponent));
   return Math.floor(Math.random() * ceiling);
 }
 
 /**
- * BullMQ backoff strategy factory function.
- * Register this as:
- *   `new Worker('queue', handler, { settings: { backoffStrategies: { exponentialJitter } } })`
+ * BullMQ backoff strategy. Registered on every Worker via
+ * `settings.backoffStrategy`. Reads the per-node policy off the job:
+ * `job.opts.backoff.delay` (base, roadmap B5) and `job.data.retryCap` (ceiling).
  */
 export function exponentialJitter(
   attemptsMade: number,
   _type: string | undefined,
   _err: Error | undefined,
-  _job: unknown,
+  job: unknown,
 ): number {
-  return exponentialJitterDelay(attemptsMade);
+  const j = job as
+    | { opts?: { backoff?: { delay?: number } }; data?: { retryCap?: number } }
+    | undefined;
+  const base = j?.opts?.backoff?.delay ?? BASE_MS;
+  const cap = j?.data?.retryCap ?? CAP_MS;
+  return exponentialJitterDelay(attemptsMade, base, cap);
 }

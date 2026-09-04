@@ -56,12 +56,19 @@ const NODE_CONFIG_FIELDS: Record<string, Array<{ key: string; label: string; typ
   ],
 };
 
+const RETRY_FIELDS = [
+  { key: 'attempts',  label: 'Attempts (1–10)',     placeholder: '3' },
+  { key: 'baseDelay', label: 'Base backoff (ms)',   placeholder: '2000' },
+  { key: 'cap',       label: 'Max backoff (ms)',    placeholder: '30000' },
+] as const;
+
 export function ConfigPanel() {
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
   const selectedEdgeId = useGraphStore((s) => s.selectedEdgeId);
   const nodes = useGraphStore((s) => s.nodes);
   const updateNodeConfig = useGraphStore((s) => s.updateNodeConfig);
   const updateNodeLabel = useGraphStore((s) => s.updateNodeLabel);
+  const updateNodeRetryPolicy = useGraphStore((s) => s.updateNodeRetryPolicy);
   const removeNode = useGraphStore((s) => s.removeNode);
   const selectNode = useGraphStore((s) => s.selectNode);
   const isReadOnly = useGraphStore((s) => s.isReadOnly);
@@ -76,6 +83,7 @@ export function ConfigPanel() {
 
   const fields = NODE_CONFIG_FIELDS[node.data.nodeType] ?? [];
   const config = node.data.config ?? {};
+  const retryPolicy = (node.data.retryPolicy ?? {}) as Record<string, number | undefined>;
   const Icon = NODE_ICON[node.data.nodeType] ?? IconNode;
 
   // Edits apply straight to the canvas store (which flips `isDirty`), so the
@@ -159,6 +167,38 @@ export function ConfigPanel() {
           </div>
         )}
       </div>
+
+      {/* Advanced — per-node retry policy (B5) */}
+      <details style={{ borderTop: '1px solid var(--color-surface-dark-soft)', paddingTop: 12 }}>
+        <summary
+          className="caption-uppercase"
+          style={{ color: 'var(--color-on-dark-soft)', fontSize: 10, letterSpacing: '1.2px', cursor: 'pointer' }}
+        >
+          Advanced · retry policy
+        </summary>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 12 }}>
+          {RETRY_FIELDS.map((f) => (
+            <div key={f.key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <label className="caption" style={{ color: 'var(--color-on-dark-soft)' }}>{f.label}</label>
+              <input
+                type="number"
+                value={String(retryPolicy[f.key] ?? '')}
+                placeholder={f.placeholder}
+                onChange={(e) => {
+                  const v = e.target.value === '' ? undefined : Number(e.target.value);
+                  updateNodeRetryPolicy(node!.id, { [f.key]: v });
+                }}
+                className="input-dark"
+                disabled={isReadOnly}
+              />
+            </div>
+          ))}
+          <span className="body-sm" style={{ color: 'var(--color-on-dark-soft)', opacity: 0.5, fontSize: 11, lineHeight: 1.5 }}>
+            Blank ⇒ engine default (3 attempts, 2s base, 30s cap). Retries apply only to transient
+            failures; a permanent error (bad script, 4xx) fails immediately.
+          </span>
+        </div>
+      </details>
 
       <div className="body-sm" style={{ color: 'var(--color-on-dark-soft)', opacity: 0.55, marginTop: 'auto', fontSize: 12 }}>
         {isReadOnly

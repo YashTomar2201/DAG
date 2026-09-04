@@ -539,6 +539,19 @@ export async function findNodeRun(
 }
 
 /**
+ * Stamps `error` on a NodeRun without changing its status (roadmap B5). The
+ * worker calls this on every failed attempt so the taxonomy-rich error is on
+ * the row before it throws — `onNodeFailed` then preserves it rather than
+ * overwriting with the bare BullMQ `failedReason` string.
+ */
+export async function setNodeRunError(
+  nodeRunId: string,
+  error: Prisma.InputJsonValue,
+): Promise<void> {
+  await prisma.nodeRun.update({ where: { id: nodeRunId }, data: { error } });
+}
+
+/**
  * Returns all NodeRuns for a run, keyed by nodeKey for O(1) access in the orchestrator.
  */
 export async function getNodeRunMap(

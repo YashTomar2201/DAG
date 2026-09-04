@@ -27,6 +27,12 @@ export const JobPayloadSchema = z.object({
   input: z.record(z.unknown()).nullable(),
   /** Current attempt number (1-indexed). Incremented on each retry. */
   attempt: z.number().int().min(1),
+  /**
+   * Backoff ceiling in ms from the node's `retryPolicy.cap` (roadmap B5). The
+   * BullMQ custom backoff strategy reads this off `job.data` — `job.opts` only
+   * carries the base delay.
+   */
+  retryCap: z.number().int().positive().optional(),
 });
 
 export type JobPayload = z.infer<typeof JobPayloadSchema>;

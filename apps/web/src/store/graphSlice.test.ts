@@ -120,3 +120,44 @@ describe('edge conditions (B1.2)', () => {
     expect(firstEdge(useGraphStore.getState().toGraph())).toEqual({ from: 'a', to: 'b' });
   });
 });
+
+describe('retry policy (B5)', () => {
+  const nodeId = () => useGraphStore.getState().nodes[0]!.id;
+  const firstNode = (g: Graph) => g.nodes[0]!;
+
+  it('toGraph() omits retryPolicy when unset', () => {
+    load(TWO_NODE_GRAPH);
+    expect(firstNode(useGraphStore.getState().toGraph())).not.toHaveProperty('retryPolicy');
+  });
+
+  it('updateNodeRetryPolicy merges, drops blanks, and toGraph() emits it', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.getState().updateNodeRetryPolicy(nodeId(), { attempts: 5 });
+    useGraphStore.getState().updateNodeRetryPolicy(nodeId(), { baseDelay: 500 });
+    expect(useGraphStore.getState().isDirty).toBe(true);
+    expect(firstNode(useGraphStore.getState().toGraph()).retryPolicy).toEqual({ attempts: 5, baseDelay: 500 });
+
+    // clearing a field removes it; clearing all removes retryPolicy entirely
+    useGraphStore.getState().updateNodeRetryPolicy(nodeId(), { attempts: undefined });
+    expect(firstNode(useGraphStore.getState().toGraph()).retryPolicy).toEqual({ baseDelay: 500 });
+    useGraphStore.getState().updateNodeRetryPolicy(nodeId(), { baseDelay: undefined });
+    expect(firstNode(useGraphStore.getState().toGraph())).not.toHaveProperty('retryPolicy');
+  });
+
+  it('survives a fromGraph → toGraph round-trip', () => {
+    const g = {
+      nodes: [{ key: 'a', label: 'A', type: 'data.source', config: {}, position: { x: 0, y: 0 }, retryPolicy: { attempts: 2, baseDelay: 100, cap: 400 } }],
+      edges: [],
+    } as unknown as Graph;
+    load(g);
+    expect(firstNode(useGraphStore.getState().toGraph()).retryPolicy).toEqual({ attempts: 2, baseDelay: 100, cap: 400 });
+  });
+
+  it('is a no-op on a read-only version', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.setState({ isReadOnly: true, isDirty: false });
+    useGraphStore.getState().updateNodeRetryPolicy(nodeId(), { attempts: 9 });
+    expect(useGraphStore.getState().isDirty).toBe(false);
+    expect(firstNode(useGraphStore.getState().toGraph())).not.toHaveProperty('retryPolicy');
+  });
+});

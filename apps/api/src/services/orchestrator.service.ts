@@ -272,7 +272,15 @@ export async function dispatchNode(
   // 2. Queue the job
   const jobId = createJobId(runId, nodeKey, nr.attempt);
   const queue = queueForType(node.type as NodeType);
-  
+
+  // Per-node retry policy (roadmap B5). `attempts` and the base `delay` go into
+  // the BullMQ job options; `cap` rides the payload because the custom backoff
+  // strategy can only read `job.data`, not the full opts.
+  const rp = node.retryPolicy;
+  const attempts = rp?.attempts ?? 3;
+  const baseDelay = rp?.baseDelay ?? 2000;
+  const cap = rp?.cap ?? 30_000;
+
   const payload = {
     runId,
     nodeKey,
@@ -281,14 +289,18 @@ export async function dispatchNode(
     config: node.config,
     input: resolvedInput,
     attempt: nr.attempt,
+    retryCap: cap,
   };
 
   // 3. Add to BullMQ
-  // Retries/backoff are handled by the queue default options we set in queues.ts
-  await queue.add(node.type, payload, { jobId });
+  await queue.add(node.type, payload, {
+    jobId,
+    attempts,
+    backoff: { type: 'exponentialJitter', delay: baseDelay },
+  });
 
-  logger.info({ runId, nodeKey, jobId, queue: queue.name }, 'Dispatched node');
-  emitAndLog(runId, 'NODE_QUEUED', { jobId }, nodeKey);
+  logger.info({ runId, nodeKey, jobId, queue: queue.name, attempts, baseDelay, cap }, 'Dispatched node');
+  emitAndLog(runId, 'NODE_QUEUED', { jobId, attempts }, nodeKey);
 }
 
 // ─── Completion Handlers ──────────────────────────────────────────────────────
@@ -369,15 +381,21 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
   const nr = await findNodeRun(runId, nodeKey);
   if (!nr || nr.status !== 'RUNNING') return;
 
+  // The worker stamps a `{ message, taxonomy, attempt, maxAttempts }` error on
+  // the row before it throws (B5). Prefer that over the bare `failedReason`
+  // string the BullMQ `failed` event carries.
+  const stamped = nr.error as { taxonomy?: string } | null;
+  const finalError = stamped?.taxonomy ? stamped : { ...error };
+
   const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'FAILED', {
-    error: error as unknown as Prisma.InputJsonValue,
+    error: finalError as unknown as Prisma.InputJsonValue,
     finishedAt: new Date(),
   });
-  
+
   if (!success) return;
 
-  logger.error({ runId, nodeKey, error }, 'Node failed');
-  emitAndLog(runId, 'NODE_FAILED', { error }, nodeKey);
+  logger.error({ runId, nodeKey, error: finalError }, 'Node failed');
+  emitAndLog(runId, 'NODE_FAILED', { error: finalError }, nodeKey);
 
   // BFS all descendants to SKIPPED
   const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });

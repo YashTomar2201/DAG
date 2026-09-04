@@ -40,6 +40,7 @@ export {
   tryTransitionNodeRun,
   findNodeRun,
   getNodeRunMap,
+  setNodeRunError,
   // Audit log
   appendRunEvent,
   getRunEvents,

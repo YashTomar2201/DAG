@@ -966,3 +966,48 @@ tick, but only `torch.train` uses that heartbeat — `pandas.preprocess` and
 `model.evaluate` also shell out to Python and need aborting. So the poll lives
 in `processJob` (covers every executor) at 5 s, comfortably inside the "~15 s"
 target with margin for the SIGKILL and the DB write.
+
+---
+
+## B5 — Make `retryPolicy` Real (`apps/api`, `apps/worker`)
+
+### Decision: `cap` rides the payload; `attempts` + base delay ride the job opts
+
+BullMQ's job options natively take `attempts` and `backoff.delay`, so those come
+straight from `node.retryPolicy`. But a custom `backoffStrategy` function only
+receives `(attemptsMade, type, err, job)` — and `job.opts.backoff` carries the
+base `delay`, not an arbitrary ceiling. So `cap` is passed on `job.data`
+(`JobPayload.retryCap`) and `exponentialJitter` reads both: base from
+`job.opts.backoff.delay`, cap from `job.data.retryCap`.
+
+### Decision: a retryable failure resets the NodeRun to QUEUED
+
+This was a latent bug, not just missing config. `processJob` claims
+`QUEUED → RUNNING` and never moves the row back on a throw. So BullMQ's second
+attempt re-ran `processJob`, its `QUEUED → RUNNING` claim failed (the row was
+still `RUNNING`), the handler `return null`ed, and BullMQ marked the job
+**completed** — a transient failure became a phantom success with null output.
+The fix: on a retryable throw with attempts remaining, transition
+`RUNNING → QUEUED` (clearing `startedAt`) before rethrowing, so the next attempt
+genuinely re-executes. `attempts: 5` on `fail.py` now runs 5 times.
+
+### Decision: the worker stamps the taxonomy; `onNodeFailed` preserves it
+
+The BullMQ `failed` event only carries `failedReason` (a string), so the
+control plane can't classify the error. Instead the worker writes
+`{ message, taxonomy, attempt, maxAttempts }` onto `NodeRun.error` in its catch
+(via `tryTransitionNodeRun`'s `error` field on a retry, or `setNodeRunError` on
+the terminal attempt). `onNodeFailed` then checks `nr.error.taxonomy` and keeps
+that object rather than overwriting with `{ message: failedReason }`. The UI
+reads `taxonomy` off the `NODE_FAILED` payload to say *"failed permanently"* vs
+*"failed after N attempts."*
+
+### Decision: `retryPolicy` is a first-class NodeDef field in the web store, not a config key
+
+The per-type config schemas are strict (`z.object` strips unknowns), so a
+`_retryAttempts` key stuffed into `config` would be dropped at
+`POST /workflows`. `retryPolicy` lives on `NodeData.retryPolicy` in the Zustand
+store, has its own `updateNodeRetryPolicy` action, and is spread onto the
+serialised `NodeDef` by `toGraph()` / restored by `graphToFlow()` — the same
+pattern edge `condition` uses (B1.2). A blank field is dropped so the engine
+default applies.

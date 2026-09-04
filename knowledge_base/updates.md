@@ -5,6 +5,60 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B5: per-node retry policy (was dead schema)
+
+**Phase:** roadmap B5. `RetryPolicySchema` (attempts / baseDelay / cap) sat on
+`NodeDefBaseSchema` and was used **nowhere** — every node silently used the
+global `attempts: 3`. Now it's real, per node, and the UI shows attempt count +
+whether a failure was retryable.
+
+### Changes
+
+- **`apps/api/src/services/orchestrator.service.ts`** — `dispatchNode` threads
+  `node.retryPolicy` into `queue.add`: `attempts` and `backoff.delay` into the
+  job options, `cap` onto the payload (`retryCap`) since the custom backoff
+  strategy can only read `job.data`.
+- **`packages/contracts/src/job.ts`** + `packages/queue/src/queues.ts` —
+  `JobPayload.retryCap?: number`.
+- **`apps/worker/src/backoff.ts`** — `exponentialJitter` now reads `base` from
+  `job.opts.backoff.delay` and `cap` from `job.data.retryCap` (previously a
+  hard-coded 2 s / 30 s with no per-node input).
+- **`apps/worker/src/worker.ts`** — `processJob`'s catch classifies the error
+  (`UnrecoverableError` → `unrecoverable`, else `retryable`). On a **retryable**
+  failure with attempts left it transitions the NodeRun back to `QUEUED` (so the
+  next BullMQ attempt actually re-executes — otherwise the retry's
+  `QUEUED→RUNNING` claim fails and the job "succeeds" returning null, a phantom
+  success). Otherwise it stamps `{ message, taxonomy, attempt, maxAttempts }` on
+  the row via the new `setNodeRunError` helper and rethrows. Emits `NODE_QUEUED`
+  with `{ retry: true, attempt, maxAttempts, taxonomy }`.
+- **`packages/db`** — `setNodeRunError(nodeRunId, error)` (stamps `error`, no
+  status change).
+- **`apps/api` `onNodeFailed`** — prefers the worker-stamped taxonomy-rich
+  error over the bare BullMQ `failedReason` string; `NODE_FAILED` carries it.
+- **`apps/worker/python/fail.py`** (new) — a fixture that exits 1 with a plain
+  (retryable) error.
+- **Web** — `graphSlice`: `NodeData.retryPolicy`, `updateNodeRetryPolicy`
+  action, round-tripped through `toGraph` / `graphToFlow`. `ConfigPanel`: an
+  "Advanced · retry policy" `<details>` with attempts / base / cap inputs.
+  `CustomNode`: the status badge shows `retry N` (QUEUED), `after N attempts` /
+  `permanent` (FAILED); the error line renders `error.message` not
+  `[object Object]`.
+
+### Verification
+
+- `apps/api/src/integration/retry-policy.integration.test.ts` (3): `attempts: 1`
+  → `job.attemptsMade === 1`, error `retryable`; `attempts: 4` → **runs 4
+  times**, error `{ taxonomy: 'retryable', attempt: 4, maxAttempts: 4 }`, and
+  `NODE_FAILED` carries the taxonomy; an unrecoverable failure (`minAccuracy: 1`
+  gate) with `attempts: 5` → `job.attemptsMade === 1`, error `unrecoverable`.
+  Full integration suite: **15 files / 45 tests green**. `pnpm -r typecheck` /
+  `lint` / unit all green.
+
+### Rebuild note
+
+`@dag/contracts` + worker (incl. the new `fail.py`) → `docker compose build api
+worker`.
+
 ## 2026-09-04 — B4: hard cancellation (stops in-flight work)
 
 **Phase:** roadmap B4. `POST /runs/:id/cancel` already drained queued jobs; now

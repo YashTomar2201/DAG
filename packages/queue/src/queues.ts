@@ -12,6 +12,8 @@ export interface JobPayload {
   config: unknown; // Will be cast/validated by the worker based on type
   input: unknown;  // Will be the resolved template inputs from context passing
   attempt: number;
+  /** Backoff ceiling (ms) from the node's `retryPolicy.cap` — read by the backoff strategy. */
+  retryCap?: number;
 }
 
 // ─── Queue Definitions ────────────────────────────────────────────────────────

@@ -29,10 +29,18 @@ import { serializeCondition } from '../lib/condition';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/** Per-node retry configuration (roadmap B5). Undefined ⇒ engine defaults. */
+export interface RetryPolicy {
+  attempts?: number;
+  baseDelay?: number;
+  cap?: number;
+}
+
 export type NodeData = Record<string, unknown> & {
   label: string;
   nodeType: string; // 'data.source' | 'pandas.preprocess' | etc.
   config: Record<string, unknown>;
+  retryPolicy?: RetryPolicy; // B5 — serialised onto NodeDef.retryPolicy
   status?: string;  // PENDING | QUEUED | RUNNING | SUCCEEDED | FAILED | SKIPPED
 };
 
@@ -101,6 +109,7 @@ export interface GraphState {
   updateEdgeCondition: (id: string, condition: Condition | null) => void;
   updateNodeConfig: (id: string, config: Record<string, unknown>) => void;
   updateNodeLabel: (id: string, label: string) => void;
+  updateNodeRetryPolicy: (id: string, patch: RetryPolicy) => void;
   updateNodeStatus: (nodeKey: string, status: string) => void;
   clearCycleHighlight: () => void;
   markSaved: () => void;
@@ -211,6 +220,9 @@ function graphToFlow(graph: Graph): { nodes: Node<NodeData>[]; edges: Edge[] } {
         label: n.label,
         nodeType: n.type,
         config: (n.config ?? {}) as Record<string, unknown>,
+        ...((n as { retryPolicy?: RetryPolicy }).retryPolicy
+          ? { retryPolicy: (n as { retryPolicy?: RetryPolicy }).retryPolicy }
+          : {}),
         status: 'PENDING',
       },
     };
@@ -515,6 +527,25 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       ),
     })),
 
+  /** Merge a retry-policy patch (B5). Empty fields are dropped so the engine default applies. */
+  updateNodeRetryPolicy: (id, patch) => {
+    if (get().isReadOnly) return;
+    set((s) => ({
+      nodes: s.nodes.map((n) => {
+        if (n.id !== id) return n;
+        const merged: RetryPolicy = { ...(n.data.retryPolicy ?? {}), ...patch };
+        for (const k of Object.keys(merged) as (keyof RetryPolicy)[]) {
+          if (merged[k] == null || Number.isNaN(merged[k])) delete merged[k];
+        }
+        const data = { ...n.data };
+        if (Object.keys(merged).length > 0) data.retryPolicy = merged;
+        else delete data.retryPolicy;
+        return { ...n, data };
+      }),
+      isDirty: true,
+    }));
+  },
+
   clearCycleHighlight: () => set({ cycleHighlight: [] }),
   markSaved: () => set({ isDirty: false }),
 
@@ -627,6 +658,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         config: sanitizeConfig(n.data.config) as any,
         position: { x: n.position.x, y: n.position.y },
+        // Partial policy is allowed on the wire — the API's Zod schema fills
+        // the missing fields with defaults.
+        ...(n.data.retryPolicy && Object.keys(n.data.retryPolicy).length > 0
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ? { retryPolicy: n.data.retryPolicy as any }
+          : {}),
       })),
       edges: edges.map((e) => {
         const condition = serializeCondition((e.data as DagEdgeData | undefined)?.condition);

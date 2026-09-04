@@ -15,7 +15,7 @@
  */
 
 import { Worker, UnrecoverableError, type Job } from 'bullmq';
-import { tryTransitionNodeRun } from '@dag/db';
+import { tryTransitionNodeRun, setNodeRunError } from '@dag/db';
 import { connection, publishRunEvent, isRunCancelled } from '@dag/queue';
 import type { JobPayload } from '@dag/contracts';
 import { env } from './env';
@@ -137,6 +137,39 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
       await publishNodeCancelled();
       logger.info({ runId, nodeKey }, 'Worker: executor stopped by cancellation');
       return null;
+    }
+
+    // ── Retry policy (roadmap B5) ─────────────────────────────────────────
+    const message = err instanceof Error ? err.message : String(err);
+    const taxonomy: 'retryable' | 'unrecoverable' =
+      err instanceof UnrecoverableError ? 'unrecoverable' : 'retryable';
+    const maxAttempts = job.opts.attempts ?? 1;
+    const thisAttempt = job.attemptsMade + 1;
+    const errorInfo = { message, taxonomy, attempt: thisAttempt, maxAttempts };
+    // BullMQ retries only a retryable error with attempts left.
+    const willRetry = taxonomy === 'retryable' && thisAttempt < maxAttempts;
+
+    if (willRetry) {
+      // Hand the row back to QUEUED so the NEXT BullMQ attempt re-executes it.
+      // Without this, the retry's QUEUED→RUNNING claim fails, the job returns
+      // null "successfully", and a transient failure becomes a phantom success.
+      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'QUEUED', {
+        error: errorInfo,
+        startedAt: null,
+        finishedAt: null,
+      });
+      await publishRunEvent(runId, {
+        runId,
+        nodeKey,
+        type: 'NODE_QUEUED',
+        payload: { retry: true, attempt: thisAttempt, maxAttempts, taxonomy },
+        ts: Date.now(),
+      }).catch(() => {});
+      logger.warn({ runId, nodeKey, attempt: thisAttempt, maxAttempts }, 'Worker: attempt failed — retrying');
+    } else {
+      // Terminal: stamp the taxonomy-rich error so `onNodeFailed` keeps it
+      // instead of overwriting with the bare BullMQ failedReason.
+      await setNodeRunError(nodeRunId, errorInfo);
     }
     throw err;
   } finally {
