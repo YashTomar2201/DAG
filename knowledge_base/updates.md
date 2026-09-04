@@ -5,6 +5,51 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-04 — B4: hard cancellation (stops in-flight work)
+
+**Phase:** roadmap B4. `POST /runs/:id/cancel` already drained queued jobs; now
+it also kills a job a worker has **already picked up** — a 4-hour training run
+stops within ~15 s instead of burning the GPU to completion.
+
+### Changes
+
+- **`packages/queue/src/lua.ts`** — `markRunCancelled(runId)` (`SET
+  run:{runId}:cancelled 1 EX 86400`) and `isRunCancelled(runId)`.
+- **`apps/api/src/services/cancel.service.ts`** — `cancelOneRun` sets the flag
+  first (before the DB writes), so it covers `POST /runs/:id/cancel` and the
+  B3.4 fan-out fail-fast sibling cancel alike.
+- **`apps/worker/src/worker.ts`** — `processJob`:
+  - **pre-check** `isRunCancelled` before the `QUEUED → RUNNING` transition →
+    land `CANCELLED`, emit `NODE_CANCELLED`, skip the executor.
+  - an `AbortController` + a 5 s poll of `isRunCancelled` → `controller.abort()`
+    on a hit; the signal goes into `ExecutorContext.signal`.
+  - the executor call is wrapped: on error, if the signal aborted / the error
+    is `PythonCancelledError` / the flag is set → land the NodeRun `CANCELLED`
+    and **return normally** (no BullMQ retry).
+- **`apps/worker/src/executor-types.ts`** — `ExecutorContext.signal:
+  AbortSignal`.
+- **`apps/worker/src/python-bridge.ts`** — `runPython({ signal })`: an abort
+  runs the **same process-group SIGKILL** the timeout watchdog uses
+  (`process.kill(-child.pid, 'SIGKILL')`) and rejects with `PythonCancelledError`.
+  `executors.ts` forwards `ctx.signal` to all three `runPython` calls and to
+  `data.source`'s URL-fetch `AbortController`.
+- **`apps/api/src/routes/run.routes.ts`** — stale "Phase 6 will extend this"
+  comment replaced with what the endpoint actually does.
+
+### Verification
+
+- `apps/api/src/integration/hard-cancel.integration.test.ts`: the reference
+  pipeline with `train.epochs = 2000` (~80 s) — waits until `train` is genuinely
+  RUNNING on a worker, cancels, then asserts the gpu job settles in **< 20 s**
+  (not the full ~80 s), the `train` NodeRun is **CANCELLED (not FAILED)**, the
+  run is CANCELLED, and the highest `[train] iter N/2000` logged is **well below
+  2000** (the Python loop was killed mid-way). *(Testcontainers was unreliable
+  on this host during the session — see the live-stack smoke below.)*
+
+### Rebuild note
+
+`@dag/queue` + worker changes → `docker compose build api worker`.
+
 ## 2026-09-04 — B3.5: fan-out in the UI
 
 **Phase:** roadmap B3.5. A fan-out now renders as **one** node with live progress

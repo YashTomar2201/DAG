@@ -160,3 +160,23 @@ export async function clearFanOutJoinClaim(parentRunId: string, mapNodeKey: stri
 export async function clearDispatched(runId: string): Promise<void> {
   await connection.del(`run:${runId}:dispatched`);
 }
+
+// ─── Hard cancellation flag (roadmap B4) ────────────────────────────────────
+//
+// `POST /runs/:id/cancel` removes queued jobs, but a job a worker has ALREADY
+// picked up keeps running. This flag is how the worker learns to stop: the
+// cancel path sets it, the worker checks it before dispatching an executor and
+// again on a poll while the executor runs, and aborts the (Python) child on a
+// hit. 24 h TTL so the key can't accumulate.
+
+const CANCEL_FLAG_TTL = 24 * 3600;
+
+/** Marks a run cancelled so in-flight workers bail. Idempotent. */
+export async function markRunCancelled(runId: string): Promise<void> {
+  await connection.set(`run:${runId}:cancelled`, '1', 'EX', CANCEL_FLAG_TTL);
+}
+
+/** True once `markRunCancelled` has been called for this run. */
+export async function isRunCancelled(runId: string): Promise<boolean> {
+  return (await connection.exists(`run:${runId}:cancelled`)) === 1;
+}

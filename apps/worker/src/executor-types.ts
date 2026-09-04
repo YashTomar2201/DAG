@@ -26,6 +26,12 @@ export interface ExecutorContext {
   artifactDir: string;
   /** The BullMQ job — used for heartbeats (`job.extendLock()`, `job.updateProgress()`) */
   job: Job<JobPayload>;
+  /**
+   * Aborted when the run is cancelled (roadmap B4). Executors that shell out to
+   * a long process must forward this to `runPython`; short executors can ignore
+   * it — the worker still lands the NodeRun on CANCELLED afterwards.
+   */
+  signal: AbortSignal;
   /** Called with each stdout log line from the Python bridge */
   onLog: (line: string) => void;
 }

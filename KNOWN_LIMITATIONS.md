@@ -81,9 +81,11 @@ are not built — the webhook path is the extension point for them.
 - Failure & cancellation cascade: `FlowMapConfig.failureThreshold` (default 0 = fail-fast — the
   first failed child cancels its siblings and fails the parent, skipping the downstream reduce
   node; set N to tolerate up to N failures and join on a partial result). `POST /runs/:id/cancel`
-  cascades to the whole child-run subtree. `POST /runs/:id/retry-failed` re-spawns **only** the
-  failed/cancelled children of each `flow.map` node, in place. Verified by
-  `apps/api/src/integration/fan-out{,-reduce,-failure}.integration.test.ts`.
+  cascades to the whole child-run subtree and (roadmap B4) sets a Redis flag so a worker already
+  running a node aborts its Python child within ~15 s — the NodeRun lands `CANCELLED`, not
+  `FAILED`. `POST /runs/:id/retry-failed` re-spawns **only** the failed/cancelled children of each
+  `flow.map` node, in place. Verified by
+  `apps/api/src/integration/{fan-out,fan-out-reduce,fan-out-failure,hard-cancel}.integration.test.ts`.
 
 - UI (B3.5): the `flow.map` node renders a `done / total` progress pill + bar (live over SSE
   `RUN_SPAWNED` / `RUN_CHILD_COMPLETED`); selecting it opens a paginated child-run list with a

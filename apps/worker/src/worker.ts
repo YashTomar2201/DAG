@@ -16,13 +16,17 @@
 
 import { Worker, UnrecoverableError, type Job } from 'bullmq';
 import { tryTransitionNodeRun } from '@dag/db';
-import { connection, publishRunEvent } from '@dag/queue';
+import { connection, publishRunEvent, isRunCancelled } from '@dag/queue';
 import type { JobPayload } from '@dag/contracts';
 import { env } from './env';
 import { logger } from './logger';
 import { executors } from './executors';
 import type { ExecutorContext } from './executor-types';
+import { PythonCancelledError } from './python-bridge';
 import { exponentialJitter } from './backoff';
+
+/** How often a running worker polls the run's hard-cancel flag (roadmap B4). */
+const CANCEL_POLL_MS = 5_000;
 
 // Concurrency per queue type (overridable via env)
 const CONCURRENCY = {
@@ -35,14 +39,33 @@ const CONCURRENCY = {
 
 async function processJob(job: Job<JobPayload>): Promise<unknown> {
   const { runId, nodeKey, nodeRunId, type, config, input, attempt } = job.data;
+  const workerId = process.env['WORKER_ID'] ?? `worker-${process.pid}`;
 
   logger.info({ runId, nodeKey, type, attempt }, 'Worker: processing job');
+
+  const publishNodeCancelled = () =>
+    publishRunEvent(runId, {
+      runId,
+      nodeKey,
+      type: 'NODE_CANCELLED',
+      payload: { reason: 'run cancelled' },
+      ts: Date.now(),
+    }).catch(() => {});
+
+  // 0. Hard-cancel pre-check (roadmap B4): the run may have been cancelled
+  //    while this job sat in the queue — don't even start the executor.
+  if (await isRunCancelled(runId)) {
+    await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'CANCELLED', { finishedAt: new Date() });
+    await publishNodeCancelled();
+    logger.info({ runId, nodeKey }, 'Worker: run cancelled before start — skipping');
+    return null;
+  }
 
   // 1. Transition NodeRun QUEUED → RUNNING
   //    Use the conditional update pattern — if we lose the race (e.g. this job
   //    was re-delivered after a stall), the update returns false and we bail.
   const claimed = await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'RUNNING', {
-    workerId: process.env['WORKER_ID'] ?? `worker-${process.pid}`,
+    workerId,
     startedAt: new Date(),
   });
 
@@ -57,11 +80,23 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     runId,
     nodeKey,
     type: 'NODE_RUNNING',
-    payload: { workerId: process.env['WORKER_ID'] ?? `worker-${process.pid}` },
+    payload: { workerId },
     ts: Date.now(),
   }).catch((err) => logger.warn({ err }, 'Failed to publish NODE_RUNNING'));
 
-  // 3. Build executor context
+  // 3. Cancellation watch — poll the run's hard-cancel flag and abort the
+  //    executor (which forwards the signal to its Python child) on a hit.
+  const controller = new AbortController();
+  const cancelPoll = setInterval(() => {
+    void isRunCancelled(runId).then((cancelled) => {
+      if (cancelled && !controller.signal.aborted) {
+        logger.info({ runId, nodeKey }, 'Worker: run cancelled — aborting executor');
+        controller.abort();
+      }
+    });
+  }, CANCEL_POLL_MS);
+
+  // 4. Build executor context
   const ctx: ExecutorContext = {
     runId,
     nodeKey,
@@ -69,8 +104,8 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     config: (config ?? {}) as Record<string, unknown>,
     artifactDir: env.ARTIFACT_DIR,
     job,
+    signal: controller.signal,
     onLog: (line: string) => {
-      // Publish log lines as NODE_LOG events (buffering is handled by SSE layer in Phase 10)
       publishRunEvent(runId, {
         runId,
         nodeKey,
@@ -81,17 +116,32 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     },
   };
 
-  // 4. Dispatch to the registered executor
+  // 5. Dispatch to the registered executor
   const executor = executors[type];
   if (!executor) {
     // Unknown type — should never happen due to the registry compile-time check,
     // but guard defensively at runtime.
+    clearInterval(cancelPoll);
     throw new UnrecoverableError(`No executor registered for node type: ${type}`);
   }
 
-  const output = await executor(ctx);
-  logger.info({ runId, nodeKey }, 'Worker: job completed successfully');
-  return output;
+  try {
+    const output = await executor(ctx);
+    logger.info({ runId, nodeKey }, 'Worker: job completed successfully');
+    return output;
+  } catch (err) {
+    // A cancelled run: land the NodeRun on CANCELLED (the cancel path likely
+    // already did via updateMany) and return normally so BullMQ does NOT retry.
+    if (controller.signal.aborted || err instanceof PythonCancelledError || (await isRunCancelled(runId))) {
+      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'CANCELLED', { finishedAt: new Date() });
+      await publishNodeCancelled();
+      logger.info({ runId, nodeKey }, 'Worker: executor stopped by cancellation');
+      return null;
+    }
+    throw err;
+  } finally {
+    clearInterval(cancelPoll);
+  }
 }
 
 // ─── Worker factory ───────────────────────────────────────────────────────────

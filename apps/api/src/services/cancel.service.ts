@@ -8,7 +8,7 @@
  */
 
 import { prisma } from '@dag/db';
-import { ioQueue, cpuQueue, gpuQueue, createJobId } from '@dag/queue';
+import { ioQueue, cpuQueue, gpuQueue, createJobId, markRunCancelled } from '@dag/queue';
 import { logger } from '../logger';
 
 const NON_TERMINAL_RUN = ['PENDING', 'RUNNING'] as const;
@@ -26,6 +26,10 @@ export async function cancelOneRun(
   if (!(NON_TERMINAL_RUN as readonly string[]).includes(run.status)) {
     return { alreadyTerminal: true, status: run.status };
   }
+
+  // Set the hard-cancel flag FIRST (roadmap B4): a worker already running a
+  // node for this run polls it and aborts its Python child within ~15 s.
+  await markRunCancelled(runId);
 
   await prisma.run.update({
     where: { id: runId },

@@ -34,14 +34,28 @@ export interface PythonBridgeOptions {
   input: unknown;
   /** Max execution time in ms before SIGKILL. Default: 30 min */
   timeoutMs?: number;
+  /** Aborted → SIGKILL the child process group and reject (roadmap B4). */
+  signal?: AbortSignal;
   /** Called with each stdout line for live log streaming */
   onLog?: (line: string) => void;
 }
 
+/** Raised when `runPython` is aborted via its `signal` (a run cancellation). */
+export class PythonCancelledError extends Error {
+  constructor(scriptPath: string) {
+    super(`Python script cancelled: ${scriptPath}`);
+    this.name = 'PythonCancelledError';
+  }
+}
+
 export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
-  const { scriptPath, input, timeoutMs = DEFAULT_TIMEOUT_MS, onLog } = opts;
+  const { scriptPath, input, timeoutMs = DEFAULT_TIMEOUT_MS, signal, onLog } = opts;
 
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new PythonCancelledError(scriptPath));
+      return;
+    }
     const absPath = path.isAbsolute(scriptPath)
       ? scriptPath
       : path.join(PYTHON_DIR, scriptPath);
@@ -87,20 +101,33 @@ export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
       }
     });
 
-    // ── Timeout watchdog ─────────────────────────────────────────────────────
-    const timer = setTimeout(() => {
-      // Kill the entire process group (negative PID kills all children)
+    /** SIGKILL the whole process group — negative PID reaches orphan grandchildren. */
+    const killGroup = () => {
       try {
         process.kill(-child.pid!, 'SIGKILL');
       } catch {
         child.kill('SIGKILL');
       }
+    };
+
+    // ── Timeout watchdog ─────────────────────────────────────────────────────
+    const timer = setTimeout(() => {
+      killGroup();
       reject(new Error(`Python script timed out after ${timeoutMs / 1000}s: ${absPath}`));
     }, timeoutMs);
+
+    // ── Cancellation (roadmap B4) — same process-group kill as the timeout ────
+    const onAbort = () => {
+      clearTimeout(timer);
+      killGroup();
+      reject(new PythonCancelledError(absPath));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     // ── Process exit ─────────────────────────────────────────────────────────
     child.on('close', (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
 
       if (code !== 0) {
         const tail = stderrLines.slice(-20).join('\n');
@@ -150,6 +177,7 @@ export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       // ENOENT = script file not found; definitely unrecoverable
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
         reject(new UnrecoverableError(`Python script not found: ${absPath}`));

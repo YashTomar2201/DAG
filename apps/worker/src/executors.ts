@@ -126,6 +126,8 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
     ctx.onLog(`[data.source] fetching ${config.url}`);
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60_000);
+    const onCancel = () => ac.abort();
+    ctx.signal.addEventListener('abort', onCancel, { once: true }); // roadmap B4
     try {
       const res = await fetch(config.url, { signal: ac.signal });
       if (!res.ok) {
@@ -145,6 +147,7 @@ async function dataSource(ctx: ExecutorContext): Promise<ExecutorOutput> {
       throw new Error(`data.source: fetch failed (retryable): ${msg}`);
     } finally {
       clearTimeout(timer);
+      ctx.signal.removeEventListener('abort', onCancel);
     }
   } else {
     sourceType = 'local';
@@ -210,6 +213,7 @@ async function pandasPreprocess(ctx: ExecutorContext): Promise<ExecutorOutput> {
       kwargs: config.kwargs ?? {},
       outputDir: destDir,
     },
+    signal: ctx.signal,
     onLog: ctx.onLog,
   });
 
@@ -247,6 +251,7 @@ async function torchTrain(ctx: ExecutorContext): Promise<ExecutorOutput> {
         outputDir: destDir,
         weightsPath,
       },
+      signal: ctx.signal,
       timeoutMs: 4 * 60 * 60 * 1000, // 4 hours max
       onLog: (line) => {
         ctx.onLog(line);
@@ -282,6 +287,7 @@ async function modelEvaluate(ctx: ExecutorContext): Promise<ExecutorOutput> {
     output = (await runPython({
       scriptPath: config.scriptPath ?? 'evaluate.py',
       input: { ...ctx.input, kwargs: config.kwargs ?? {} },
+      signal: ctx.signal,
       onLog: ctx.onLog,
     })) as Record<string, unknown>;
     // Persist BEFORE the gate so a rejected run still leaves the real metrics

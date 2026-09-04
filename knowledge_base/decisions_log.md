@@ -926,3 +926,43 @@ B3.4's order (cancel → skip → transition) and add a **second**
 `cancelChildRunsOf` after the transition. With `spawnFanOut` also checking the
 parent status every iteration and once more after its loop, three sweeps cover
 every interleaving and neither path regresses.
+
+---
+
+## B4 — Hard Cancellation (`apps/worker`, `packages/queue`)
+
+### Decision: a Redis flag the worker polls, not a per-job kill signal
+
+`cancelOneRun` sets `run:{runId}:cancelled` (24 h TTL). The worker checks it
+once before starting an executor and every 5 s while one runs. There is no
+targeted "kill job X" channel: the run id is the unit of cancellation, the flag
+is one key, and a worker that picks up a stale job for an already-cancelled run
+bails on the pre-check with no wasted work. BullMQ's own job removal still
+handles anything still queued; the flag is only for the job a worker already
+holds.
+
+### Decision: abort → the timeout watchdog's process-group SIGKILL
+
+`runPython` already kills the whole child process group on timeout
+(`process.kill(-child.pid, 'SIGKILL')`) so orphan grandchildren don't linger.
+Cancellation reuses that exact `killGroup()` — a `signal.addEventListener('abort',
+…)` that clears the timer, kills the group, and rejects with
+`PythonCancelledError`. One kill path, proven by the timeout case.
+
+### Decision: a cancelled executor returns normally, not throws
+
+If the worker rethrew on a cancel-induced executor error, BullMQ would mark the
+job failed and **retry it** (attempts: 3) against an already-cancelled run.
+Instead `processJob` catches, confirms it was a cancellation (signal aborted /
+`PythonCancelledError` / flag set), transitions the NodeRun `RUNNING →
+CANCELLED` (idempotent — `cancelOneRun`'s `updateMany` usually got there first),
+emits `NODE_CANCELLED`, and returns `null`. The job completes cleanly; the
+control plane's `onNodeSucceeded` no-ops because the NodeRun isn't `RUNNING`.
+
+### Decision: 5 s poll, not the 15 s heartbeat
+
+The roadmap suggested piggybacking the cancel check on `startHeartbeat`'s 15 s
+tick, but only `torch.train` uses that heartbeat — `pandas.preprocess` and
+`model.evaluate` also shell out to Python and need aborting. So the poll lives
+in `processJob` (covers every executor) at 5 s, comfortably inside the "~15 s"
+target with margin for the SIGKILL and the DB write.

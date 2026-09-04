@@ -97,8 +97,10 @@ runRouter.get('/:id/events', async (req, res, next) => {
 // ─── POST /runs/:id/cancel ────────────────────────────────────────────────────
 
 /**
- * Cancels a run. Sets all non-terminal NodeRuns to CANCELLED.
- * Phase 6 will extend this to also drain pending BullMQ jobs.
+ * Cancels a run and its fan-out child-run subtree: drains queued BullMQ jobs,
+ * flips every non-terminal NodeRun to CANCELLED, and sets a Redis flag so a
+ * worker already running a node aborts its Python child within ~15 s
+ * (roadmap B4). See `cancel.service.ts`.
  */
 runRouter.post('/:id/cancel', async (req, res, next) => {
   try {
