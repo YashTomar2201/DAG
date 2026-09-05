@@ -6,7 +6,7 @@ valuable than pretending they don't exist.
 
 ---
 
-## 1. Multi-Tenancy Is Namespace-Only at the Broker Layer — 🟡 IN PROGRESS (roadmap A3 + C2.1 done, C2.2/C2.3 open)
+## 1. Multi-Tenancy — ✅ CLOSED (roadmap A3 + C2.1 + C2.2 + C2.3)
 
 **What existed:** Every `Workflow`, `Run`, and `NodeRun` row carried a `tenantId` column, and the
 API read it from an unauthenticated `?tenantId=` query param anyone could type.
@@ -40,17 +40,31 @@ against the real Docker stack (a second tenant's key gets 404s on the first tena
 and runs; the first tenant's run still executes end-to-end through the real worker process). Full
 write-up in `knowledge_base/updates.md`'s C2.1 entry.
 
-**What is still missing (C2.2/C2.3, open):**
-- Redis keys (`run:{runId}:indegree`, `run:{runId}:dispatched`) are keyed by `runId` alone, not
-  `tenantId`. Two tenants sharing a Redis instance get no namespace separation at the broker layer.
-- The per-run concurrency semaphore (`run:{id}:slots`) is likewise not tenant-scoped, so one
-  tenant's fan-out can consume the entire cluster's capacity budget.
+**C2.2 (done):** Every run-scoped Redis key used by the orchestrator (`indegree`, `dispatched`,
+`activeParents`, `fanoutJoined`, `cancelled`) is now namespaced `{tenantId}:run:{runId}:{suffix}`
+(`packages/queue/src/lua.ts`'s `tenantRunKey` helper) — two tenants sharing one Redis instance can
+no longer collide on or enumerate each other's keys, even via a raw `redis-cli KEYS` scan. The
+per-run semaphore (`packages/queue/src/semaphore.ts`, unused by any call site but kept for shape
+consistency) got the same treatment.
 
-**To close it (C2.2/C2.3):**
-- Namespace Redis keys as `{tenantId}:{runId}:indegree` (or use Redis ACLs to restrict key
-  patterns per tenant).
-- Add a per-tenant concurrency quota (a second semaphore, or a tenant-level BullMQ rate limiter)
-  so one large tenant cannot starve others.
+**C2.3 (done):** `Tenant.concurrencyLimit` (default 20) bounds how many NodeRuns a tenant may have
+QUEUED/RUNNING across the whole cluster at once, enforced by a Redis semaphore
+(`packages/queue/src/tenant-quota.ts`, `{tenantId}:concurrency:slots`) that `dispatchNode` checks
+*before* claiming a node. Over quota, the node is left PENDING and recorded in
+`{tenantId}:concurrency:blocked`; a slot release (`onNodeSucceeded`/`onNodeFailed`) immediately
+retries one blocked dispatch, and a periodic sweep (`sweepBlockedDispatches`, every 15s from
+`apps/api/src/index.ts`) is the backstop for the case the roadmap calls out — a tenant's other
+in-flight nodes are themselves long-running rather than releasing in a burst. Verified live: a
+4-independent-root workflow under a quota of 2 dispatched exactly 2 immediately, explicitly logged
+"Dispatch deferred — tenant concurrency quota exceeded" for the other 2, then drained them
+automatically as slots freed — all 4 nodes eventually SUCCEEDED, zero slots leaked afterward.
+**Known limitation, inherited from the per-run semaphore's own design:** the whole-key `EXPIRE` is
+a backstop against a fully abandoned tenant, not a per-member TTL — a slot leaked by a path that
+skips `onNodeSucceeded`/`onNodeFailed` entirely (a hard-cancelled or skipped node) stays held until
+the whole key next goes quiet for 24h. Closing that properly needs a per-member-expiry structure,
+real added complexity judged out of scope for this "small follow-on" roadmap item.
+
+Full write-up in `knowledge_base/updates.md`'s C2.2/C2.3 entries.
 
 ---
 

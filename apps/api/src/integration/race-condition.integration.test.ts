@@ -63,7 +63,7 @@ describe('Phase 12 — race condition: b and c completing simultaneously', () =>
     // Seed the real in-degree hash exactly as startRun would (b=1, c=1, d=2
     // for this graph's edges) — this is the real Redis state the Lua script
     // decrements against.
-    await ctx.queue.seedInDegrees(run.id, diamondGraph().edges);
+    await ctx.queue.seedInDegrees(run.id, diamondGraph().edges, tenantId);
 
     // Put b and c straight into RUNNING by hand — see the file header for
     // why this bypasses dispatchNode/BullMQ entirely for the setup step.
@@ -111,9 +111,10 @@ describe('Phase 12 — race condition: b and c completing simultaneously', () =>
     expect(dJob!.data.nodeKey).toBe('d');
 
     // ── Assertion 4: the Redis state backing the decision is consistent ─
-    const remaining = await ctx.queue.connection.hget(`run:${run.id}:indegree`, 'd');
+    // Keys are tenant-namespaced (roadmap C2.2): `{tenantId}:run:{runId}:...`.
+    const remaining = await ctx.queue.connection.hget(`${tenantId}:run:${run.id}:indegree`, 'd');
     expect(remaining).toBe('0');
-    const dispatchedMembers = await ctx.queue.connection.smembers(`run:${run.id}:dispatched`);
+    const dispatchedMembers = await ctx.queue.connection.smembers(`${tenantId}:run:${run.id}:dispatched`);
     expect(dispatchedMembers.filter((m) => m === 'd')).toHaveLength(1);
   }, 30_000);
 });

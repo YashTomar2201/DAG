@@ -16,6 +16,7 @@ import {
   getRunTreeInfo,
   getChildRunSummary,
   getFanOutChildOutputs,
+  getTenantConcurrencyLimit,
 } from '@dag/db';
 import type { Prisma, WorkflowVersion } from '@dag/db';
 import {
@@ -29,6 +30,12 @@ import {
   queueForType,
   createJobId,
   publishRunEvent,
+  acquireTenantSlot,
+  releaseTenantSlot,
+  getTenantActiveSlotCount,
+  queueBlockedDispatch,
+  popBlockedDispatch,
+  listBlockedTenantIds,
 } from '@dag/queue';
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
@@ -262,7 +269,7 @@ export async function startRun(
   emitAndLog(run.id, tenantId, 'RUN_STARTED', { startedAt: new Date() });
 
   // 2. Seed in-degrees in Redis (control edges only)
-  await seedInDegrees(run.id, controlEdges);
+  await seedInDegrees(run.id, controlEdges, tenantId);
 
   // 3. Find initial ready set (in-degree 0) and dispatch
   const inDegreeCounts = new Map<string, number>();
@@ -292,10 +299,27 @@ export async function dispatchNode(
   const nr = await findNodeRun(runId, nodeKey, tenantId);
   if (!nr) return; // shouldn't happen unless DB corrupted
 
+  // Roadmap C2.3: a per-tenant concurrency quota, checked BEFORE claiming the
+  // node — over quota, the node is left PENDING (never transitions to
+  // QUEUED) and recorded as a blocked dispatch. `releaseTenantSlotAndDrain`
+  // (called from `onNodeSucceeded`/`onNodeFailed`) and `sweepBlockedDispatches`
+  // (a periodic backstop) are what eventually retry it.
+  const limit = await getTenantConcurrencyLimit(tenantId);
+  const acquiredSlot = await acquireTenantSlot(tenantId, nr.id, limit);
+  if (!acquiredSlot) {
+    await queueBlockedDispatch(tenantId, runId, nodeKey);
+    logger.info({ runId, nodeKey, tenantId, limit }, 'Dispatch deferred — tenant concurrency quota exceeded');
+    return;
+  }
+
   // We check `tryTransitionNodeRun` *before* enqueueing. If it returns false,
-  // another actor (like a concurrent API process) already dispatched it.
+  // another actor (like a concurrent API process) already dispatched it —
+  // release the slot we just took since it won't be used.
   const claimed = await tryTransitionNodeRun(nr.id, 'PENDING', 'QUEUED', tenantId);
-  if (!claimed) return; // Lost the race, do nothing
+  if (!claimed) {
+    await releaseTenantSlot(tenantId, nr.id);
+    return; // Lost the race, do nothing
+  }
 
   // Load graph if not provided (needed when dispatching from completion handler)
   if (!graph) {
@@ -358,6 +382,57 @@ export async function dispatchNode(
   emitAndLog(runId, tenantId, 'NODE_QUEUED', { jobId, attempts }, nodeKey);
 }
 
+// ─── Tenant concurrency quota (roadmap C2.3) ─────────────────────────────────
+
+/**
+ * Releases the tenant slot a terminal NodeRun was holding, then immediately
+ * retries ONE dispatch that was previously blocked on the same tenant's
+ * quota — the common case, so a busy tenant's backlog drains node-by-node as
+ * capacity frees up rather than waiting for the periodic sweep below.
+ */
+async function releaseTenantSlotAndDrain(tenantId: string, nodeRunId: string): Promise<void> {
+  await releaseTenantSlot(tenantId, nodeRunId);
+  try {
+    const blocked = await popBlockedDispatch(tenantId);
+    if (blocked) await dispatchNode(blocked.runId, blocked.nodeKey, tenantId);
+  } catch (err) {
+    // Never let a retry attempt take down the completion handler that
+    // triggered it — the periodic sweep below is the backstop if this drops.
+    logger.error({ err, tenantId }, 'Failed to drain a blocked dispatch after releasing a tenant slot');
+  }
+}
+
+/**
+ * Periodic backstop for the "no parent will complete again" case the roadmap
+ * calls out: a release-triggered drain only retries one blocked dispatch per
+ * release, so if a tenant's other in-flight nodes are themselves
+ * long-running rather than finishing in a burst, a blocked node could wait
+ * longer than necessary for its own trigger. This scans for any tenant with
+ * a blocked dispatch and drains as many as its current spare capacity allows.
+ * Safe to call on a timer — every operation here is idempotent (popping an
+ * already-drained blocked set is a no-op).
+ */
+export async function sweepBlockedDispatches(): Promise<void> {
+  const tenantIds = await listBlockedTenantIds();
+  for (const tenantId of tenantIds) {
+    try {
+      const [limit, active] = await Promise.all([
+        getTenantConcurrencyLimit(tenantId),
+        getTenantActiveSlotCount(tenantId),
+      ]);
+      let capacity = limit - active;
+      while (capacity > 0) {
+        const blocked = await popBlockedDispatch(tenantId);
+        if (!blocked) break;
+        await dispatchNode(blocked.runId, blocked.nodeKey, tenantId);
+        capacity -= 1;
+      }
+    } catch (err) {
+      logger.error({ err, tenantId }, 'Blocked-dispatch sweep failed for tenant');
+    }
+  }
+}
+
 // ─── Completion Handlers ──────────────────────────────────────────────────────
 
 export async function onNodeSucceeded(runId: string, nodeKey: string, tenantId: string, output: unknown) {
@@ -384,6 +459,8 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, tenantId: 
   });
 
   if (!success) return; // Lost update race
+
+  await releaseTenantSlotAndDrain(tenantId, nr.id);
 
   logger.info({ runId, nodeKey }, 'Node succeeded');
   emitAndLog(runId, tenantId, 'NODE_SUCCEEDED', { output }, nodeKey);
@@ -450,6 +527,8 @@ export async function onNodeFailed(runId: string, nodeKey: string, tenantId: str
   });
 
   if (!success) return;
+
+  await releaseTenantSlotAndDrain(tenantId, nr.id);
 
   logger.error({ runId, nodeKey, error: finalError }, 'Node failed');
   emitAndLog(runId, tenantId, 'NODE_FAILED', { error: finalError }, nodeKey);
@@ -597,7 +676,7 @@ export async function spawnFanOut(
     if (!created) continue; // replay — this child already exists (and may be running/done)
 
     await tryTransitionRun(child.id, 'PENDING', 'RUNNING', tenantId, { startedAt: new Date() });
-    await seedInDegrees(child.id, subEdges);
+    await seedInDegrees(child.id, subEdges, tenantId);
     for (const rootKey of roots) {
       await dispatchNode(child.id, rootKey, tenantId, graph, versionId);
     }
@@ -719,13 +798,13 @@ async function joinFanOut(
   graph: Graph,
   versionId: string,
 ): Promise<void> {
-  if (!(await claimFanOutJoin(parentRunId, mapNodeKey))) return; // another finisher won
+  if (!(await claimFanOutJoin(parentRunId, mapNodeKey, tenantId))) return; // another finisher won
 
   // A fail-fast abort (B3.4) can land between the claim and here; never resume
   // a run that is no longer RUNNING.
   const parentStatus = await getRunStatus(parentRunId, tenantId);
   if (parentStatus !== 'RUNNING') {
-    await clearFanOutJoinClaim(parentRunId, mapNodeKey);
+    await clearFanOutJoinClaim(parentRunId, mapNodeKey, tenantId);
     return;
   }
 
@@ -863,8 +942,8 @@ export async function retryFanOutChildren(parentRunId: string, tenantId: string,
           data: { status: 'RUNNING', startedAt: new Date(), finishedAt: null },
         }),
       );
-      await clearDispatched(child.id);
-      await seedInDegrees(child.id, subEdges);
+      await clearDispatched(child.id, tenantId);
+      await seedInDegrees(child.id, subEdges, tenantId);
       for (const rootKey of roots) {
         try {
           await dispatchNode(child.id, rootKey, tenantId, graph, versionId);
@@ -875,7 +954,7 @@ export async function retryFanOutChildren(parentRunId: string, tenantId: string,
       respawned += 1;
     }
 
-    await clearFanOutJoinClaim(parentRunId, mapNode.key);
+    await clearFanOutJoinClaim(parentRunId, mapNode.key, tenantId);
   }
 
   if (respawned > 0) logger.info({ parentRunId, respawned }, 'Re-spawned failed fan-out children');
@@ -912,12 +991,12 @@ async function propagateToChildren(
     const edgeActive =
       parentActive && (!edge?.condition || evaluateCondition(edge.condition, nodeRunMap, parentKey));
 
-    if (edgeActive) await markParentActive(runId, childKey, parentKey);
+    if (edgeActive) await markParentActive(runId, childKey, parentKey, tenantId);
 
-    const ready = await decrementInDegree(runId, childKey);
+    const ready = await decrementInDegree(runId, childKey, tenantId);
     if (!ready) continue;
 
-    if (await hasActiveParent(runId, childKey)) {
+    if (await hasActiveParent(runId, childKey, tenantId)) {
       await dispatchNode(runId, childKey, tenantId, graph, versionId);
     } else {
       await skipNode(runId, childKey, tenantId, graph, versionId, nodeRunMap);

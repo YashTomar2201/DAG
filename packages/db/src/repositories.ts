@@ -795,6 +795,18 @@ export async function resolveTenantForRun(runId: string): Promise<string | null>
 }
 
 /**
+ * Roadmap C2.3 — the max number of NodeRuns this tenant may have QUEUED or
+ * RUNNING across the cluster at once (enforced by a Redis semaphore in
+ * `dispatchNode`, see `packages/queue/src/tenant-quota.ts`). `Tenant` is not
+ * RLS-protected — reading a tenant's own row by its own id needs no context —
+ * so this is a plain, unscoped lookup, same as `findActiveApiKeyByHash`.
+ */
+export async function getTenantConcurrencyLimit(tenantId: string): Promise<number> {
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId }, select: { concurrencyLimit: true } });
+  return tenant?.concurrencyLimit ?? 20;
+}
+
+/**
  * True iff the run exists and belongs to the tenant. Now backed by RLS
  * itself (roadmap C2.1) — `withTenant` alone would hide a wrong-tenant run,
  * making the explicit `tenantId` filter redundant, but keeping it is exactly

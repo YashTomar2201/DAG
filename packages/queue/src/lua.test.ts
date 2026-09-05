@@ -27,24 +27,25 @@ const DIAMOND_EDGES = [
 
 describe.skipIf(!HAS_REDIS)('Phase 5 — Redis Lua atomicity (requires real Redis)', () => {
   const runId = `test-run-${Date.now()}`;
+  const tenantId = 'test-tenant';
 
   beforeAll(async () => {
     // Seed the graph in-degrees
     // In the diamond graph: b=1, c=1, d=2
-    await seedInDegrees(runId, DIAMOND_EDGES);
+    await seedInDegrees(runId, DIAMOND_EDGES, tenantId);
   });
 
   afterAll(async () => {
-    // Cleanup
-    await connection.del(`run:${runId}:indegree`);
-    await connection.del(`run:${runId}:dispatched`);
+    // Cleanup — keys are tenant-namespaced (roadmap C2.2).
+    await connection.del(`${tenantId}:run:${runId}:indegree`);
+    await connection.del(`${tenantId}:run:${runId}:dispatched`);
     connection.disconnect();
   });
 
   it('correctly initializes the in-degrees', async () => {
-    const bDegree = await connection.hget(`run:${runId}:indegree`, 'b');
-    const cDegree = await connection.hget(`run:${runId}:indegree`, 'c');
-    const dDegree = await connection.hget(`run:${runId}:indegree`, 'd');
+    const bDegree = await connection.hget(`${tenantId}:run:${runId}:indegree`, 'b');
+    const cDegree = await connection.hget(`${tenantId}:run:${runId}:indegree`, 'c');
+    const dDegree = await connection.hget(`${tenantId}:run:${runId}:indegree`, 'd');
 
     expect(bDegree).toBe('1');
     expect(cDegree).toBe('1');
@@ -53,55 +54,55 @@ describe.skipIf(!HAS_REDIS)('Phase 5 — Redis Lua atomicity (requires real Redi
 
   it('decrementing a node with >1 remaining returns false', async () => {
     // First parent of 'd' completes
-    const shouldDispatch = await decrementInDegree(runId, 'd');
+    const shouldDispatch = await decrementInDegree(runId, 'd', tenantId);
     expect(shouldDispatch).toBe(false); // still 1 remaining parent
-    
-    const dDegree = await connection.hget(`run:${runId}:indegree`, 'd');
+
+    const dDegree = await connection.hget(`${tenantId}:run:${runId}:indegree`, 'd');
     expect(dDegree).toBe('1');
   });
 
   it('decrementing the final parent returns true (owner of dispatch)', async () => {
     // Second parent of 'd' completes
-    const shouldDispatch = await decrementInDegree(runId, 'd');
+    const shouldDispatch = await decrementInDegree(runId, 'd', tenantId);
     expect(shouldDispatch).toBe(true); // 0 remaining parents -> you dispatch
-    
-    const dDegree = await connection.hget(`run:${runId}:indegree`, 'd');
+
+    const dDegree = await connection.hget(`${tenantId}:run:${runId}:indegree`, 'd');
     expect(dDegree).toBe('0');
   });
 
   it('a delayed concurrent decrement after it hits 0 returns false (SADD guard)', async () => {
     // What if a third caller comes in somehow (race condition upstream)?
     // The SADD dispatch guard should return false.
-    const shouldDispatch = await decrementInDegree(runId, 'd');
+    const shouldDispatch = await decrementInDegree(runId, 'd', tenantId);
     expect(shouldDispatch).toBe(false);
   });
 
   // Acceptance Check: The exact double-dispatch race condition
   it('prevents double dispatch when two workers finish concurrently', async () => {
     const concurrentRunId = `test-concurrent-${Date.now()}`;
-    await seedInDegrees(concurrentRunId, DIAMOND_EDGES);
+    await seedInDegrees(concurrentRunId, DIAMOND_EDGES, tenantId);
 
     // One parent finishes normally, leaving 1 remaining for 'd'
-    await decrementInDegree(concurrentRunId, 'd');
+    await decrementInDegree(concurrentRunId, 'd', tenantId);
 
     // Now 'd' has 1 remaining parent.
     // Simulating the race: 'b' and 'c' finish on different workers at the EXACT same ms.
     // They both fire decrementInDegree(concurrentRunId, 'd').
     // Only ONE should ever get true.
     const results = await Promise.all([
-      decrementInDegree(concurrentRunId, 'd'),
-      decrementInDegree(concurrentRunId, 'd'),
-      decrementInDegree(concurrentRunId, 'd'), // Let's fire 3 just to be sure
+      decrementInDegree(concurrentRunId, 'd', tenantId),
+      decrementInDegree(concurrentRunId, 'd', tenantId),
+      decrementInDegree(concurrentRunId, 'd', tenantId), // Let's fire 3 just to be sure
     ]);
 
     // Count how many got "true" (meaning they should dispatch the child)
     const trueCount = results.filter((r) => r === true).length;
-    
+
     // Core guarantee: exactly one worker gets the right to dispatch 'd'
     expect(trueCount).toBe(1);
 
     // Cleanup
-    await connection.del(`run:${concurrentRunId}:indegree`);
-    await connection.del(`run:${concurrentRunId}:dispatched`);
+    await connection.del(`${tenantId}:run:${concurrentRunId}:indegree`);
+    await connection.del(`${tenantId}:run:${concurrentRunId}:dispatched`);
   });
 });

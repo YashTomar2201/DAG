@@ -30,7 +30,7 @@ export async function cancelOneRun(
 
   // Set the hard-cancel flag FIRST (roadmap B4): a worker already running a
   // node for this run polls it and aborts its Python child within ~15 s.
-  await markRunCancelled(runId);
+  await markRunCancelled(runId, tenantId);
 
   await withTenant(tenantId, (tx) =>
     tx.run.update({

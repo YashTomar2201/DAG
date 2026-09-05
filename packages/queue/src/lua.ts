@@ -1,10 +1,22 @@
 import { connection } from './redis';
 
 /**
+ * Every run-scoped Redis key is namespaced by tenant (roadmap C2.2) —
+ * `{tenantId}:run:{runId}:{suffix}` — so two tenants sharing one Redis
+ * instance can never collide on or enumerate each other's keys, even though
+ * `runId` (a cuid) is already effectively unguessable on its own. This is the
+ * broker-layer counterpart to C2.1's Postgres RLS: that closed the DB, this
+ * closes Redis.
+ */
+function tenantRunKey(tenantId: string, runId: string, suffix: string): string {
+  return `${tenantId}:run:${runId}:${suffix}`;
+}
+
+/**
  * Lua script for atomic in-degree decrement and dispatch gating.
  *
- * KEYS[1] = run:{runId}:indegree   (hash: nodeKey -> remaining parents)
- * KEYS[2] = run:{runId}:dispatched (set of already-dispatched nodeKeys)
+ * KEYS[1] = {tenantId}:run:{runId}:indegree   (hash: nodeKey -> remaining parents)
+ * KEYS[2] = {tenantId}:run:{runId}:dispatched (set of already-dispatched nodeKeys)
  * ARGV[1] = childKey
  *
  * Returns 1 if the caller should dispatch this node.
@@ -42,10 +54,11 @@ declare module 'ioredis' {
  */
 export async function decrementInDegree(
   runId: string,
-  childKey: string
+  childKey: string,
+  tenantId: string
 ): Promise<boolean> {
-  const indegreeKey = `run:${runId}:indegree`;
-  const dispatchedKey = `run:${runId}:dispatched`;
+  const indegreeKey = tenantRunKey(tenantId, runId, 'indegree');
+  const dispatchedKey = tenantRunKey(tenantId, runId, 'dispatched');
 
   const result = await connection.decrementInDegree(
     indegreeKey,
@@ -65,7 +78,8 @@ export async function decrementInDegree(
  */
 export async function seedInDegrees(
   runId: string,
-  edges: { from: string; to: string }[]
+  edges: { from: string; to: string }[],
+  tenantId: string
 ): Promise<void> {
   const indegreeMap = new Map<string, number>();
 
@@ -78,7 +92,7 @@ export async function seedInDegrees(
   // If there are no edges, we don't need to seed anything
   if (indegreeMap.size === 0) return;
 
-  const indegreeKey = `run:${runId}:indegree`;
+  const indegreeKey = tenantRunKey(tenantId, runId, 'indegree');
   const pipeline = connection.pipeline();
 
   // Seed the hash with the initial counts
@@ -88,7 +102,7 @@ export async function seedInDegrees(
 
   // Expiration so run data doesn't accumulate forever
   pipeline.expire(indegreeKey, 7 * 24 * 3600);
-  pipeline.expire(`run:${runId}:dispatched`, 7 * 24 * 3600);
+  pipeline.expire(tenantRunKey(tenantId, runId, 'dispatched'), 7 * 24 * 3600);
 
   await pipeline.exec();
 }
@@ -97,8 +111,9 @@ export async function seedInDegrees(
 //
 // Join semantics: "any active parent" — a child runs if AT LEAST ONE incoming
 // edge was active (unconditional, or its condition passed). It is SKIPPED only
-// when EVERY incoming edge was inactive. `run:{runId}:activeParents:{childKey}`
-// is a Redis set of the parent keys whose edge into `childKey` was active. The
+// when EVERY incoming edge was inactive.
+// `{tenantId}:run:{runId}:activeParents:{childKey}` is a Redis set of the
+// parent keys whose edge into `childKey` was active. The
 // in-degree hash still decrements for every parent regardless — so a skipped
 // branch can never leave a child hanging at in-degree > 0.
 
@@ -109,8 +124,9 @@ export async function markParentActive(
   runId: string,
   childKey: string,
   parentKey: string,
+  tenantId: string,
 ): Promise<void> {
-  const key = `run:${runId}:activeParents:${childKey}`;
+  const key = tenantRunKey(tenantId, runId, `activeParents:${childKey}`);
   const p = connection.pipeline();
   p.sadd(key, parentKey);
   p.expire(key, ACTIVE_PARENTS_TTL);
@@ -118,8 +134,8 @@ export async function markParentActive(
 }
 
 /** True if any incoming edge into `childKey` has been marked active. */
-export async function hasActiveParent(runId: string, childKey: string): Promise<boolean> {
-  const key = `run:${runId}:activeParents:${childKey}`;
+export async function hasActiveParent(runId: string, childKey: string, tenantId: string): Promise<boolean> {
+  const key = tenantRunKey(tenantId, runId, `activeParents:${childKey}`);
   return (await connection.scard(key)) > 0;
 }
 
@@ -136,8 +152,8 @@ export async function hasActiveParent(runId: string, childKey: string): Promise<
 const FANOUT_JOIN_TTL = 7 * 24 * 3600;
 
 /** Returns true for exactly one caller per (parentRunId, mapNodeKey); false for the rest. */
-export async function claimFanOutJoin(parentRunId: string, mapNodeKey: string): Promise<boolean> {
-  const key = `run:${parentRunId}:fanoutJoined`;
+export async function claimFanOutJoin(parentRunId: string, mapNodeKey: string, tenantId: string): Promise<boolean> {
+  const key = tenantRunKey(tenantId, parentRunId, 'fanoutJoined');
   const p = connection.pipeline();
   p.sadd(key, mapNodeKey);
   p.expire(key, FANOUT_JOIN_TTL);
@@ -147,8 +163,8 @@ export async function claimFanOutJoin(parentRunId: string, mapNodeKey: string): 
 }
 
 /** Releases a join claim so it can fire again — used when retrying failed children (B3.4). */
-export async function clearFanOutJoinClaim(parentRunId: string, mapNodeKey: string): Promise<void> {
-  await connection.srem(`run:${parentRunId}:fanoutJoined`, mapNodeKey);
+export async function clearFanOutJoinClaim(parentRunId: string, mapNodeKey: string, tenantId: string): Promise<void> {
+  await connection.srem(tenantRunKey(tenantId, parentRunId, 'fanoutJoined'), mapNodeKey);
 }
 
 /**
@@ -157,8 +173,8 @@ export async function clearFanOutJoinClaim(parentRunId: string, mapNodeKey: stri
  * node that ran on the first attempt and the retry would silently never
  * re-dispatch it.
  */
-export async function clearDispatched(runId: string): Promise<void> {
-  await connection.del(`run:${runId}:dispatched`);
+export async function clearDispatched(runId: string, tenantId: string): Promise<void> {
+  await connection.del(tenantRunKey(tenantId, runId, 'dispatched'));
 }
 
 // ─── Hard cancellation flag (roadmap B4) ────────────────────────────────────
@@ -172,11 +188,11 @@ export async function clearDispatched(runId: string): Promise<void> {
 const CANCEL_FLAG_TTL = 24 * 3600;
 
 /** Marks a run cancelled so in-flight workers bail. Idempotent. */
-export async function markRunCancelled(runId: string): Promise<void> {
-  await connection.set(`run:${runId}:cancelled`, '1', 'EX', CANCEL_FLAG_TTL);
+export async function markRunCancelled(runId: string, tenantId: string): Promise<void> {
+  await connection.set(tenantRunKey(tenantId, runId, 'cancelled'), '1', 'EX', CANCEL_FLAG_TTL);
 }
 
 /** True once `markRunCancelled` has been called for this run. */
-export async function isRunCancelled(runId: string): Promise<boolean> {
-  return (await connection.exists(`run:${runId}:cancelled`)) === 1;
+export async function isRunCancelled(runId: string, tenantId: string): Promise<boolean> {
+  return (await connection.exists(tenantRunKey(tenantId, runId, 'cancelled'))) === 1;
 }

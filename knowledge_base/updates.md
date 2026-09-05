@@ -5,6 +5,106 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-05 — C2.2 + C2.3: tenant-namespaced Redis keys + per-tenant concurrency quota
+
+**Phase:** roadmap C2.2 and C2.3, the two remaining "small follow-on" items under C2 — closing
+the broker-layer half of multi-tenancy that C2.1's Postgres RLS didn't touch. Both roadmap items
+are Size S and closely related (both live in `packages/queue`), so shipped together.
+
+### C2.2 — tenant-namespaced Redis keys
+
+Every run-scoped Redis key the orchestrator touches was keyed by `runId` alone
+(`run:{runId}:indegree`, `:dispatched`, `:activeParents:{childKey}`, `:fanoutJoined`,
+`:cancelled`) — a `runId` (cuid) is effectively unguessable, but nothing stopped one tenant's
+Redis footprint from being enumerable or colliding with another's, the broker-layer analogue of
+the DB-layer gap C2.1 closed.
+
+- **`packages/queue/src/lua.ts`** — new `tenantRunKey(tenantId, runId, suffix)` helper:
+  `{tenantId}:run:{runId}:{suffix}`. Every exported function that builds one of these keys
+  (`decrementInDegree`, `seedInDegrees`, `markParentActive`, `hasActiveParent`, `claimFanOutJoin`,
+  `clearFanOutJoinClaim`, `clearDispatched`, `markRunCancelled`, `isRunCancelled`) gained a
+  required `tenantId` parameter.
+- **`packages/queue/src/semaphore.ts`** — same treatment (`{tenantId}:run:{runId}:slots`), even
+  though this per-run semaphore has no call site in application code yet (see Phase 9's decision
+  log — it was scaffolded but never wired into `dispatchNode`). Updated per the roadmap's explicit
+  instruction and to keep it a faithful template for C2.3's tenant-scoped semaphore.
+- **`apps/api/src/services/{orchestrator,cancel}.service.ts`**, **`apps/worker/src/worker.ts`** —
+  every call site threads the `tenantId` already in scope (all of these had it in hand already,
+  post-C2.1).
+- Two integration test files that assert on raw Redis state directly
+  (`race-condition.integration.test.ts`, `hard-cancel.integration.test.ts`) and the `@dag/queue`
+  unit suite (`lua.test.ts`) updated to use the tenant-prefixed keys / pass a `tenantId`.
+
+### C2.3 — per-tenant concurrency quota
+
+Without this, one tenant's large fan-out could saturate every worker in the cluster — the
+per-run semaphore bounds a single run's own parallelism, but does nothing once a tenant runs many
+runs at once, or many tenants share the cluster.
+
+- **`packages/db/prisma/schema.prisma`** + migration `20260905030057_c2_3_tenant_concurrency_limit`
+  — `Tenant.concurrencyLimit Int @default(20)`. Not RLS-protected: reading a tenant's own row by
+  its own id needs no `app.tenant_id` context.
+- **`packages/db/src/repositories.ts`** — `getTenantConcurrencyLimit(tenantId)`, a plain
+  (unscoped) lookup, same category as `findActiveApiKeyByHash`.
+- **`packages/queue/src/tenant-quota.ts`** (new) — `acquireTenantSlot` / `releaseTenantSlot` /
+  `getTenantActiveSlotCount` (a Redis SET, `{tenantId}:concurrency:slots`, same shape as the
+  per-run semaphore); `queueBlockedDispatch` / `popBlockedDispatch` (a Redis SET,
+  `{tenantId}:concurrency:blocked`, holding `{runId}:{nodeKey}` members); `listBlockedTenantIds`
+  (a `SCAN`, not `KEYS`, over `*:concurrency:blocked`) for the periodic sweep.
+- **`apps/api/src/services/orchestrator.service.ts`** — `dispatchNode` now acquires a tenant slot
+  *before* the `PENDING → QUEUED` claim (not after): over quota, the node is left PENDING and
+  recorded as a blocked dispatch instead of ever being claimed; losing the claim race after
+  successfully acquiring a slot releases it immediately (nothing wasted). `onNodeSucceeded` /
+  `onNodeFailed` call a new `releaseTenantSlotAndDrain(tenantId, nodeRunId)` right after their
+  transition succeeds — releases the slot, then pops and retries exactly one blocked dispatch for
+  that tenant (the common case: a busy tenant's backlog drains node-by-node as capacity frees up).
+  New exported `sweepBlockedDispatches()` — the periodic backstop the roadmap calls out explicitly
+  ("no parent will complete again" to trigger the release-side drain, e.g. a tenant's other
+  in-flight nodes are themselves long-running rather than finishing in a burst): scans every
+  tenant with a blocked dispatch and drains as many as its current spare capacity allows.
+- **`apps/api/src/index.ts`** — a 15s `setInterval` calling `sweepBlockedDispatches()`, cleared on
+  shutdown. Not started from `createApp()` (same reasoning as the scheduler worker — integration
+  tests call `createApp()` directly and a standing timer would outlive test teardown).
+- **New `apps/api/src/integration/tenant-quota.integration.test.ts`** (2 tests, real
+  Postgres/Redis/workers): (A) a tenant with 4 independent roots and a quota of 2 never has more
+  than 2 QUEUED/RUNNING at once (asserted immediately after `startRun` returns, before any real
+  work can complete), the run still reaches SUCCEEDED with every node eventually dispatched, and
+  every slot is released afterward; (B) tenant A saturating its own low quota does not delay
+  tenant B's independent run — B finishes on its own timescale while A's backlog drains separately
+  in the background, then A's run is confirmed to complete too (not silently dropped).
+
+### Known limitation, inherited from the per-run semaphore's own design
+
+The whole-key `EXPIRE` on `{tenantId}:concurrency:slots` is a backstop against a fully abandoned
+tenant (no acquire calls refreshing the TTL at all for 24h), not a per-member TTL — a slot leaked
+by a path that skips `onNodeSucceeded`/`onNodeFailed` entirely (a hard-cancelled or skipped node,
+neither of which currently releases explicitly) stays held until the whole key next goes quiet.
+The roadmap's own text anticipates and accepts this trade-off ("add a TTL on the semaphore entries
+as a backstop" — not "release on every possible termination path"); closing it properly would need
+a per-member-expiry structure (a sorted set keyed by acquire time, swept separately), which is real
+added complexity judged out of scope for a "small follow-on" item.
+
+### Verification
+
+- Full Testcontainers integration suite: **17 files / 54 tests green** (16/52 from before C2.2/
+  C2.3 plus the 2 new tenant-quota tests), run in isolation.
+- Live smoke against the real Docker stack: set the dev tenant's `concurrencyLimit` to 2, started a
+  run with 4 independent `model.evaluate` roots — API logs show `r0`/`r1` dispatched immediately,
+  `r2`/`r3` explicitly logged as "Dispatch deferred — tenant concurrency quota exceeded", then both
+  drained and dispatched automatically once `r0`/`r1` released their slots; all 4 nodes eventually
+  SUCCEEDED. Confirmed `default:concurrency:slots` / `default:concurrency:blocked` populated live
+  mid-run via `redis-cli`, and `redis-cli KEYS 'default:run:{runId}:*'` on an edged graph showed
+  `indegree`/`dispatched`/`activeParents:b` all correctly tenant-prefixed.
+- `pnpm -r typecheck` / `pnpm -r lint` green across all 7 workspace packages.
+
+### Rebuild note
+
+`@dag/queue` + `@dag/db` (new column) + api → `docker compose build api worker`; schema change →
+`docker compose build migrate`, `run --rm migrate` (or let `depends_on:
+service_completed_successfully` handle it on `up`).
+
+---
+
 ## 2026-09-05 — C2.1: Postgres Row-Level Security
 
 **Phase:** roadmap C2.1. A3 closed tenant isolation at the *route* layer (every

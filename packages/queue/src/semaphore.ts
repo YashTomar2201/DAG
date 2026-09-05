@@ -22,7 +22,13 @@
  *   held. If at the limit, dispatch is deferred — the orchestrator will retry
  *   when a slot is freed.
  *
- *   Key: `run:{runId}:slots`   Type: Redis SET   Members: nodeKeys in-flight
+ *   Key: `{tenantId}:run:{runId}:slots`   Type: Redis SET   Members: nodeKeys in-flight
+ *
+ *   Namespaced by tenant (roadmap C2.2), same as every other run-scoped key
+ *   in `lua.ts` — keeps two tenants' Redis footprints from ever colliding or
+ *   being enumerable from one another, even though this semaphore isn't
+ *   wired into `dispatchNode` yet (that's roadmap C2.3, which copies this
+ *   file's shape for a tenant-scoped quota rather than a per-run one).
  */
 
 import type { Redis } from 'ioredis';
@@ -42,9 +48,10 @@ export async function acquireConcurrencySlot(
   redis: Redis,
   runId: string,
   nodeKey: string,
+  tenantId: string,
   maxSlots = DEFAULT_MAX_SLOTS,
 ): Promise<boolean> {
-  const key = `run:${runId}:slots`;
+  const key = `${tenantId}:run:${runId}:slots`;
 
   // Atomic Lua script: check cardinality, add if below limit.
   // Returns 1 if slot was acquired, 0 if at limit.
@@ -74,8 +81,9 @@ export async function releaseConcurrencySlot(
   redis: Redis,
   runId: string,
   nodeKey: string,
+  tenantId: string,
 ): Promise<void> {
-  const key = `run:${runId}:slots`;
+  const key = `${tenantId}:run:${runId}:slots`;
   await redis.srem(key, nodeKey);
 }
 
@@ -83,7 +91,7 @@ export async function releaseConcurrencySlot(
  * Returns the number of currently held slots for a run.
  * Useful for observability and testing.
  */
-export async function getActiveSlotCount(redis: Redis, runId: string): Promise<number> {
-  const key = `run:${runId}:slots`;
+export async function getActiveSlotCount(redis: Redis, runId: string, tenantId: string): Promise<number> {
+  const key = `${tenantId}:run:${runId}:slots`;
   return redis.scard(key);
 }

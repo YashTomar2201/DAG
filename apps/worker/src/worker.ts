@@ -58,7 +58,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
 
   // 0. Hard-cancel pre-check (roadmap B4): the run may have been cancelled
   //    while this job sat in the queue — don't even start the executor.
-  if (await isRunCancelled(runId)) {
+  if (await isRunCancelled(runId, tenantId)) {
     await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'CANCELLED', tenantId, { finishedAt: new Date() });
     await publishNodeCancelled();
     logger.info({ runId, nodeKey }, 'Worker: run cancelled before start — skipping');
@@ -92,7 +92,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
   //    executor (which forwards the signal to its Python child) on a hit.
   const controller = new AbortController();
   const cancelPoll = setInterval(() => {
-    void isRunCancelled(runId).then((cancelled) => {
+    void isRunCancelled(runId, tenantId).then((cancelled) => {
       if (cancelled && !controller.signal.aborted) {
         logger.info({ runId, nodeKey }, 'Worker: run cancelled — aborting executor');
         controller.abort();
@@ -137,7 +137,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
   } catch (err) {
     // A cancelled run: land the NodeRun on CANCELLED (the cancel path likely
     // already did via updateMany) and return normally so BullMQ does NOT retry.
-    if (controller.signal.aborted || err instanceof PythonCancelledError || (await isRunCancelled(runId))) {
+    if (controller.signal.aborted || err instanceof PythonCancelledError || (await isRunCancelled(runId, tenantId))) {
       await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'CANCELLED', tenantId, { finishedAt: new Date() });
       await publishNodeCancelled();
       logger.info({ runId, nodeKey }, 'Worker: executor stopped by cancellation');

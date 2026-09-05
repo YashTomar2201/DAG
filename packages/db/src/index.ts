@@ -59,6 +59,7 @@ export {
   workflowBelongsToTenant,
   runBelongsToTenant,
   resolveTenantForRun,
+  getTenantConcurrencyLimit,
   // API Keys (A3)
   findActiveApiKeyByHash,
   createApiKey,

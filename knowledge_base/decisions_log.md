@@ -1398,3 +1398,80 @@ state. The general lesson: a signature change to a shared package is only as saf
 consumer that got typechecked — `pnpm -r typecheck` (not per-package) is the check that actually
 proves nothing was missed, and a hanging/timing-out integration test is itself a signal worth
 reading literally rather than attributing to test flakiness.
+
+---
+
+## Roadmap C2.2 — Tenant-Namespaced Redis Keys
+
+### Decision: `{tenantId}:run:{runId}:{suffix}`, Not a Separate Redis Instance/Database Per Tenant
+
+**Why:** Redis supports numbered logical databases (`SELECT n`) and a real deployment could run a
+dedicated Redis instance per tenant, but both are heavier isolation than the actual threat model
+calls for. The risk C2.2 closes is a bug or an operator running `redis-cli KEYS '*'` (or a script
+iterating keys) accidentally reading or touching another tenant's run state — a `runId` (cuid) is
+already unguessable, so the realistic gap was never "tenant B computes tenant A's key," it was "a
+shared, un-prefixed keyspace has no visible boundary at all." A string prefix on every key gives
+`redis-cli KEYS 'tenantA:*'` a real, auditable boundary at zero infrastructure cost, matches the
+granularity C2.1's Postgres RLS already established (row-level, not database-per-tenant), and adds
+no new failure mode (a second Redis connection pool per tenant, a `SELECT` before every command)
+for a threat that doesn't need it.
+
+### Decision: `semaphore.ts` Gets the Same Prefix Even Though It Has No Caller Yet
+
+**Why:** `packages/queue/src/semaphore.ts` (the per-run concurrency semaphore, Phase 9) was
+scaffolded with real functions and real tests-worthy logic but was never actually wired into
+`dispatchNode` — grep confirms zero call sites in application code. It would have been reasonable
+to skip it as dead code, but the roadmap text for C2.2 explicitly names both `lua.ts` *and*
+`semaphore.ts`, and C2.3 (immediately next) explicitly copies this file's shape for the new
+tenant-scoped quota semaphore. Leaving `semaphore.ts` on the old unprefixed key scheme would have
+meant C2.3's new code and this file's existing code disagreed on the correct pattern for the exact
+same kind of key, which is a worse outcome than a few lines of otherwise-unexercised code getting
+updated for consistency.
+
+---
+
+## Roadmap C2.3 — Per-Tenant Concurrency Quota
+
+### Decision: Acquire the Tenant Slot BEFORE the `PENDING → QUEUED` Claim, Not After
+
+**Why:** `dispatchNode`'s existing pattern (Phase 6) claims a node via a conditional Postgres
+`UPDATE` before ever touching BullMQ, specifically so a lost claim costs nothing — the loser just
+returns. The tenant quota check needed the identical property for the same reason: if quota were
+checked *after* claiming the node (transitioning it to QUEUED) and found to be exceeded, the node
+would already be QUEUED with no job on any BullMQ queue — a orphaned row that nothing would ever
+pick up, since QUEUED is not a state `dispatchNode` (or anything else) re-attempts from. Checking
+the quota first means an over-quota node is left cleanly PENDING — the same state it would be in if
+`dispatchNode` had simply never been called yet — which is both correct and exactly what the
+roadmap's "leave the node PENDING" instruction describes.
+
+### Decision: A Release Immediately Drains ONE Blocked Dispatch, Not the Whole Backlog
+
+**Why:** When a slot frees up, exactly one unit of capacity became available — draining more than
+one blocked dispatch from that single release would let the tenant briefly exceed its quota again
+(a re-introduction of the exact bug this feature exists to prevent). Popping and retrying exactly
+one blocked dispatch per release keeps the invariant "held slots ≤ concurrencyLimit" true at every
+instant, not just eventually. The periodic sweep (`sweepBlockedDispatches`) is a separate, coarser
+mechanism that recomputes actual spare capacity (`limit - active`) before draining, which is why it
+CAN safely drain more than one at a time — it isn't reacting to a single just-freed slot, it's
+correcting for accumulated drift.
+
+### Decision: The Periodic Sweep Uses `SCAN`, Not `KEYS`, and Exists Only Because of a Named Roadmap Gap
+
+**Why:** The roadmap's own C2.3 steps flag the gap directly: a release-triggered drain only fires
+when *something completes* — if a tenant's blocked node is waiting on capacity that a genuinely
+stuck or abandoned run will never free (its holder crashed without reaching a terminal state, or
+simply never will), nothing ever retries it without an independent, time-based check. `SCAN` (not
+`KEYS`) was chosen because this sweep runs unconditionally every 15s in a live API process — `KEYS`
+blocks the single-threaded Redis event loop for its entire O(N) scan, which is an acceptable one-off
+cost for a test's cleanup step but not for a command a production process issues forever. `SCAN`'s
+cursor-based iteration returns the same eventual result in bounded per-call slices, at the cost of
+needing a loop (see `listBlockedTenantIds`) rather than one call.
+
+### Decision: `Tenant.concurrencyLimit` Defaults to 20, Same as the Per-Run Semaphore's Default
+
+**Why:** No product requirement specified an exact number — the roadmap text itself says "e.g. 20."
+Reusing `semaphore.ts`'s own `DEFAULT_MAX_SLOTS` value keeps the two concurrency knobs (per-run,
+per-tenant) at a consistent, easy-to-reason-about scale rather than introducing an arbitrary second
+number with no stated justification. A real deployment would tune this per paying tier via the
+`Tenant` row directly — there is deliberately no route to change it yet (out of C2.3's stated scope,
+which is the enforcement mechanism, not a tenant-management UI).

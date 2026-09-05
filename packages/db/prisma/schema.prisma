@@ -48,8 +48,14 @@ enum RunStatus {
 model Tenant {
   id        String     @id @default(cuid())
   name      String
-  workflows Workflow[]
-  apiKeys   ApiKey[]
+  /// Roadmap C2.3 — max NodeRuns this tenant may have QUEUED/RUNNING across
+  /// the whole cluster at once, enforced by a Redis semaphore in
+  /// `dispatchNode` (see `packages/queue/src/tenant-quota.ts`). Not RLS-
+  /// protected (roadmap C2.1 scoped RLS to Workflow/Run/NodeRun/RunEvent) —
+  /// reading a tenant's own quota by its own id needs no tenant context.
+  concurrencyLimit Int        @default(20)
+  workflows        Workflow[]
+  apiKeys          ApiKey[]
 }
 
 /// Roadmap A3 — a bearer credential that resolves to a tenant. The raw key is
