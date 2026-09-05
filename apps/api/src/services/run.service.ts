@@ -1,4 +1,4 @@
-import { prisma, getRunEvents, getChildRunSummary, listChildRuns } from '@dag/db';
+import { prisma, getRunEvents, getChildRunSummary, listChildRuns, runBelongsToTenant } from '@dag/db';
 import { NotFoundError } from '../errors';
 import { dispatchNode, retryFanOutChildren } from './orchestrator.service';
 import { cancelRunTree } from './cancel.service';
@@ -14,8 +14,14 @@ import { logger } from '../logger';
  * computed with a `groupBy` — never by loading the child rows. It is an
  * all-zero summary for an ordinary run, so existing consumers see no change in
  * shape beyond the new key.
+ *
+ * Roadmap A3: `tenantId` must belong to the run's own workflow, or this 404s
+ * exactly like a run that doesn't exist — a leaked/guessed run id from
+ * another tenant must never be distinguishable from a wrong id.
  */
-export async function getRunService(runId: string) {
+export async function getRunService(runId: string, tenantId: string) {
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
+
   const run = await prisma.run.findUnique({
     where: { id: runId },
     include: {
@@ -53,10 +59,10 @@ const CHILDREN_PAGE_MAX = 200;
  */
 export async function listRunChildrenService(
   runId: string,
+  tenantId: string,
   opts: { limit?: number; cursor?: string } = {},
 ) {
-  const run = await prisma.run.findUnique({ where: { id: runId }, select: { id: true } });
-  if (!run) throw new NotFoundError('Run', runId);
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
   const limit = Math.min(Math.max(opts.limit ?? CHILDREN_PAGE_DEFAULT, 1), CHILDREN_PAGE_MAX);
   return listChildRuns(runId, { limit, cursor: opts.cursor });
@@ -66,13 +72,8 @@ export async function listRunChildrenService(
  * Returns persisted RunEvents for SSE replay.
  * `afterId` is the `Last-Event-ID` cursor from a reconnecting SSE client.
  */
-export async function getRunEventsService(runId: string, afterId?: string) {
-  // Verify the run exists
-  const run = await prisma.run.findUnique({
-    where: { id: runId },
-    select: { id: true },
-  });
-  if (!run) throw new NotFoundError('Run', runId);
+export async function getRunEventsService(runId: string, tenantId: string, afterId?: string) {
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
   const cursorId = afterId ? BigInt(afterId) : undefined;
   return getRunEvents(runId, cursorId);
@@ -85,9 +86,8 @@ export async function getRunEventsService(runId: string, afterId?: string) {
  * run is marked CANCELLED, its still-queued BullMQ jobs are removed, and its
  * non-terminal NodeRuns are CANCELLED. See `cancel.service.ts`.
  */
-export async function cancelRunService(runId: string) {
-  const run = await prisma.run.findUnique({ where: { id: runId }, select: { id: true } });
-  if (!run) throw new NotFoundError('Run', runId);
+export async function cancelRunService(runId: string, tenantId: string) {
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
   const result = await cancelRunTree(runId);
   logger.info({ runId, ...result }, 'Run cancel');
@@ -109,7 +109,9 @@ export async function cancelRunService(runId: string) {
  *
  * The run transitions back to RUNNING after this call.
  */
-export async function retryFailedNodesService(runId: string) {
+export async function retryFailedNodesService(runId: string, tenantId: string) {
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
+
   const run = await prisma.run.findUnique({
     where: { id: runId },
     include: {

@@ -3,7 +3,6 @@ import type { Graph } from '@dag/contracts';
 import { detectCycle, topologicalSort } from '@dag/graph-core';
 import type { TopologicalSortResult } from '@dag/graph-core';
 import {
-  prisma,
   createWorkflow,
   createWorkflowVersion,
   listWorkflows,
@@ -12,6 +11,7 @@ import {
   listWorkflowVersions,
   renameWorkflow,
   softDeleteWorkflow,
+  workflowBelongsToTenant,
 } from '@dag/db';
 import { CycleError, NotFoundError } from '../errors';
 
@@ -118,21 +118,21 @@ export async function deleteWorkflowService(id: string, tenantId: string) {
 
 export interface CreateVersionInput {
   workflowId: string;
+  tenantId: string;
   graph: unknown;
 }
 
 /**
  * Validates the graph and appends a new immutable version to an existing workflow.
  * Returns HTTP 422 (via CycleError) if the graph has a cycle.
- * Returns HTTP 404 (via NotFoundError) if the workflow doesn't exist.
+ * Returns HTTP 404 (via NotFoundError) if the workflow doesn't exist OR
+ * belongs to a different tenant — this used to check existence only, which
+ * meant any authenticated caller could append a version to ANY workflow by
+ * id, not just their own (roadmap A3 caught this as part of "every path must
+ * filter by tenant, not just look up by id").
  */
 export async function createVersionService(input: CreateVersionInput) {
-  // Verify the workflow exists before creating a version
-  const workflow = await prisma.workflow.findUnique({
-    where: { id: input.workflowId },
-    select: { id: true },
-  });
-  if (!workflow) {
+  if (!(await workflowBelongsToTenant(input.workflowId, input.tenantId))) {
     throw new NotFoundError('Workflow', input.workflowId);
   }
 

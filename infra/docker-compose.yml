@@ -67,7 +67,10 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.api
       target: build
-    command: ["pnpm", "--filter", "@dag/db", "run", "db:migrate:deploy"]
+    # Runs migrations, then seeds a dev tenant + API key (roadmap A3) so the
+    # editor has something to authenticate with out of the box — see
+    # packages/db/prisma/seed.ts for why the key is fixed rather than random.
+    command: ["sh", "-c", "pnpm --filter @dag/db run db:migrate:deploy && pnpm --filter @dag/db run db:seed"]
     environment:
       DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
     depends_on:
@@ -86,6 +89,13 @@ services:
       REDIS_URL: redis://redis:6379
       API_PORT: 3001
       ARTIFACT_DIR: /data/artifacts
+      # Dev-only fixed values, same spirit as the postgres/redis passwords
+      # above — a real deployment must override both (env.ts refuses to boot
+      # with these under NODE_ENV=production... which this dev compose file
+      # also sets, so they have to be *something* other than the code's own
+      # dev-default strings for the container to start at all).
+      METRICS_TOKEN: local-dev-metrics-token
+      EVENTS_TOKEN_SECRET: local-dev-events-token-secret
       NODE_ENV: production
     volumes:
       - artifact_data:/data/artifacts

@@ -63,7 +63,7 @@ describe('B4 — hard cancellation', () => {
     const jobId = ctx.queue.createJobId(run.id, 'train', trainNr!.attempt);
 
     const cancelledAt = Date.now();
-    const result = await ctx.runService.cancelRunService(run.id);
+    const result = await ctx.runService.cancelRunService(run.id, tenantId);
     expect(result.status).toBe('CANCELLED');
     expect(await ctx.queue.isRunCancelled(run.id)).toBe(true);
 

@@ -4,6 +4,8 @@ import { runRouter } from './routes/run.routes';
 import { scheduleRouter } from './routes/schedule.routes';
 import { triggerRouter } from './routes/trigger.routes';
 import { errorHandler } from './middleware/errorHandler';
+import { requireApiKey } from './middleware/auth';
+import { requireMetricsToken } from './middleware/metricsAuth';
 import { registry, renderMetrics } from './metrics';
 
 /**
@@ -55,7 +57,10 @@ export function createApp(): Express {
 
   // ── Prometheus-style metrics (Phase 12) ────────────────────────────────────
   // See metrics.ts for what each series means and why it's computed per-scrape.
-  app.get('/metrics', async (_req, res, next) => {
+  // Protected by a static shared secret (roadmap A3), not an API key — see
+  // middleware/metricsAuth.ts for why a scraper needs a different shape of
+  // credential than a tenant.
+  app.get('/metrics', requireMetricsToken, async (_req, res, next) => {
     try {
       res.set('Content-Type', registry.contentType);
       res.send(await renderMetrics());
@@ -64,12 +69,17 @@ export function createApp(): Express {
     }
   });
 
-  // ── API routes ────────────────────────────────────────────────────────────
-  app.use('/workflows', workflowRouter);
+  // ── API routes (roadmap A3: every one of these requires a verified API key) ──
+  // `requireApiKey` sets `req.tenantId`; every route/service downstream reads
+  // that instead of a client-supplied `tenantId` field. `workflowRouter` mounts
+  // under a path prefix with no exceptions, so `app.use(path, requireApiKey, ...)`
+  // scopes the check correctly. `runRouter`, `scheduleRouter`, and
+  // `triggerRouter` each have at least one route that can't require a normal
+  // API key (the SSE stream — `EventSource` can't send custom headers — and
+  // the public webhook receiver), so they apply `requireApiKey` to their own
+  // routes internally instead of at the mount point here.
+  app.use('/workflows', requireApiKey, workflowRouter);
   app.use('/runs', runRouter);
-  // Schedules (B2) and triggers own absolute paths (/workflows/:id/schedules,
-  // /schedules/:id, /workflows/:id/triggers, /triggers/:id, /triggers/:token),
-  // so they mount at the root rather than under a shared prefix.
   app.use(scheduleRouter);
   app.use(triggerRouter);
 

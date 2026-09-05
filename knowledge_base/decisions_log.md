@@ -1182,3 +1182,108 @@ prefix pattern after N days) or a periodic sweep keyed off `Run.finishedAt`
 that calls `store` deletes directly; the former is simpler and doesn't need
 this codebase to run anything on a schedule, so it's the more likely answer
 when this is actually built.
+
+---
+
+## A3 — API-Key Authentication (`apps/api`, `packages/db`, `apps/web`)
+
+### Decision: pull A3 forward, out of its original track order
+
+The user asked for C2 (Postgres RLS, tenant-namespaced Redis, per-tenant
+quotas) next. C2's own roadmap text says it requires an authenticated tenant
+first, and it's easy to see why: RLS enforced via
+`current_setting('app.tenant_id')` set from a value the caller still typed
+into a query string isn't isolation, it's the same hole wearing a
+database-shaped costume. Rather than build C2 on that foundation (or silently
+reinterpret "authenticated" to mean the existing shim), A3 got built first —
+asked the user which they preferred rather than assuming, since it changes
+what gets built this session, not just how.
+
+### Decision: `tenantOf(req)` stays as the read path, only its implementation changes
+
+Every route already called `tenantOf(req)` (a query-param shim) rather than
+reading `req.query['tenantId']` inline. That indirection turned out to be
+exactly the right seam: swapping its body from "read the query string" to
+"read `req.tenantId`, set by `requireApiKey`" meant most route files needed
+zero changes. The one file that didn't already use the shared helper —
+`workflow.routes.ts` had its own copy-pasted local `tenantOf` — got
+consolidated onto the shared one while touching it anyway.
+
+### Decision: `req.tenantId` is optional at the type level, asserted at the point of use
+
+Augmenting Express's `Request` with a *required* `tenantId: string` seemed
+like the obviously-correct way to make "every route must authenticate" a
+compile-time fact. It doesn't work: TypeScript has no way to know
+`requireApiKey` ran before a given handler, so the type applies to *every*
+`Request` everywhere, including inside `requireApiKey` itself before it's set
+one — the whole app failed to typecheck. `tenantId?: string` on the
+augmentation plus a runtime assertion inside `tenantOf()` (throws a plain
+`Error`, not `UnauthorizedError` — this is a wiring bug in app.ts, not
+something a caller can trigger) gets the same practical guarantee without
+fighting the type system: every real caller of `tenantOf()` sits behind
+`requireApiKey`, so the assertion never actually fires in production; it
+exists to fail loudly if a future route forgets the middleware, rather than
+silently proceeding with `tenantId = undefined`.
+
+### Decision: `SSE` gets its own token, not an `Authorization` exemption
+
+`GET /runs/:id/events` is the one route that generically cannot present an
+API key the normal way — browsers' `EventSource` doesn't support custom
+request headers, full stop. The tempting shortcut is to leave that one route
+unauthenticated ("it's just a read, and only event *types* leak, not data")
+— rejected, because NODE_LOG events carry real log line content, and "just
+this one route skips auth" is exactly the kind of exception that gets copied
+elsewhere later. Instead: a normal authenticated request
+(`POST /runs/:id/events-token`) mints an HMAC-signed token scoped to exactly
+one `(tenantId, runId)` pair, valid ~30 minutes, and the stream URL carries
+that instead of a header. Nothing is stored server-side for this — verification
+is one `timingSafeEqual` against a recomputed signature, so there's no token
+table to clean up and no state to leak. The real cost: `EventSource`'s native
+reconnect-on-drop reuses the exact URL it was given, so a connection that
+drops and auto-reconnects after the token has expired will fail silently
+(the browser just keeps retrying with a now-invalid token). Documented as a
+known rough edge in `client.ts` rather than solved — the fix is "close and
+re-open the stream with a fresh token," which is a product decision about
+when to detect staleness, not something this phase needed to build.
+
+### Bug found while wiring the SSE route: mounting `requireApiKey` without a path applies it globally
+
+The first draft wrote `app.use(requireApiKey, scheduleRouter)` in `app.ts`,
+mirroring `app.use('/workflows', requireApiKey, workflowRouter)` right above
+it. The difference matters: Express scopes path-prefixed middleware
+(`app.use('/workflows', mw, router)`) to requests actually matching that
+prefix, but un-prefixed middleware (`app.use(mw, router)`) runs for *every*
+request that reaches that point in the stack, regardless of which router
+ultimately handles it — including `triggerRouter`'s public webhook receiver,
+mounted right after. That would have 401'd every webhook delivery. Caught by
+reading the diff before running anything, not by a test — a good argument for
+mounting auth *inside* the router file it protects (`scheduleRouter.use(requireApiKey)`)
+whenever a router doesn't own a clean path prefix, rather than at the
+composition point in `app.ts`, where it's easy to assume path-scoping applies
+when it doesn't.
+
+### Decision: fix the `createVersionService` tenant-ownership gap here, not defer it
+
+While threading `tenantId` through every route, `createVersionService`
+(`POST /workflows/:id/versions`) turned out to check that the workflow
+*existed*, never that it belonged to the caller — a pre-existing bug, not
+something A3 introduced, but the exact category of bug A3 exists to close
+("every path must filter by tenant, not just look up by id" — this codebase's
+own words, written for the read paths, applied here to a write path nobody
+had gotten to yet). Fixing it was a two-line change once the tenant was
+already in scope at the route; deferring it to a separate pass would have
+meant shipping A3 while knowingly leaving open the exact class of hole it was
+built to close.
+
+### Decision: the dev seed key is fixed, not randomly generated
+
+A real `ApiKey` is meant to be shown exactly once, which is why only its hash
+is stored. But `apps/web`'s Docker image bakes `VITE_API_KEY` in at *build*
+time (`ARG`/`ENV` in `Dockerfile.web`, same mechanism `VITE_API_URL` already
+used) — long before any container that could generate and display a random
+key has run. A fixed, well-known value (`dev-key-local-only`) lets
+`packages/db/prisma/seed.ts`, the web build, and a developer's own `curl`
+testing all agree on one working credential with zero manual steps, matching
+the "it just works" experience the old `?tenantId=default` shim gave for
+free. This is explicitly a local-dev convenience: a real deployment seed
+would generate a random key and print it once, never commit a fixed string.

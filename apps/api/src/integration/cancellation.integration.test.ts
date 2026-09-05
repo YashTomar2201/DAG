@@ -63,7 +63,7 @@ describe('Phase 12 — cancellation mid-run', () => {
       return nr?.status === 'SUCCEEDED';
     });
 
-    const result = await ctx.runService.cancelRunService(run.id);
+    const result = await ctx.runService.cancelRunService(run.id, tenantId);
     expect(result.alreadyTerminal).toBe(false);
     expect(result.status).toBe('CANCELLED');
 

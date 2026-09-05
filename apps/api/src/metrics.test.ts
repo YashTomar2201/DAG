@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
+import { env } from './env';
 
 vi.mock('@dag/db', () => ({
   countNodeRunsByStatus: vi.fn().mockResolvedValue({ SUCCEEDED: 3, RUNNING: 1, FAILED: 0 }),
@@ -33,11 +34,19 @@ describe('GET /metrics', () => {
     vi.clearAllMocks();
   });
 
-  it('returns Prometheus text-exposition format with all four metric families', async () => {
+  it('rejects a scrape with no metrics token (roadmap A3)', async () => {
     const { createApp } = await import('./app');
     const app = createApp();
 
     const res = await request(app).get('/metrics');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns Prometheus text-exposition format with all four metric families', async () => {
+    const { createApp } = await import('./app');
+    const app = createApp();
+
+    const res = await request(app).get('/metrics').set('Authorization', `Bearer ${env.METRICS_TOKEN}`);
 
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/plain/);
@@ -67,7 +76,7 @@ describe('GET /metrics', () => {
 
     nodeDurationSeconds.observe({ nodeType: 'pandas.preprocess', outcome: 'succeeded' }, 1.5);
 
-    const res = await request(app).get('/metrics');
+    const res = await request(app).get('/metrics').set('Authorization', `Bearer ${env.METRICS_TOKEN}`);
     expect(res.text).toContain('dag_node_duration_seconds_count{nodeType="pandas.preprocess",outcome="succeeded"} 1');
   });
 });

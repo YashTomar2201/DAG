@@ -19,7 +19,7 @@ import {
  *   CycleError     → 422  (graph is structurally invalid — cycle detected)
  *   NotFoundError  → 404
  *   ConflictError  → 409
- *   UnauthorizedError → 401  (bad / missing webhook HMAC signature)
+ *   UnauthorizedError → 401  (bad/missing API key, metrics token, or webhook HMAC signature)
  *   everything else→ 500  (unexpected; include correlation id for log lookup)
  *
  * Express identifies this as an error handler because it has 4 parameters.

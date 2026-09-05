@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { prisma } from '@dag/db';
+import { prisma, runBelongsToTenant } from '@dag/db';
 import { env } from '../env';
 import { NotFoundError, ValidationError } from '../errors';
 
@@ -45,18 +45,20 @@ export type ArtifactDownload =
 /**
  * Resolves `output[field]` on the given NodeRun into a download descriptor.
  *
- * Multi-tenancy note: like every other run-read route in this codebase today
- * (`GET /runs/:id`, `POST /runs/:id/cancel`, ...), this does not check the
- * caller's `tenantId` — see KNOWN_LIMITATIONS.md §1, that's a pre-existing,
- * documented gap this route doesn't newly introduce. It DOES check that the
- * requested key's own `{runId}/...` prefix matches the run being queried, so
- * the route can't be used to fetch an arbitrary key by guessing a field name.
+ * Roadmap A3: `tenantId` must own the run, checked the same way every other
+ * run route checks it (`runBelongsToTenant`) — 404, not 403, on a mismatch.
+ * Independently, it also checks that the requested key's own `{runId}/...`
+ * prefix matches the run being queried, so the route can't be used to fetch
+ * an arbitrary key by guessing a field name even within the right tenant.
  */
 export async function resolveArtifactDownload(
   runId: string,
   nodeKey: string,
   field: string,
+  tenantId: string,
 ): Promise<ArtifactDownload> {
+  if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
+
   const nodeRun = await prisma.nodeRun.findFirst({
     where: { runId, nodeKey },
     select: { output: true },

@@ -5,6 +5,88 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-05 — A3: API-key authentication (unblocks C2)
+
+**Phase:** roadmap A3, pulled forward ahead of C2 because C2 (Postgres RLS,
+tenant-namespaced Redis keys, per-tenant quotas) explicitly requires an
+authenticated tenant first — building RLS on top of an unauthenticated
+`?tenantId=` query param would just be the same spoofable gap in a different
+layer. `tenantId` now comes from a verified credential everywhere it's used.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** — `ApiKey { id, tenantId, name, hash,
+  createdAt, revokedAt }`. Only the SHA-256 `hash` is ever stored; the raw key
+  exists only in the caller's hands and (once) in the seed/creation response.
+  Migration `20260904235403_a3_api_keys`.
+- **`packages/db/src/repositories.ts`** — `findActiveApiKeyByHash`,
+  `createApiKey`, and `runBelongsToTenant` (join through
+  `Run → WorkflowVersion → Workflow.tenantId`, since `Run`/`NodeRun` have no
+  `tenantId` column of their own — denormalising one is C2.1's job, not A3's).
+- **`apps/api/src/middleware/auth.ts`** (new) — `requireApiKey` reads
+  `Authorization: Bearer <key>`, hashes it, looks up the tenant, sets
+  `req.tenantId`; same 401 whether the header is missing, malformed, or the
+  key is unknown/revoked (never leaks which).
+- **`apps/api/src/middleware/metricsAuth.ts`** (new) — `/metrics` gets a
+  separate static `METRICS_TOKEN`, not an API key: a Prometheus scrape has one
+  fixed credential configured once, not a per-tenant login.
+- **`apps/api/src/services/events-token.service.ts`** (new) — `EventSource`
+  can't send `Authorization`, so `GET /runs/:id/events` accepts a short-lived
+  (~30 min) HMAC-signed, single-run-scoped token instead, minted by a new
+  authenticated `POST /runs/:id/events-token` call.
+- **Every route now checks tenant ownership, not just existence** — this is
+  where A3 caught a real, independent bug: `createVersionService`
+  (`POST /workflows/:id/versions`) previously verified the workflow *existed*
+  and appended a version regardless of who owned it. Any authenticated tenant
+  could have appended a version to *any* workflow by id. Fixed alongside the
+  auth work since it's the same "trust the id, not just the credential"
+  mistake A3 is about closing everywhere else (`getRunService`,
+  `cancelRunService`, `retryFailedNodesService`, `listRunChildrenService`,
+  `resolveArtifactDownload`, and `startRun` when called from `POST /runs`, all
+  gained a tenant-ownership check via `runBelongsToTenant`/
+  `workflowBelongsToTenant`).
+- **`apps/web/src/api/client.ts`** — every request carries
+  `Authorization: Bearer ${API_KEY}` (default: the fixed dev key
+  `packages/db/prisma/seed.ts` seeds, so `docker compose up` still demos with
+  zero setup — same pattern `VITE_API_URL` already used). `openRunEventStream`
+  is now `async`: it mints an events-token first, then opens the
+  `EventSource` with it in the query string.
+- **`packages/db/prisma/seed.ts`** (new) — idempotent: upserts a `default`
+  tenant and seeds one fixed dev API key if it doesn't already exist. Wired
+  into the `migrate` one-shot compose service, run after every
+  `migrate deploy`.
+
+### Why the dev API key is fixed, not random
+
+A real API key can only be shown once by design — that's the whole point of
+storing a hash, not the key. But `apps/web`'s Docker build bakes
+`VITE_API_KEY` into the bundle at *build* time (same mechanism as
+`VITE_API_URL`), which happens before any container that could generate and
+display a random key has even started. A fixed, well-known dev value
+(`dev-key-local-only`) is what lets the whole stack — seed, worker, api, web
+— agree on a working credential with no manual "copy the key from the
+migrate container's logs" step. A production seed would generate a random key
+and print it once; this one deliberately doesn't, because "works out of the
+box" is the actual goal of the dev seed.
+
+### Verification
+
+- New `apps/api/src/integration/auth.integration.test.ts` (7 tests): seeds
+  two independent tenants, starts a real run under tenant A, and proves
+  tenant B's key 404s reading it, listing its children, cancelling it, and
+  retrying it — plus that tenant B cannot start a run against tenant A's
+  `workflowVersionId`, and that an internal caller omitting `tenantId`
+  (schedule/trigger fire handlers, which already resolved the versionId
+  through their own tenant-scoped lookup) is unaffected.
+- `api.test.ts`/`metrics.test.ts` (supertest-driven unit tests, the ones that
+  actually exercise the Express app) updated to authenticate every request
+  and gained explicit 401 cases (missing header, invalid key, missing metrics
+  token).
+- Full Testcontainers integration suite: 16 files / 52 tests, green.
+- Full `pnpm -r typecheck` / `lint` green across all 7 workspace packages.
+
+---
+
 ## 2026-09-05 — C1.2: S3/MinIO artifact backend + download links
 
 **Phase:** roadmap C1.2. Where C1.1 made every executor go through an

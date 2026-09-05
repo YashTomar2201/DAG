@@ -15,6 +15,10 @@
 # here to read a runtime environment variable from. Changing the API URL
 # means rebuilding this image with a different --build-arg, not editing an
 # env var on a running container.
+#
+# VITE_API_KEY (roadmap A3) is the same story: baked in at build time,
+# defaulting to the fixed dev key `packages/db/prisma/seed.ts` seeds so the
+# demo works out of the box. A real deployment overrides it with a real key.
 
 FROM node:22-alpine AS base
 RUN corepack enable && corepack prepare pnpm@11.6.0 --activate
@@ -29,7 +33,9 @@ FROM fetch AS build
 COPY . .
 RUN pnpm install --offline --frozen-lockfile
 ARG VITE_API_URL=http://localhost:3001
+ARG VITE_API_KEY=dev-key-local-only
 ENV VITE_API_URL=${VITE_API_URL}
+ENV VITE_API_KEY=${VITE_API_KEY}
 RUN pnpm --filter @dag/web build
 
 FROM nginx:1.27-alpine AS runtime

@@ -49,6 +49,24 @@ model Tenant {
   id        String     @id @default(cuid())
   name      String
   workflows Workflow[]
+  apiKeys   ApiKey[]
+}
+
+/// Roadmap A3 — a bearer credential that resolves to a tenant. The raw key is
+/// shown to the caller exactly once (at creation); only its SHA-256 `hash` is
+/// stored, so a stolen database dump can't be turned back into working keys.
+/// `revokedAt` (rather than deleting the row) keeps a revoked key's audit
+/// trail — which tenant it belonged to, when it was created — intact.
+model ApiKey {
+  id        String    @id @default(cuid())
+  tenantId  String
+  name      String
+  hash      String    @unique
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+  tenant    Tenant    @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
 }
 
 /// A named workflow container. Mutable (name can change). Graph versions are

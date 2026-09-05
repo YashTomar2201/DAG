@@ -165,7 +165,7 @@ describe('B3.4 — fan-out failure & cancellation', () => {
       },
       { timeoutMs: 60_000 },
     );
-    const result = await ctx.runService.cancelRunService(runId);
+    const result = await ctx.runService.cancelRunService(runId, tenantId);
     expect(result.childrenCancelled).toBeGreaterThanOrEqual(1);
 
     await waitUntil(
@@ -202,7 +202,7 @@ describe('B3.4 — fan-out failure & cancellation', () => {
     // The cause of c1's failure is now gone.
     fs.writeFileSync(latePath, 'a,b\n1,2\n3,4\n');
 
-    const retry = await ctx.runService.retryFailedNodesService(runId);
+    const retry = await ctx.runService.retryFailedNodesService(runId, tenantId);
     expect(retry.respawnedChildren).toBe(1);
 
     await waitTerminal(runId, 'SUCCEEDED');

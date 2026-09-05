@@ -691,6 +691,39 @@ export async function workflowBelongsToTenant(workflowId: string, tenantId: stri
   return wf !== null;
 }
 
+/**
+ * True iff the run exists and its workflow (via `WorkflowVersion`) belongs to
+ * the tenant — `Run` itself has no `tenantId` column (see C2.1's note on
+ * denormalising one for RLS; A3 doesn't need it, a join is fine at this
+ * volume). Every tenant-scoped run route calls this before doing anything
+ * else, so a leaked/guessed run id from another tenant reads as a plain 404,
+ * never as data.
+ */
+export async function runBelongsToTenant(runId: string, tenantId: string): Promise<boolean> {
+  const run = await prisma.run.findFirst({
+    where: { id: runId, workflowVersion: { workflow: { tenantId } } },
+    select: { id: true },
+  });
+  return run !== null;
+}
+
+// ─── API Keys (roadmap A3) ───────────────────────────────────────────────────
+
+export type { ApiKey } from './generated/client';
+
+/** Looks up an active (non-revoked) key by its SHA-256 hash. Never by the raw key. */
+export async function findActiveApiKeyByHash(hash: string) {
+  return prisma.apiKey.findFirst({
+    where: { hash, revokedAt: null },
+    select: { id: true, tenantId: true, name: true },
+  });
+}
+
+/** Creates a key row for a pre-computed hash. The raw key never touches the DB — see `apps/api/scripts/seed.ts`. */
+export async function createApiKey(tenantId: string, name: string, hash: string) {
+  return prisma.apiKey.create({ data: { tenantId, name, hash } });
+}
+
 // ── Schedule ────────────────────────────────────────────────────────────────
 
 export async function createSchedule(data: {

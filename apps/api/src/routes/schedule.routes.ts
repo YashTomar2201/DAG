@@ -1,6 +1,7 @@
 import { Router, type Router as ExpressRouter } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
+import { requireApiKey } from '../middleware/auth';
 import { tenantOf } from './tenant';
 import {
   createScheduleService,
@@ -10,6 +11,11 @@ import {
 } from '../services/schedule.service';
 
 export const scheduleRouter: ExpressRouter = Router();
+
+// This router owns absolute paths (no shared prefix app.ts can scope a
+// mount-level `requireApiKey` to — see app.ts's comment), so every route here
+// requires it directly.
+scheduleRouter.use(requireApiKey);
 
 const CreateScheduleBody = z.object({
   cron: z.string().min(1).max(120),

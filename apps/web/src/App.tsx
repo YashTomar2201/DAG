@@ -527,7 +527,7 @@ function AppCanvas() {
       let sseCleanup = () => {};
       startListening(run.id, () => sseCleanup());
 
-      sseCleanup = openRunEventStream(
+      sseCleanup = await openRunEventStream(
         run.id,
         undefined,
         (type, data) => applyEvent(type, data),

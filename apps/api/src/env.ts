@@ -31,10 +31,26 @@ const EnvSchema = z.object({
   ARTIFACT_S3_REGION: z.string().min(1).default('us-east-1'),
   ARTIFACT_S3_ACCESS_KEY_ID: z.string().optional(),
   ARTIFACT_S3_SECRET_ACCESS_KEY: z.string().optional(),
+  /**
+   * Static bearer token Prometheus scrapes `/metrics` with (roadmap A3) — not
+   * a per-tenant API key, since metrics aren't tenant data and a scraper has
+   * one fixed credential, not a login flow. The default below is fine for
+   * local dev (no monitoring stack exists yet — roadmap C4); production must
+   * override it, enforced by the refine below.
+   */
+  METRICS_TOKEN: z.string().min(1).default('dev-metrics-token'),
+  /** HMAC secret for the short-lived SSE auth tokens `events-token.service.ts` mints. Same dev-default rationale as METRICS_TOKEN. */
+  EVENTS_TOKEN_SECRET: z.string().min(1).default('dev-events-token-secret'),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 }).refine((e) => e.ARTIFACT_BACKEND !== 's3' || !!e.ARTIFACT_S3_BUCKET, {
   message: 'ARTIFACT_S3_BUCKET is required when ARTIFACT_BACKEND=s3',
   path: ['ARTIFACT_S3_BUCKET'],
+}).refine((e) => e.NODE_ENV !== 'production' || e.METRICS_TOKEN !== 'dev-metrics-token', {
+  message: 'METRICS_TOKEN must be overridden in production',
+  path: ['METRICS_TOKEN'],
+}).refine((e) => e.NODE_ENV !== 'production' || e.EVENTS_TOKEN_SECRET !== 'dev-events-token-secret', {
+  message: 'EVENTS_TOKEN_SECRET must be overridden in production',
+  path: ['EVENTS_TOKEN_SECRET'],
 });
 
 export type Env = z.infer<typeof EnvSchema>;

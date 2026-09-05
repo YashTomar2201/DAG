@@ -10,6 +10,7 @@
  * Integration tests against a real DB are in Phase 12 (Testcontainers).
  */
 
+import { createHash } from 'crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from './app';
@@ -17,6 +18,10 @@ import { createApp } from './app';
 // ─── Mock @dag/db ─────────────────────────────────────────────────────────────
 // We test the control-plane logic (validation, cycle detection, topo sort) in
 // isolation. DB persistence is verified in Phase 12's integration tests.
+
+/** A fake API key these tests authenticate with — see `findActiveApiKeyByHash` below. */
+export const TEST_API_KEY = 'test-api-key';
+const TEST_API_KEY_HASH = createHash('sha256').update(TEST_API_KEY).digest('hex');
 
 vi.mock('@dag/db', () => ({
   prisma: {
@@ -35,6 +40,14 @@ vi.mock('@dag/db', () => ({
   })),
   createRun: vi.fn(),
   getRunEvents: vi.fn().mockResolvedValue([]),
+  // Roadmap A3 — requireApiKey looks this up on every protected route. Real
+  // auth logic runs here (wrong/missing key genuinely 401s); only the DB
+  // lookup behind it is faked.
+  findActiveApiKeyByHash: vi.fn().mockImplementation(async (hash: string) =>
+    hash === TEST_API_KEY_HASH ? { id: 'key-1', tenantId: 'tenant-1', name: 'test-key' } : null,
+  ),
+  // A3 also needs this for createVersionService's ownership check.
+  workflowBelongsToTenant: vi.fn().mockResolvedValue(true),
 }));
 
 // ─── Test fixtures ────────────────────────────────────────────────────────────
@@ -95,6 +108,9 @@ const SELF_LOOP_GRAPH = {
 describe('Phase 4 — Control Plane API', () => {
   const app = createApp();
 
+  /** Every protected route needs this now (roadmap A3) — see the `@dag/db` mock above. */
+  const AUTH = { Authorization: `Bearer ${TEST_API_KEY}` };
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -107,23 +123,33 @@ describe('Phase 4 — Control Plane API', () => {
     expect(res.body.status).toBe('ok');
   });
 
+  // ── Auth (roadmap A3) ────────────────────────────────────────────────────────
+
+  it('POST /workflows with no Authorization header → 401', async () => {
+    const res = await request(app)
+      .post('/workflows')
+      .send({ name: 'No Auth', graph: ML_PIPELINE_GRAPH });
+    expect(res.status).toBe(401);
+  });
+
+  it('POST /workflows with an invalid API key → 401', async () => {
+    const res = await request(app)
+      .post('/workflows')
+      .set('Authorization', 'Bearer not-a-real-key')
+      .send({ name: 'Bad Key', graph: ML_PIPELINE_GRAPH });
+    expect(res.status).toBe(401);
+  });
+
   // ── POST /workflows — acceptance check 2 ───────────────────────────────────
 
   it('POST /workflows with the 5-node ML pipeline → 201 with workflowId + versionId', async () => {
     const res = await request(app)
       .post('/workflows')
-      .send({ tenantId: 'tenant-1', name: 'ML Pipeline', graph: ML_PIPELINE_GRAPH });
+      .set(AUTH)
+      .send({ name: 'ML Pipeline', graph: ML_PIPELINE_GRAPH });
 
     expect(res.status).toBe(201);
     expect(res.body).toMatchObject({ workflowId: 'wf-1', versionId: 'v-1' });
-  });
-
-  it('POST /workflows with missing tenantId → 400', async () => {
-    const res = await request(app)
-      .post('/workflows')
-      .send({ name: 'No Tenant', graph: ML_PIPELINE_GRAPH });
-    expect(res.status).toBe(400);
-    expect(res.body.issues).toBeDefined();
   });
 
   // ── POST /workflows/:id/versions — acceptance check 1 & 2 ─────────────────
@@ -131,6 +157,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/versions with a cyclic graph → 422 with cyclePath', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/versions')
+      .set(AUTH)
       .send({ graph: CYCLIC_GRAPH });
 
     expect(res.status).toBe(422);
@@ -144,6 +171,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/versions with a valid graph → 201 with correct topoOrder', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/versions')
+      .set(AUTH)
       .send({ graph: ML_PIPELINE_GRAPH });
 
     expect(res.status).toBe(201);
@@ -164,6 +192,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/validate with valid graph → 200 { valid: true }', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/validate')
+      .set(AUTH)
       .send({ graph: ML_PIPELINE_GRAPH });
 
     expect(res.status).toBe(200);
@@ -174,6 +203,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/validate with cyclic graph → 200 { valid: false, cyclePath }', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/validate')
+      .set(AUTH)
       .send({ graph: CYCLIC_GRAPH });
 
     expect(res.status).toBe(200);
@@ -184,6 +214,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/validate with duplicate node key → 200 { valid: false, zodIssues }', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/validate')
+      .set(AUTH)
       .send({ graph: DUPLICATE_KEY_GRAPH });
 
     expect(res.status).toBe(200);
@@ -195,6 +226,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/validate with dangling edge → 200 { valid: false, zodIssues }', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/validate')
+      .set(AUTH)
       .send({ graph: DANGLING_EDGE_GRAPH });
 
     expect(res.status).toBe(200);
@@ -205,6 +237,7 @@ describe('Phase 4 — Control Plane API', () => {
   it('POST /workflows/:id/validate with self-loop → 200 { valid: false, zodIssues }', async () => {
     const res = await request(app)
       .post('/workflows/wf-1/validate')
+      .set(AUTH)
       .send({ graph: SELF_LOOP_GRAPH });
 
     expect(res.status).toBe(200);

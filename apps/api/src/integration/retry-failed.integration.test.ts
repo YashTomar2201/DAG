@@ -74,7 +74,7 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
       data: { graph: graph as unknown as object },
     });
 
-    const result = await ctx.runService.retryFailedNodesService(run.id);
+    const result = await ctx.runService.retryFailedNodesService(run.id, tenantId);
     expect(result.retried).toBe(1);
     expect(result.resetSkipped).toBe(1);
 

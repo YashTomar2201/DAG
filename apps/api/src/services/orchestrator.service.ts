@@ -163,12 +163,23 @@ function emitAndLog(runId: string, type: RunEventType, payload: Record<string, u
 export async function startRun(
   workflowVersionId: string,
   idempotencyKey?: string,
-  opts: { triggeredBy?: string } = {},
+  opts: { triggeredBy?: string; tenantId?: string } = {},
 ) {
   const version = await prisma.workflowVersion.findUnique({
     where: { id: workflowVersionId },
+    include: { workflow: { select: { tenantId: true } } },
   });
   if (!version) throw new NotFoundError('WorkflowVersion', workflowVersionId);
+  // Roadmap A3: `POST /runs` passes `tenantId` (the caller's verified
+  // identity) so an authenticated caller can't start a run against a
+  // workflowVersionId belonging to another tenant just by knowing its id.
+  // `opts.tenantId` is omitted by internal callers (schedule/trigger fire
+  // handlers) that already resolved this exact versionId through a
+  // tenant-scoped lookup (`getLatestVersionId(workflowId, tenantId)`) before
+  // ever reaching here — re-checking would be redundant, not unsafe to skip.
+  if (opts.tenantId && version.workflow.tenantId !== opts.tenantId) {
+    throw new NotFoundError('WorkflowVersion', workflowVersionId);
+  }
 
   const graph = getGraphFromVersion(version);
 

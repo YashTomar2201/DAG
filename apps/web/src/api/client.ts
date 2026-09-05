@@ -13,8 +13,14 @@
 
 const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:3001';
 
-/** Default tenant used by the single-tenant visual editor. */
-const DEFAULT_TENANT_ID = 'default';
+/**
+ * Roadmap A3 — every request carries this as `Authorization: Bearer <key>`.
+ * The fallback matches the fixed dev key `packages/db/prisma/seed.ts` seeds,
+ * so a fresh `docker compose up` (or `pnpm dev`) authenticates out of the
+ * box with no setup step. A real deployment overrides `VITE_API_KEY` at
+ * build time — see `infra/Dockerfile.web`.
+ */
+const API_KEY = import.meta.env.VITE_API_KEY ?? 'dev-key-local-only';
 
 /**
  * Structured API error. Carries the HTTP status and the parsed JSON body so
@@ -65,7 +71,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...init?.headers },
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${API_KEY}`,
+        ...init?.headers,
+      },
       ...init,
     });
   } catch {
@@ -108,8 +118,8 @@ export interface WorkflowVersion {
 }
 
 /**
- * Creates a new workflow with its first version.
- * The API requires a tenantId — we use a fixed default for the visual editor.
+ * Creates a new workflow with its first version. `tenantId` comes from the
+ * API key (roadmap A3), not the request body.
  * Returns { workflowId, versionId } — not a full Workflow object.
  */
 export async function createWorkflow(
@@ -118,7 +128,7 @@ export async function createWorkflow(
 ): Promise<CreateWorkflowResult> {
   return request<CreateWorkflowResult>('/workflows', {
     method: 'POST',
-    body: JSON.stringify({ tenantId: DEFAULT_TENANT_ID, name, graph }),
+    body: JSON.stringify({ name, graph }),
   });
 }
 
@@ -152,23 +162,22 @@ export interface WorkflowVersionMeta {
   createdAt: string;
 }
 
-const T = `tenantId=${DEFAULT_TENANT_ID}`;
-
 /** Paginated, newest-first list of this tenant's workflows. */
 export async function listWorkflows(
   opts: { limit?: number; cursor?: string } = {},
 ): Promise<{ workflows: WorkflowListItem[]; nextCursor: string | null }> {
-  const p = new URLSearchParams({ tenantId: DEFAULT_TENANT_ID });
+  const p = new URLSearchParams();
   if (opts.limit) p.set('limit', String(opts.limit));
   if (opts.cursor) p.set('cursor', opts.cursor);
-  return request(`/workflows?${p.toString()}`);
+  const qs = p.toString();
+  return request(`/workflows${qs ? `?${qs}` : ''}`);
 }
 
 /** A workflow + its version list (newest first). */
 export async function getWorkflow(
   id: string,
 ): Promise<{ id: string; name: string; createdAt: string; versions: WorkflowVersionMeta[] }> {
-  return request(`/workflows/${id}?${T}`);
+  return request(`/workflows/${id}`);
 }
 
 /** One full version — { id, workflowId, version, graph, topoOrder, createdAt }. */
@@ -176,7 +185,7 @@ export async function getWorkflowVersion(
   workflowId: string,
   versionId: string,
 ): Promise<WorkflowVersion> {
-  return request(`/workflows/${workflowId}/versions/${versionId}?${T}`);
+  return request(`/workflows/${workflowId}/versions/${versionId}`);
 }
 
 /** Rename a workflow. Returns { id, name, createdAt }. */
@@ -184,7 +193,7 @@ export async function renameWorkflow(
   id: string,
   name: string,
 ): Promise<{ id: string; name: string; createdAt: string }> {
-  return request(`/workflows/${id}?${T}`, {
+  return request(`/workflows/${id}`, {
     method: 'PATCH',
     body: JSON.stringify({ name }),
   });
@@ -192,7 +201,7 @@ export async function renameWorkflow(
 
 /** Soft-delete a workflow. Resolves on 204. */
 export async function deleteWorkflow(id: string): Promise<void> {
-  await request<void>(`/workflows/${id}?${T}`, { method: 'DELETE' });
+  await request<void>(`/workflows/${id}`, { method: 'DELETE' });
 }
 
 // ─── Runs ─────────────────────────────────────────────────────────────────────
@@ -326,7 +335,7 @@ export interface Trigger {
 export type TriggerWithSecret = Trigger & { secret: string };
 
 export async function listSchedules(workflowId: string): Promise<Schedule[]> {
-  const r = await request<{ schedules: Schedule[] }>(`/workflows/${workflowId}/schedules?${T}`);
+  const r = await request<{ schedules: Schedule[] }>(`/workflows/${workflowId}/schedules`);
   return r.schedules;
 }
 
@@ -335,7 +344,7 @@ export async function createSchedule(
   cron: string,
   timezone = 'UTC',
 ): Promise<Schedule> {
-  return request(`/workflows/${workflowId}/schedules?${T}`, {
+  return request(`/workflows/${workflowId}/schedules`, {
     method: 'POST',
     body: JSON.stringify({ cron, timezone }),
   });
@@ -345,34 +354,34 @@ export async function updateSchedule(
   scheduleId: string,
   patch: Partial<{ cron: string; timezone: string; enabled: boolean }>,
 ): Promise<Schedule> {
-  return request(`/schedules/${scheduleId}?${T}`, {
+  return request(`/schedules/${scheduleId}`, {
     method: 'PATCH',
     body: JSON.stringify(patch),
   });
 }
 
 export async function deleteSchedule(scheduleId: string): Promise<void> {
-  await request<void>(`/schedules/${scheduleId}?${T}`, { method: 'DELETE' });
+  await request<void>(`/schedules/${scheduleId}`, { method: 'DELETE' });
 }
 
 export async function listTriggers(workflowId: string): Promise<Trigger[]> {
-  const r = await request<{ triggers: Trigger[] }>(`/workflows/${workflowId}/triggers?${T}`);
+  const r = await request<{ triggers: Trigger[] }>(`/workflows/${workflowId}/triggers`);
   return r.triggers;
 }
 
 export async function createTrigger(workflowId: string): Promise<TriggerWithSecret> {
-  return request(`/workflows/${workflowId}/triggers?${T}`, { method: 'POST' });
+  return request(`/workflows/${workflowId}/triggers`, { method: 'POST' });
 }
 
 export async function setTriggerEnabled(triggerId: string, enabled: boolean): Promise<Trigger> {
-  return request(`/triggers/${triggerId}?${T}`, {
+  return request(`/triggers/${triggerId}`, {
     method: 'PATCH',
     body: JSON.stringify({ enabled }),
   });
 }
 
 export async function deleteTrigger(triggerId: string): Promise<void> {
-  await request<void>(`/triggers/${triggerId}?${T}`, { method: 'DELETE' });
+  await request<void>(`/triggers/${triggerId}`, { method: 'DELETE' });
 }
 
 /** Absolute webhook URL for a trigger token — for the "copy" affordance. */
@@ -395,14 +404,24 @@ export function artifactDownloadUrl(runId: string, nodeKey: string, field: strin
 /**
  * Opens the SSE stream for a run and calls `onEvent` for each event.
  * Returns a teardown function that closes the EventSource.
+ *
+ * Roadmap A3: `EventSource` cannot send the `Authorization` header every
+ * other request uses, so this first makes a normal authenticated request to
+ * mint a short-lived, single-run-scoped token, then appends it as
+ * `?eventsToken=` on the stream URL. That token expires after ~30 minutes
+ * (`events-token.service.ts`) — a run whose SSE connection drops and
+ * auto-reconnects after that window will fail silently (EventSource just
+ * keeps retrying); the practical fix if that ever bites is to close and
+ * re-call this function, not something built here.
  */
-export function openRunEventStream(
+export async function openRunEventStream(
   runId: string,
   lastEventId: string | undefined,
   onEvent: (type: string, data: unknown) => void,
   onError?: (err: Event) => void,
-): () => void {
-  const url = `${API_BASE}/runs/${runId}/events`;
+): Promise<() => void> {
+  const { token } = await request<{ token: string }>(`/runs/${runId}/events-token`, { method: 'POST' });
+  const url = `${API_BASE}/runs/${runId}/events?eventsToken=${encodeURIComponent(token)}`;
   const es = new EventSource(url);
 
   const TERMINAL = new Set(['RUN_SUCCEEDED', 'RUN_FAILED', 'RUN_CANCELLED']);

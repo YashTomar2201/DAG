@@ -1,6 +1,7 @@
 import { Router, type Router as ExpressRouter } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
+import { requireApiKey } from '../middleware/auth';
 import { tenantOf } from './tenant';
 import {
   createTriggerService,
@@ -18,7 +19,7 @@ const UpdateTriggerBody = z.object({ enabled: z.boolean() });
 
 // ─── GET /workflows/:id/triggers ─────────────────────────────────────────────
 
-triggerRouter.get('/workflows/:id/triggers', async (req, res, next) => {
+triggerRouter.get('/workflows/:id/triggers', requireApiKey, async (req, res, next) => {
   try {
     const triggers = await listTriggersService(req.params['id'] as string, tenantOf(req));
     res.json({ triggers });
@@ -30,7 +31,7 @@ triggerRouter.get('/workflows/:id/triggers', async (req, res, next) => {
 // ─── POST /workflows/:id/triggers ────────────────────────────────────────────
 
 /** Creates a webhook. The `secret` is in the 201 body — the only time it is shown. */
-triggerRouter.post('/workflows/:id/triggers', async (req, res, next) => {
+triggerRouter.post('/workflows/:id/triggers', requireApiKey, async (req, res, next) => {
   try {
     const trigger = await createTriggerService(req.params['id'] as string, tenantOf(req));
     res.status(201).json(trigger);
@@ -43,6 +44,7 @@ triggerRouter.post('/workflows/:id/triggers', async (req, res, next) => {
 
 triggerRouter.patch(
   '/triggers/:triggerId',
+  requireApiKey,
   validateBody(UpdateTriggerBody),
   async (req, res, next) => {
     try {
@@ -60,7 +62,7 @@ triggerRouter.patch(
 
 // ─── DELETE /triggers/:triggerId ─────────────────────────────────────────────
 
-triggerRouter.delete('/triggers/:triggerId', async (req, res, next) => {
+triggerRouter.delete('/triggers/:triggerId', requireApiKey, async (req, res, next) => {
   try {
     await deleteTriggerService(req.params['triggerId'] as string, tenantOf(req));
     res.status(204).end();

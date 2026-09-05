@@ -64,7 +64,7 @@ describe('B3.1 — run tree', () => {
 
   it('reports an all-zero children summary for an ordinary run', async () => {
     const plain = await ctx.db.createRun(versionId, 'api', ['extract']);
-    const detail = await svc.getRunService(plain.id);
+    const detail = await svc.getRunService(plain.id, tenantId);
     expect(detail.children).toEqual({
       total: 0, pending: 0, running: 0, succeeded: 0, failed: 0, skipped: 0, cancelled: 0,
     });
@@ -73,22 +73,22 @@ describe('B3.1 — run tree', () => {
   });
 
   it('counts children per status with one groupBy', async () => {
-    const detail = await svc.getRunService(parentId);
+    const detail = await svc.getRunService(parentId, tenantId);
     expect(detail.children).toEqual({
       total: 5, pending: 0, running: 1, succeeded: 3, failed: 1, skipped: 0, cancelled: 0,
     });
   });
 
   it('pages children in fanOutIndex order', async () => {
-    const p1 = await svc.listRunChildrenService(parentId, { limit: 2 });
+    const p1 = await svc.listRunChildrenService(parentId, tenantId, { limit: 2 });
     expect(p1.children.map((c) => c.fanOutIndex)).toEqual([0, 1]);
     expect(p1.nextCursor).not.toBeNull();
 
-    const p2 = await svc.listRunChildrenService(parentId, { limit: 2, cursor: p1.nextCursor! });
+    const p2 = await svc.listRunChildrenService(parentId, tenantId, { limit: 2, cursor: p1.nextCursor! });
     expect(p2.children.map((c) => c.fanOutIndex)).toEqual([2, 3]);
     expect(p2.nextCursor).not.toBeNull();
 
-    const p3 = await svc.listRunChildrenService(parentId, { limit: 2, cursor: p2.nextCursor! });
+    const p3 = await svc.listRunChildrenService(parentId, tenantId, { limit: 2, cursor: p2.nextCursor! });
     expect(p3.children.map((c) => c.fanOutIndex)).toEqual([4]);
     expect(p3.nextCursor).toBeNull();
 
@@ -96,7 +96,7 @@ describe('B3.1 — run tree', () => {
   });
 
   it('404s for an unknown run id', async () => {
-    await expect(svc.listRunChildrenService('run-does-not-exist')).rejects.toThrow();
-    await expect(svc.getRunService('run-does-not-exist')).rejects.toThrow();
+    await expect(svc.listRunChildrenService('run-does-not-exist', tenantId)).rejects.toThrow();
+    await expect(svc.getRunService('run-does-not-exist', tenantId)).rejects.toThrow();
   });
 });

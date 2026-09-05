@@ -1,6 +1,7 @@
-import { Router, type Router as ExpressRouter, type Request } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import { z } from 'zod';
 import { validateBody } from '../middleware/validate';
+import { tenantOf } from './tenant';
 import {
   createWorkflowService,
   createVersionService,
@@ -16,20 +17,9 @@ import { logger } from '../logger';
 
 export const workflowRouter: ExpressRouter = Router();
 
-/**
- * Tenant scoping shim. Until A3 (auth) lands, the tenant comes from a
- * `?tenantId=` query param and defaults to "default" — the single-tenant
- * editor's fixed id. A3 replaces this with `req.tenantId` from a verified key.
- */
-function tenantOf(req: Request): string {
-  const q = req.query['tenantId'];
-  return typeof q === 'string' && q.length > 0 ? q : 'default';
-}
-
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
 const CreateWorkflowBody = z.object({
-  tenantId: z.string().min(1),
   name: z.string().min(1).max(255),
   graph: z.unknown(), // validated inside the service against GraphSchema
 });
@@ -154,7 +144,7 @@ workflowRouter.post(
   validateBody(CreateWorkflowBody),
   async (req, res, next) => {
     try {
-      const result = await createWorkflowService(req.body);
+      const result = await createWorkflowService({ ...req.body, tenantId: tenantOf(req) });
       logger.info({ workflowId: result.workflowId, versionId: result.versionId }, 'Workflow created');
       res.status(201).json(result);
     } catch (err) {
@@ -181,6 +171,7 @@ workflowRouter.post(
     try {
       const version = await createVersionService({
         workflowId: req.params['id'] as string,
+        tenantId: tenantOf(req),
         graph: req.body.graph,
       });
       logger.info(

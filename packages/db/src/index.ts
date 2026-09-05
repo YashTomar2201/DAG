@@ -50,6 +50,10 @@ export {
   // Schedules & Triggers (B2)
   getLatestVersionId,
   workflowBelongsToTenant,
+  runBelongsToTenant,
+  // API Keys (A3)
+  findActiveApiKeyByHash,
+  createApiKey,
   createSchedule,
   listSchedulesForWorkflow,
   getScheduleById,
@@ -72,6 +76,7 @@ export type {
   RunEvent,
   Tenant,
   Workflow,
+  ApiKey,
   Schedule,
   Trigger,
 } from './repositories';

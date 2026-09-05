@@ -6,25 +6,36 @@ valuable than pretending they don't exist.
 
 ---
 
-## 1. Multi-Tenancy Is Namespace-Only, Not Isolated
+## 1. Multi-Tenancy Is Namespace-Only, Not Row-Level-Secure — 🟡 IN PROGRESS (roadmap A3 done, C2 open)
 
-**What exists:** Every `Workflow`, `Run`, and `NodeRun` row carries a `tenantId` column, and the
-API reads `tenantId` from a request header that is passed through as-is.
+**What existed:** Every `Workflow`, `Run`, and `NodeRun` row carried a `tenantId` column, and the
+API read it from an unauthenticated `?tenantId=` query param anyone could type.
 
-**What is missing:**
-- No authentication or token verification — any caller can pass any `tenantId`.
-- No row-level security (RLS) in Postgres — a bug in one API service function could query across
-  tenants.
+**A3 (done):** `tenantId` now comes from a verified `ApiKey` (`Authorization: Bearer <key>`,
+looked up by SHA-256 hash — the raw key is never stored). Every route that reads or mutates
+tenant-scoped data is behind `requireApiKey` and filters by the authenticated tenant, not just by
+id — `GET /runs/:id`, `POST /runs/:id/cancel`, `POST /runs/:id/retry-failed`,
+`GET /runs/:id/children`, the artifact download route, and `POST /workflows/:id/versions` (this
+last one was a genuine pre-A3 gap: it checked the workflow *existed*, not that it belonged to the
+caller — any authenticated tenant could have appended a version to any other tenant's workflow).
+A leaked/guessed id from another tenant 404s, indistinguishable from a wrong id. `/metrics` is
+separately protected by a static `METRICS_TOKEN` (a scraper has one fixed credential, not a login
+flow). The one exception, `GET /runs/:id/events` (SSE — `EventSource` can't send custom headers),
+uses a short-lived (~30 min) signed token minted by an authenticated
+`POST /runs/:id/events-token` call instead.
+
+**What is still missing (C2, open):**
+- No row-level security (RLS) in Postgres — a bug in one API service function could still query
+  across tenants; A3 closes this at the *route* layer (every route checks tenant ownership) but
+  not at the *database* layer (nothing stops a future service function from forgetting to).
 - Redis keys (`run:{runId}:indegree`, `run:{runId}:dispatched`) are keyed by `runId` alone, not
   `tenantId`. Two tenants sharing a Redis instance get no namespace separation at the broker layer.
 - The per-run concurrency semaphore (`run:{id}:slots`) is likewise not tenant-scoped, so one
   tenant's fan-out can consume the entire cluster's capacity budget.
 
-**To close it:**
-- Add JWT/API-key authentication middleware that sets `req.tenantId` from a verified token, not
-  from a raw header.
-- Enable Postgres RLS on `NodeRun`, `Run`, and `Workflow` so a leaked `tenantId` cannot read
-  another tenant's data even if the application layer fails.
+**To close it (C2):**
+- Enable Postgres RLS on `NodeRun`, `Run`, and `Workflow` so a bug in the application layer cannot
+  read another tenant's data even if a route forgets its own check.
 - Namespace Redis keys as `{tenantId}:{runId}:indegree` (or use Redis ACLs to restrict key
   patterns per tenant).
 - Add a per-tenant concurrency quota (a second semaphore, or a tenant-level BullMQ rate limiter)

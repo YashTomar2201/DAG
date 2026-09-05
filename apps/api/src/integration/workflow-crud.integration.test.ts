@@ -113,7 +113,7 @@ describe('D1.1 — Workflow CRUD', () => {
     await expect(wfService.listWorkflowVersionsService(ids[1]!, tenantId)).rejects.toThrow();
 
     // The run of the deleted workflow is still readable by id.
-    const run = await runService.getRunService(runIdForWf2);
+    const run = await runService.getRunService(runIdForWf2, tenantId);
     expect(run.id).toBe(runIdForWf2);
     expect(run.nodeRuns.length).toBeGreaterThan(0);
   });

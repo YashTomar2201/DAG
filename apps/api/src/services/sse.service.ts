@@ -80,11 +80,14 @@ function writeComment(res: Response, comment: string): void {
  * Attaches an SSE stream to the HTTP response for `runId`.
  *
  * @param runId       The run to stream.
+ * @param tenantId    The caller's verified tenant (roadmap A3) — checked
+ *                     against the run's own tenant before anything is sent.
  * @param res         The Express response object (kept open).
  * @param lastEventId The `Last-Event-ID` from the reconnecting client (if any).
  */
 export async function streamRunEvents(
   runId: string,
+  tenantId: string,
   res: Response,
   lastEventId?: string,
 ): Promise<void> {
@@ -96,8 +99,9 @@ export async function streamRunEvents(
   res.flushHeaders(); // start the stream immediately, don't wait for first event
 
   // ── Phase 1: Replay persisted events since the cursor ─────────────────────
-  // getRunEventsService validates the run exists (throws NotFoundError → 404).
-  const pastEvents = await getRunEventsService(runId, lastEventId);
+  // getRunEventsService validates the run exists AND belongs to tenantId
+  // (throws NotFoundError → 404 either way).
+  const pastEvents = await getRunEventsService(runId, tenantId, lastEventId);
 
   for (const event of pastEvents) {
     writeEvent(res, String(event.id), event.type, event.payload);
