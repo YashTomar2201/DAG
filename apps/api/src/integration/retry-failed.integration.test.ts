@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
@@ -24,6 +24,7 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
   let workflowId: string;
   let versionId: string;
   let graph: Graph;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
@@ -36,15 +37,16 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
     const evaluateNode = graph.nodes.find((n) => n.key === 'evaluate')!;
     (evaluateNode.config as Record<string, unknown>)['minAccuracy'] = 0.99; // fails on attempt 0 (0.923 < 0.99)
 
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, graph, 'retry-failed');
+    const seeded = await seedWorkflowVersion(ctx.db, graph, 'retry-failed');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
+    db = tenantScopedPrisma(ctx.db, tenantId);
   }, 60_000);
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -52,11 +54,11 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
     const run = await ctx.orchestrator.startRun(versionId);
 
     await waitUntil(async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
+      const r = await db.run.findUnique({ where: { id: run.id } });
       return r?.status === 'FAILED';
     });
 
-    let nodeRuns = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id } });
+    let nodeRuns = await db.nodeRun.findMany({ where: { runId: run.id } });
     expect(nodeRuns.find((n) => n.nodeKey === 'evaluate')?.status).toBe('FAILED');
     expect(nodeRuns.find((n) => n.nodeKey === 'deploy')?.status).toBe('SKIPPED');
     const evaluateAttemptBefore = nodeRuns.find((n) => n.nodeKey === 'evaluate')!.attempt;
@@ -69,7 +71,7 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
     // retried attempt picks up the fix automatically.
     const evaluateNode = graph.nodes.find((n) => n.key === 'evaluate')!;
     (evaluateNode.config as Record<string, unknown>)['minAccuracy'] = 0.5; // 0.923 now clears the bar
-    await ctx.db.prisma.workflowVersion.update({
+    await db.workflowVersion.update({
       where: { id: versionId },
       data: { graph: graph as unknown as object },
     });
@@ -79,12 +81,12 @@ describe('Phase 12 — retry-failed recovers a FAILED run to SUCCEEDED', () => {
     expect(result.resetSkipped).toBe(1);
 
     await waitUntil(async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
+      const r = await db.run.findUnique({ where: { id: run.id } });
       return r?.status === 'SUCCEEDED' || r?.status === 'FAILED';
     });
 
-    const finalRun = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
-    nodeRuns = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id } });
+    const finalRun = await db.run.findUnique({ where: { id: run.id } });
+    nodeRuns = await db.nodeRun.findMany({ where: { runId: run.id } });
     const byKey = new Map(nodeRuns.map((n) => [n.nodeKey, n]));
 
     expect(finalRun?.status).toBe('SUCCEEDED');

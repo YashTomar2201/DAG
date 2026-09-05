@@ -23,7 +23,7 @@ describe('B2 — cron schedules', () => {
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
     svc = await import('../services/schedule.service');
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, hermeticPipelineGraph(), 'b2-sched');
+    const seeded = await seedWorkflowVersion(ctx.db, hermeticPipelineGraph(), 'b2-sched');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
@@ -35,7 +35,7 @@ describe('B2 — cron schedules', () => {
       await ctx.queue.removeScheduleJob(id).catch(() => {});
     }
     await ctx.db.prisma.schedule.deleteMany({ where: { workflowId } });
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -75,7 +75,7 @@ describe('B2 — cron schedules', () => {
     expect(first.deduped).toBe(false);
     expect(second.deduped).toBe(true);
 
-    const runs = await ctx.db.prisma.run.findMany({ where: { workflowVersionId: versionId } });
+    const runs = await ctx.db.withTenant(tenantId, (tx) => tx.run.findMany({ where: { workflowVersionId: versionId } }));
     const scheduleRuns = runs.filter((r) => r.triggeredBy === 'schedule');
     expect(scheduleRuns).toHaveLength(1);
     expect(scheduleRuns[0]!.idempotencyKey).toBe(

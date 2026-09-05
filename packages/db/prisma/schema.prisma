@@ -170,6 +170,11 @@ model WorkflowVersion {
 model Run {
   id                String      @id @default(cuid())
   workflowVersionId String
+  /// Denormalised from WorkflowVersion -> Workflow.tenantId (roadmap C2.1) —
+  /// Row-Level Security needs this column directly on the table it protects;
+  /// a policy can't reach through two joins. Set once at creation, never
+  /// changed (a Run's tenant can't move).
+  tenantId          String
   status            RunStatus   @default(PENDING)
   idempotencyKey    String?     @unique
   triggeredBy       String      // userId, 'schedule', 'api', 'webhook', 'fanout'
@@ -187,6 +192,7 @@ model Run {
 
   /// Hot query for the fan-out join: "how many children of X are still running?"
   @@index([parentRunId, status])
+  @@index([tenantId])
 }
 
 /// One execution of one node inside a Run. This is the atomic unit of work
@@ -205,6 +211,8 @@ model Run {
 model NodeRun {
   id             String     @id @default(cuid())
   runId          String
+  /// Denormalised from Run.tenantId (roadmap C2.1) — see the note on Run.tenantId.
+  tenantId       String
   nodeKey        String     // stable user-facing key, e.g. "preprocess"
   status         NodeStatus @default(PENDING)
   attempt        Int        @default(0)
@@ -222,6 +230,7 @@ model NodeRun {
   @@unique([runId, nodeKey])
   /// Hot query for the orchestrator: "which nodes in run X are still pending?"
   @@index([runId, status])
+  @@index([tenantId])
 }
 
 /// Append-only audit log. Every state transition and log chunk lands here.
@@ -232,6 +241,8 @@ model NodeRun {
 model RunEvent {
   id        BigInt   @id @default(autoincrement())
   runId     String
+  /// Denormalised from Run.tenantId (roadmap C2.1) — see the note on Run.tenantId.
+  tenantId  String
   nodeKey   String?
   type      String   // matches RUN_EVENT_TYPES in @dag/contracts
   payload   Json
@@ -241,4 +252,5 @@ model RunEvent {
 
   /// Efficient tail query for SSE: WHERE runId = ? AND id > cursor ORDER BY id
   @@index([runId, id])
+  @@index([tenantId])
 }

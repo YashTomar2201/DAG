@@ -27,28 +27,28 @@ describe('A3 — cross-tenant isolation', () => {
     ctx = await bootstrapTestEnv();
     stopQueueEvents = ctx.workerEvents.startQueueEventListeners();
 
-    const seededA = await seedWorkflowVersion(ctx.db.prisma, hermeticPipelineGraph(), 'a3-tenant-a');
+    const seededA = await seedWorkflowVersion(ctx.db, hermeticPipelineGraph(), 'a3-tenant-a');
     tenantA = seededA.tenantId;
     workflowA = seededA.workflowId;
     versionA = seededA.versionId;
 
     // A completely separate tenant — not derived from tenant A in any way.
-    const seededB = await seedWorkflowVersion(ctx.db.prisma, hermeticPipelineGraph(), 'a3-tenant-b');
+    const seededB = await seedWorkflowVersion(ctx.db, hermeticPipelineGraph(), 'a3-tenant-b');
     tenantB = seededB.tenantId;
     workflowB = seededB.workflowId;
 
     const run = await ctx.orchestrator.startRun(versionA, undefined, { tenantId: tenantA });
     runId = run.id;
     await waitUntil(async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: runId } });
+      const r = await ctx.db.withTenant(tenantA, (tx) => tx.run.findUnique({ where: { id: runId } }));
       return r?.status === 'SUCCEEDED' || r?.status === 'FAILED';
     });
   }, 60_000);
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await cleanupWorkflow(ctx.db.prisma, tenantA, workflowA);
-    await cleanupWorkflow(ctx.db.prisma, tenantB, workflowB);
+    await cleanupWorkflow(ctx.db, tenantA, workflowA);
+    await cleanupWorkflow(ctx.db, tenantB, workflowB);
     await teardownTestEnv(ctx);
   });
 

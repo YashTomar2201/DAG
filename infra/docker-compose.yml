@@ -85,7 +85,11 @@ services:
     ports:
       - "3001:3001"
     environment:
-      DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
+      # dag_app (NOT the dag superuser) — RLS (roadmap C2.1) is unconditionally
+      # bypassed for superusers/table owners, so runtime traffic must go
+      # through the restricted role the C2.1 migration creates. `migrate`
+      # below still runs as `dag`, which owns the schema and can grant DDL.
+      DATABASE_URL: postgresql://dag_app:dag_app_secret@postgres:5432/dag_engine
       REDIS_URL: redis://redis:6379
       API_PORT: 3001
       ARTIFACT_DIR: /data/artifacts
@@ -119,7 +123,8 @@ services:
       context: ..
       dockerfile: infra/Dockerfile.worker
     environment:
-      DATABASE_URL: postgresql://dag:dag_secret@postgres:5432/dag_engine
+      # See the api service's DATABASE_URL comment — same reasoning, dag_app.
+      DATABASE_URL: postgresql://dag_app:dag_app_secret@postgres:5432/dag_engine
       REDIS_URL: redis://redis:6379
       ARTIFACT_DIR: /data/artifacts
       NODE_ENV: production

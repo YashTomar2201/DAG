@@ -11,6 +11,8 @@ export const JobPayloadSchema = z.object({
   runId: z.string().cuid(),
   nodeKey: z.string().min(1),
   nodeRunId: z.string().cuid(),
+  /** The tenant that owns this run — RLS (roadmap C2.1) requires it for every DB call the worker makes. */
+  tenantId: z.string().min(1),
   /**
    * The node type determines which executor handles this job.
    * Inferred from the NodeDef's discriminated union — the worker's switch/map

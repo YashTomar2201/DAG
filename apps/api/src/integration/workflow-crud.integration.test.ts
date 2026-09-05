@@ -34,9 +34,9 @@ describe('D1.1 — Workflow CRUD', () => {
       const { workflowId, versionId } = await ctx.db.createWorkflow(tenantId, name, graph, topo);
       ids.push(workflowId);
       if (name === 'bravo') {
-        const run = await ctx.db.createRun(versionId, 'api', graph.nodes.map((n) => n.key));
+        const run = await ctx.db.createRun(versionId, tenantId, 'api', graph.nodes.map((n) => n.key));
         // lastRunAt is derived from Run.startedAt — mark it started.
-        await ctx.db.prisma.run.update({ where: { id: run.id }, data: { startedAt: new Date() } });
+        await ctx.db.withTenant(tenantId, (tx) => tx.run.update({ where: { id: run.id }, data: { startedAt: new Date() } }));
         runIdForWf2 = run.id;
       }
       await new Promise((r) => setTimeout(r, 5));
@@ -50,16 +50,20 @@ describe('D1.1 — Workflow CRUD', () => {
       select: { id: true },
     });
     const vIds = versions.map((v) => v.id);
-    const runs = await ctx.db.prisma.run.findMany({
-      where: { workflowVersionId: { in: vIds } },
-      select: { id: true },
+    const rIds = await ctx.db.withTenant(tenantId, async (tx) => {
+      const runs = await tx.run.findMany({
+        where: { workflowVersionId: { in: vIds } },
+        select: { id: true },
+      });
+      return runs.map((r) => r.id);
     });
-    const rIds = runs.map((r) => r.id);
-    await ctx.db.prisma.runEvent.deleteMany({ where: { runId: { in: rIds } } });
-    await ctx.db.prisma.nodeRun.deleteMany({ where: { runId: { in: rIds } } });
-    await ctx.db.prisma.run.deleteMany({ where: { id: { in: rIds } } });
+    await ctx.db.withTenant(tenantId, async (tx) => {
+      await tx.runEvent.deleteMany({ where: { runId: { in: rIds } } });
+      await tx.nodeRun.deleteMany({ where: { runId: { in: rIds } } });
+      await tx.run.deleteMany({ where: { id: { in: rIds } } });
+    });
     await ctx.db.prisma.workflowVersion.deleteMany({ where: { workflowId: { in: ids } } });
-    await ctx.db.prisma.workflow.deleteMany({ where: { id: { in: ids } } });
+    await ctx.db.withTenant(tenantId, (tx) => tx.workflow.deleteMany({ where: { id: { in: ids } } }));
     await ctx.db.prisma.tenant.deleteMany({ where: { id: tenantId } });
     await teardownTestEnv(ctx);
   });

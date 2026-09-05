@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 describe('Phase 12 — cancellation mid-run', () => {
@@ -21,6 +21,7 @@ describe('Phase 12 — cancellation mid-run', () => {
   let tenantId: string;
   let workflowId: string;
   let versionId: string;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
@@ -39,15 +40,16 @@ describe('Phase 12 — cancellation mid-run', () => {
     const trainNode = graph.nodes.find((n) => n.key === 'train')!;
     (trainNode.config as Record<string, unknown>)['epochs'] = 100; // ~2s of simulated training
 
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, graph as Graph, 'cancellation');
+    const seeded = await seedWorkflowVersion(ctx.db, graph as Graph, 'cancellation');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
+    db = tenantScopedPrisma(ctx.db, tenantId);
   }, 60_000);
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -57,7 +59,7 @@ describe('Phase 12 — cancellation mid-run', () => {
     // Wait for the first node to complete — proves the run is genuinely
     // in-flight (not cancelled before anything happened).
     await waitUntil(async () => {
-      const nr = await ctx.db.prisma.nodeRun.findUnique({
+      const nr = await db.nodeRun.findUnique({
         where: { runId_nodeKey: { runId: run.id, nodeKey: 'extract' } },
       });
       return nr?.status === 'SUCCEEDED';
@@ -72,8 +74,8 @@ describe('Phase 12 — cancellation mid-run', () => {
     // not a timing coincidence.
     await new Promise((r) => setTimeout(r, 2000));
 
-    const finalRun = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
-    const nodeRuns = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id } });
+    const finalRun = await db.run.findUnique({ where: { id: run.id } });
+    const nodeRuns = await db.nodeRun.findMany({ where: { runId: run.id } });
     const byKey = new Map(nodeRuns.map((n) => [n.nodeKey, n]));
     const terminalNonRunning = ['SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED'];
 

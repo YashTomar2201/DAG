@@ -8,6 +8,8 @@ export interface JobPayload {
   runId: string;
   nodeKey: string;
   nodeRunId: string;
+  /** The tenant that owns this run — RLS (roadmap C2.1) requires it for every DB call the worker makes. */
+  tenantId: string;
   type: NodeType;
   config: unknown; // Will be cast/validated by the worker based on type
   input: unknown;  // Will be the resolved template inputs from context passing

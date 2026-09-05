@@ -2,6 +2,7 @@ import type { NodeStatus, RunStatus } from '@dag/contracts';
 import type { TopologicalSortResult } from '@dag/graph-core';
 import type { Graph } from '@dag/contracts';
 import { prisma } from './client';
+import { withTenant, withAdminContext } from './tenant';
 import type { Prisma } from './generated/client';
 import type {
   Run,
@@ -36,6 +37,10 @@ export async function createWorkflow(
       update: {},
       create: { id: tenantId, name: tenantId === 'default' ? 'Default' : tenantId },
     });
+
+    // Roadmap C2.1: Workflow is RLS-protected — the INSERT below is checked
+    // against this same value (the policy's implicit WITH CHECK).
+    await tx.$executeRaw`SELECT set_config('app.tenant_id', ${tenantId}, true)`;
 
     const workflow = await tx.workflow.create({
       data: { tenantId, name },
@@ -110,7 +115,8 @@ export async function listWorkflows(
   tenantId: string,
   opts: { limit: number; cursor?: string },
 ): Promise<{ workflows: WorkflowListRow[]; nextCursor: string | null }> {
-  const rows = await prisma.workflow.findMany({
+  return withTenant(tenantId, async (tx) => {
+  const rows = await tx.workflow.findMany({
     where: { tenantId, deletedAt: null },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: opts.limit + 1,
@@ -122,8 +128,11 @@ export async function listWorkflows(
   const page = hasMore ? rows.slice(0, opts.limit) : rows;
   const ids = page.map((w) => w.id);
 
+  // WorkflowVersion/Run: Run is RLS-protected too, but we're already inside
+  // this tenant's transaction, so it's visible the same way Workflow is —
+  // no separate wrapping needed for a query nested in the same tx.
   const agg = ids.length
-    ? await prisma.workflowVersion.findMany({
+    ? await tx.workflowVersion.findMany({
         where: { workflowId: { in: ids } },
         select: {
           workflowId: true,
@@ -151,22 +160,25 @@ export async function listWorkflows(
     })),
     nextCursor: hasMore ? page[page.length - 1]!.id : null,
   };
+  });
 }
 
 /** A single workflow with its version list (newest first). 404s if soft-deleted. */
 export async function getWorkflowWithVersions(id: string, tenantId: string) {
-  return prisma.workflow.findFirst({
-    where: { id, tenantId, deletedAt: null },
-    select: {
-      id: true,
-      name: true,
-      createdAt: true,
-      versions: {
-        orderBy: { version: 'desc' },
-        select: { id: true, version: true, createdAt: true },
+  return withTenant(tenantId, (tx) =>
+    tx.workflow.findFirst({
+      where: { id, tenantId, deletedAt: null },
+      select: {
+        id: true,
+        name: true,
+        createdAt: true,
+        versions: {
+          orderBy: { version: 'desc' },
+          select: { id: true, version: true, createdAt: true },
+        },
       },
-    },
-  });
+    }),
+  );
 }
 
 /**
@@ -175,29 +187,36 @@ export async function getWorkflowWithVersions(id: string, tenantId: string) {
  * doesn't belong to it.
  */
 export async function getWorkflowVersion(workflowId: string, versionId: string, tenantId: string) {
-  const wf = await prisma.workflow.findFirst({
-    where: { id: workflowId, tenantId, deletedAt: null },
-    select: { id: true },
-  });
-  if (!wf) return null;
-  return prisma.workflowVersion.findFirst({
-    where: { id: versionId, workflowId },
-    select: { id: true, workflowId: true, version: true, graph: true, topoOrder: true, createdAt: true },
+  return withTenant(tenantId, async (tx) => {
+    const wf = await tx.workflow.findFirst({
+      where: { id: workflowId, tenantId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!wf) return null;
+    // WorkflowVersion itself isn't RLS-protected (see the migration's doc
+    // comment) — scoping through the Workflow check above is what makes this
+    // tenant-safe.
+    return tx.workflowVersion.findFirst({
+      where: { id: versionId, workflowId },
+      select: { id: true, workflowId: true, version: true, graph: true, topoOrder: true, createdAt: true },
+    });
   });
 }
 
 /** Just the version list for a workflow (D1.3). Returns null if not found. */
 export async function listWorkflowVersions(id: string, tenantId: string) {
-  const wf = await prisma.workflow.findFirst({
-    where: { id, tenantId, deletedAt: null },
-    select: {
-      versions: {
-        orderBy: { version: 'desc' },
-        select: { id: true, version: true, createdAt: true },
+  return withTenant(tenantId, async (tx) => {
+    const wf = await tx.workflow.findFirst({
+      where: { id, tenantId, deletedAt: null },
+      select: {
+        versions: {
+          orderBy: { version: 'desc' },
+          select: { id: true, version: true, createdAt: true },
+        },
       },
-    },
+    });
+    return wf ? wf.versions : null;
   });
-  return wf ? wf.versions : null;
 }
 
 /**
@@ -205,14 +224,16 @@ export async function listWorkflowVersions(id: string, tenantId: string) {
  * for this tenant (or is soft-deleted).
  */
 export async function renameWorkflow(id: string, tenantId: string, name: string) {
-  const result = await prisma.workflow.updateMany({
-    where: { id, tenantId, deletedAt: null },
-    data: { name },
-  });
-  if (result.count === 0) return null;
-  return prisma.workflow.findUnique({
-    where: { id },
-    select: { id: true, name: true, createdAt: true },
+  return withTenant(tenantId, async (tx) => {
+    const result = await tx.workflow.updateMany({
+      where: { id, tenantId, deletedAt: null },
+      data: { name },
+    });
+    if (result.count === 0) return null;
+    return tx.workflow.findUnique({
+      where: { id },
+      select: { id: true, name: true, createdAt: true },
+    });
   });
 }
 
@@ -221,11 +242,13 @@ export async function renameWorkflow(id: string, tenantId: string, name: string)
  * there was no matching non-deleted row. Runs stay readable by id.
  */
 export async function softDeleteWorkflow(id: string, tenantId: string): Promise<boolean> {
-  const result = await prisma.workflow.updateMany({
-    where: { id, tenantId, deletedAt: null },
-    data: { deletedAt: new Date() },
+  return withTenant(tenantId, async (tx) => {
+    const result = await tx.workflow.updateMany({
+      where: { id, tenantId, deletedAt: null },
+      data: { deletedAt: new Date() },
+    });
+    return result.count > 0;
   });
-  return result.count > 0;
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -241,20 +264,22 @@ export async function softDeleteWorkflow(id: string, tenantId: string): Promise<
  */
 export async function createRun(
   workflowVersionId: string,
+  tenantId: string,
   triggeredBy: string,
   nodeKeys: string[],
   idempotencyKey?: string,
 ): Promise<Run> {
-  // Idempotency check — return existing run without creating a new one
-  if (idempotencyKey) {
-    const existing = await prisma.run.findUnique({ where: { idempotencyKey } });
-    if (existing) return existing;
-  }
+  return withTenant(tenantId, async (tx) => {
+    // Idempotency check — return existing run without creating a new one
+    if (idempotencyKey) {
+      const existing = await tx.run.findUnique({ where: { idempotencyKey } });
+      if (existing) return existing;
+    }
 
-  return prisma.$transaction(async (tx) => {
     const run = await tx.run.create({
       data: {
         workflowVersionId,
+        tenantId,
         triggeredBy,
         idempotencyKey,
       },
@@ -264,6 +289,7 @@ export async function createRun(
     await tx.nodeRun.createMany({
       data: nodeKeys.map((nodeKey) => ({
         runId: run.id,
+        tenantId,
         nodeKey,
         // Prisma enums are string-typed in createMany — cast is correct
         status: 'PENDING' as NodeStatus,
@@ -277,8 +303,8 @@ export async function createRun(
 
 /** The run created for a given idempotency key, or null. Lets callers tell a
  *  fresh run apart from an idempotent replay (B2 schedule / webhook fires). */
-export async function findRunByIdempotencyKey(idempotencyKey: string): Promise<Run | null> {
-  return prisma.run.findUnique({ where: { idempotencyKey } });
+export async function findRunByIdempotencyKey(idempotencyKey: string, tenantId: string): Promise<Run | null> {
+  return withTenant(tenantId, (tx) => tx.run.findUnique({ where: { idempotencyKey } }));
 }
 
 /**
@@ -295,6 +321,7 @@ export async function findRunByIdempotencyKey(idempotencyKey: string): Promise<R
  */
 export async function createFanOutChildRun(params: {
   workflowVersionId: string;
+  tenantId: string;
   parentRunId: string;
   fanOutIndex: number;
   subgraphKeys: string[];
@@ -302,14 +329,17 @@ export async function createFanOutChildRun(params: {
   seedOutput: unknown;
   idempotencyKey: string;
 }): Promise<{ run: Run; created: boolean }> {
-  const existing = await prisma.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+  const existing = await withTenant(params.tenantId, (tx) =>
+    tx.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } }),
+  );
   if (existing) return { run: existing, created: false };
 
   try {
-    const run = await prisma.$transaction(async (tx) => {
+    const run = await withTenant(params.tenantId, async (tx) => {
       const child = await tx.run.create({
         data: {
           workflowVersionId: params.workflowVersionId,
+          tenantId: params.tenantId,
           triggeredBy: 'fanout',
           idempotencyKey: params.idempotencyKey,
           parentRunId: params.parentRunId,
@@ -319,6 +349,7 @@ export async function createFanOutChildRun(params: {
       await tx.nodeRun.create({
         data: {
           runId: child.id,
+          tenantId: params.tenantId,
           nodeKey: params.seedNodeKey,
           status: 'SUCCEEDED' as NodeStatus,
           attempt: 0,
@@ -330,6 +361,7 @@ export async function createFanOutChildRun(params: {
         await tx.nodeRun.createMany({
           data: params.subgraphKeys.map((nodeKey) => ({
             runId: child.id,
+            tenantId: params.tenantId,
             nodeKey,
             status: 'PENDING' as NodeStatus,
             attempt: 0,
@@ -340,28 +372,39 @@ export async function createFanOutChildRun(params: {
     });
     return { run, created: true };
   } catch (err) {
-    // A concurrent spawn of the same index lost the unique-key race — return theirs.
-    const raced = await prisma.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } });
+    // A concurrent spawn of the same index lost the unique-key race — return
+    // theirs. Deliberately a FRESH withTenant call (a new transaction), not a
+    // continuation of the failed one above — Postgres aborts the rest of a
+    // transaction after any statement inside it fails, so re-querying on the
+    // same `tx` here would itself fail with "current transaction is aborted".
+    const raced = await withTenant(params.tenantId, (tx) =>
+      tx.run.findUnique({ where: { idempotencyKey: params.idempotencyKey } }),
+    );
     if (raced) return { run: raced, created: false };
     throw err;
   }
 }
 
 /** Count of a parent's children that are not in a terminal RunStatus. Zero ⇒ join. */
-export async function countNonTerminalChildren(parentRunId: string): Promise<number> {
-  return prisma.run.count({
-    where: { parentRunId, status: { notIn: ['SUCCEEDED', 'FAILED', 'CANCELLED'] } },
-  });
+export async function countNonTerminalChildren(parentRunId: string, tenantId: string): Promise<number> {
+  return withTenant(tenantId, (tx) =>
+    tx.run.count({
+      where: { parentRunId, status: { notIn: ['SUCCEEDED', 'FAILED', 'CANCELLED'] } },
+    }),
+  );
 }
 
 /** Minimal parent-tree fields for a run, or null if the run doesn't exist. */
 export async function getRunTreeInfo(
   runId: string,
+  tenantId: string,
 ): Promise<{ parentRunId: string | null; fanOutIndex: number | null; idempotencyKey: string | null; status: string } | null> {
-  return prisma.run.findUnique({
-    where: { id: runId },
-    select: { parentRunId: true, fanOutIndex: true, idempotencyKey: true, status: true },
-  });
+  return withTenant(tenantId, (tx) =>
+    tx.run.findUnique({
+      where: { id: runId },
+      select: { parentRunId: true, fanOutIndex: true, idempotencyKey: true, status: true },
+    }),
+  );
 }
 
 /**
@@ -373,34 +416,37 @@ export async function getRunTreeInfo(
 export async function getFanOutChildOutputs(
   parentRunId: string,
   sinkKeys: string[],
+  tenantId: string,
 ): Promise<Array<{ fanOutIndex: number; status: string; element: unknown }>> {
-  const children = await prisma.run.findMany({
-    where: { parentRunId },
-    orderBy: { fanOutIndex: 'asc' },
-    select: { id: true, fanOutIndex: true, status: true },
-  });
-  if (children.length === 0) return [];
+  return withTenant(tenantId, async (tx) => {
+    const children = await tx.run.findMany({
+      where: { parentRunId },
+      orderBy: { fanOutIndex: 'asc' },
+      select: { id: true, fanOutIndex: true, status: true },
+    });
+    if (children.length === 0) return [];
 
-  const nodeRuns = await prisma.nodeRun.findMany({
-    where: { runId: { in: children.map((c) => c.id) }, nodeKey: { in: sinkKeys } },
-    select: { runId: true, nodeKey: true, status: true, output: true },
-  });
-  const byRun = new Map<string, Map<string, unknown>>();
-  for (const nr of nodeRuns) {
-    if (nr.status !== 'SUCCEEDED') continue;
-    let m = byRun.get(nr.runId);
-    if (!m) byRun.set(nr.runId, (m = new Map()));
-    m.set(nr.nodeKey, nr.output);
-  }
-
-  const single = sinkKeys.length === 1 ? sinkKeys[0]! : null;
-  return children.map((c) => {
-    const outs = byRun.get(c.id);
-    let element: unknown = null;
-    if (outs && outs.size > 0) {
-      element = single ? (outs.get(single) ?? null) : Object.fromEntries(outs);
+    const nodeRuns = await tx.nodeRun.findMany({
+      where: { runId: { in: children.map((c) => c.id) }, nodeKey: { in: sinkKeys } },
+      select: { runId: true, nodeKey: true, status: true, output: true },
+    });
+    const byRun = new Map<string, Map<string, unknown>>();
+    for (const nr of nodeRuns) {
+      if (nr.status !== 'SUCCEEDED') continue;
+      let m = byRun.get(nr.runId);
+      if (!m) byRun.set(nr.runId, (m = new Map()));
+      m.set(nr.nodeKey, nr.output);
     }
-    return { fanOutIndex: c.fanOutIndex ?? 0, status: c.status, element };
+
+    const single = sinkKeys.length === 1 ? sinkKeys[0]! : null;
+    return children.map((c) => {
+      const outs = byRun.get(c.id);
+      let element: unknown = null;
+      if (outs && outs.size > 0) {
+        element = single ? (outs.get(single) ?? null) : Object.fromEntries(outs);
+      }
+      return { fanOutIndex: c.fanOutIndex ?? 0, status: c.status, element };
+    });
   });
 }
 
@@ -426,12 +472,14 @@ const EMPTY_CHILD_SUMMARY: ChildRunSummary = {
  * children (the common case). `pending` folds PENDING + RUNNING-is-separate:
  * PENDING here is the DB `PENDING` state only; `running` is `RUNNING`.
  */
-export async function getChildRunSummary(parentRunId: string): Promise<ChildRunSummary> {
-  const rows = await prisma.run.groupBy({
-    by: ['status'],
-    where: { parentRunId },
-    _count: { _all: true },
-  });
+export async function getChildRunSummary(parentRunId: string, tenantId: string): Promise<ChildRunSummary> {
+  const rows = await withTenant(tenantId, (tx) =>
+    tx.run.groupBy({
+      by: ['status'],
+      where: { parentRunId },
+      _count: { _all: true },
+    }),
+  );
   const summary: ChildRunSummary = { ...EMPTY_CHILD_SUMMARY };
   for (const row of rows) {
     const n = row._count._all;
@@ -455,6 +503,7 @@ export async function getChildRunSummary(parentRunId: string): Promise<ChildRunS
  */
 export async function listChildRuns(
   parentRunId: string,
+  tenantId: string,
   opts: { limit: number; cursor?: string },
 ): Promise<{
   children: Array<{
@@ -467,20 +516,22 @@ export async function listChildRuns(
   }>;
   nextCursor: string | null;
 }> {
-  const rows = await prisma.run.findMany({
-    where: { parentRunId },
-    orderBy: [{ fanOutIndex: 'asc' }, { id: 'asc' }],
-    take: opts.limit + 1,
-    ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
-    select: {
-      id: true,
-      status: true,
-      fanOutIndex: true,
-      triggeredBy: true,
-      startedAt: true,
-      finishedAt: true,
-    },
-  });
+  const rows = await withTenant(tenantId, (tx) =>
+    tx.run.findMany({
+      where: { parentRunId },
+      orderBy: [{ fanOutIndex: 'asc' }, { id: 'asc' }],
+      take: opts.limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      select: {
+        id: true,
+        status: true,
+        fanOutIndex: true,
+        triggeredBy: true,
+        startedAt: true,
+        finishedAt: true,
+      },
+    }),
+  );
 
   const hasMore = rows.length > opts.limit;
   const children = hasMore ? rows.slice(0, opts.limit) : rows;
@@ -508,6 +559,7 @@ export async function tryTransitionNodeRun(
   nodeRunId: string,
   from: NodeStatus,
   to: NodeStatus,
+  tenantId: string,
   extra?: {
     output?: Prisma.InputJsonValue;
     error?: Prisma.InputJsonValue;
@@ -518,10 +570,12 @@ export async function tryTransitionNodeRun(
     attempt?: number;
   },
 ): Promise<boolean> {
-  const result = await prisma.nodeRun.updateMany({
-    where: { id: nodeRunId, status: from },
-    data: { status: to, ...extra },
-  });
+  const result = await withTenant(tenantId, (tx) =>
+    tx.nodeRun.updateMany({
+      where: { id: nodeRunId, status: from },
+      data: { status: to, ...extra },
+    }),
+  );
 
   return result.count > 0;
 }
@@ -532,10 +586,13 @@ export async function tryTransitionNodeRun(
 export async function findNodeRun(
   runId: string,
   nodeKey: string,
+  tenantId: string,
 ): Promise<NodeRun | null> {
-  return prisma.nodeRun.findUnique({
-    where: { runId_nodeKey: { runId, nodeKey } },
-  });
+  return withTenant(tenantId, (tx) =>
+    tx.nodeRun.findUnique({
+      where: { runId_nodeKey: { runId, nodeKey } },
+    }),
+  );
 }
 
 /**
@@ -546,9 +603,10 @@ export async function findNodeRun(
  */
 export async function setNodeRunError(
   nodeRunId: string,
+  tenantId: string,
   error: Prisma.InputJsonValue,
 ): Promise<void> {
-  await prisma.nodeRun.update({ where: { id: nodeRunId }, data: { error } });
+  await withTenant(tenantId, (tx) => tx.nodeRun.update({ where: { id: nodeRunId }, data: { error } }));
 }
 
 /**
@@ -556,8 +614,9 @@ export async function setNodeRunError(
  */
 export async function getNodeRunMap(
   runId: string,
+  tenantId: string,
 ): Promise<Map<string, NodeRun>> {
-  const rows = await prisma.nodeRun.findMany({ where: { runId } });
+  const rows = await withTenant(tenantId, (tx) => tx.nodeRun.findMany({ where: { runId } }));
   return new Map(rows.map((r) => [r.nodeKey, r]));
 }
 
@@ -570,15 +629,18 @@ export async function tryTransitionRun(
   runId: string,
   from: RunStatus,
   to: RunStatus,
+  tenantId: string,
   extra?: {
     startedAt?: Date | null;
     finishedAt?: Date | null;
   },
 ): Promise<boolean> {
-  const result = await prisma.run.updateMany({
-    where: { id: runId, status: from },
-    data: { status: to, ...extra },
-  });
+  const result = await withTenant(tenantId, (tx) =>
+    tx.run.updateMany({
+      where: { id: runId, status: from },
+      data: { status: to, ...extra },
+    }),
+  );
 
   return result.count > 0;
 }
@@ -587,13 +649,15 @@ export async function tryTransitionRun(
  * Checks whether all NodeRuns for a run are in a terminal state.
  * Used by the orchestrator to decide when to mark the Run SUCCEEDED.
  */
-export async function allNodeRunsTerminal(runId: string): Promise<boolean> {
-  const pending = await prisma.nodeRun.count({
-    where: {
-      runId,
-      status: { notIn: ['SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED'] },
-    },
-  });
+export async function allNodeRunsTerminal(runId: string, tenantId: string): Promise<boolean> {
+  const pending = await withTenant(tenantId, (tx) =>
+    tx.nodeRun.count({
+      where: {
+        runId,
+        status: { notIn: ['SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED'] },
+      },
+    }),
+  );
   return pending === 0;
 }
 
@@ -605,13 +669,16 @@ export async function allNodeRunsTerminal(runId: string): Promise<boolean> {
  */
 export async function appendRunEvent(
   runId: string,
+  tenantId: string,
   type: string,
   payload: Prisma.InputJsonValue,
   nodeKey?: string,
 ): Promise<RunEvent> {
-  return prisma.runEvent.create({
-    data: { runId, type, payload, nodeKey },
-  });
+  return withTenant(tenantId, (tx) =>
+    tx.runEvent.create({
+      data: { runId, tenantId, type, payload, nodeKey },
+    }),
+  );
 }
 
 /**
@@ -620,15 +687,18 @@ export async function appendRunEvent(
  */
 export async function getRunEvents(
   runId: string,
+  tenantId: string,
   afterId?: bigint,
 ): Promise<RunEvent[]> {
-  return prisma.runEvent.findMany({
-    where: {
-      runId,
-      ...(afterId !== undefined ? { id: { gt: afterId } } : {}),
-    },
-    orderBy: { id: 'asc' },
-  });
+  return withTenant(tenantId, (tx) =>
+    tx.runEvent.findMany({
+      where: {
+        runId,
+        ...(afterId !== undefined ? { id: { gt: afterId } } : {}),
+      },
+      orderBy: { id: 'asc' },
+    }),
+  );
 }
 
 // ─── Observability (Phase 12) ─────────────────────────────────────────────────
@@ -646,7 +716,7 @@ export async function getRunEvents(
  * forgotten.
  */
 export async function countNodeRunsByStatus(): Promise<Record<string, number>> {
-  const rows = await prisma.nodeRun.groupBy({ by: ['status'], _count: { _all: true } });
+  const rows = await withAdminContext((tx) => tx.nodeRun.groupBy({ by: ['status'], _count: { _all: true } }));
   const result: Record<string, number> = {};
   for (const row of rows) result[row.status] = row._count._all;
   return result;
@@ -654,7 +724,7 @@ export async function countNodeRunsByStatus(): Promise<Record<string, number>> {
 
 /** Same idea as {@link countNodeRunsByStatus}, one row per Run. */
 export async function countRunsByStatus(): Promise<Record<string, number>> {
-  const rows = await prisma.run.groupBy({ by: ['status'], _count: { _all: true } });
+  const rows = await withAdminContext((tx) => tx.run.groupBy({ by: ['status'], _count: { _all: true } }));
   const result: Record<string, number> = {};
   for (const row of rows) result[row.status] = row._count._all;
   return result;
@@ -666,44 +736,78 @@ export type { Schedule, Trigger } from './generated/client';
 
 /**
  * The id of a workflow's newest version, or null if it has none / is
- * soft-deleted / belongs to another tenant. Used by the schedule + webhook
- * fire paths, which run "whatever is latest right now".
+ * soft-deleted / belongs to another tenant. `tenantId` is required — the
+ * schedule/trigger fire paths that don't have one in hand yet resolve it
+ * first via {@link getWorkflowTenantId}.
  */
 export async function getLatestVersionId(
   workflowId: string,
-  tenantId?: string,
+  tenantId: string,
 ): Promise<string | null> {
-  const wf = await prisma.workflow.findFirst({
-    where: { id: workflowId, deletedAt: null, ...(tenantId ? { tenantId } : {}) },
-    select: {
-      versions: { orderBy: { version: 'desc' }, take: 1, select: { id: true } },
-    },
-  });
+  const wf = await withTenant(tenantId, (tx) =>
+    tx.workflow.findFirst({
+      where: { id: workflowId, tenantId, deletedAt: null },
+      select: {
+        versions: { orderBy: { version: 'desc' }, take: 1, select: { id: true } },
+      },
+    }),
+  );
   return wf?.versions[0]?.id ?? null;
+}
+
+/**
+ * Which tenant owns a workflow, or null if it doesn't exist / is
+ * soft-deleted. Admin-context by construction: this is the one query that
+ * has to run BEFORE any tenant context is known, for callers that only have
+ * a bare `workflowId` — the scheduler tick and webhook delivery paths, which
+ * resolve a `Schedule`/`Trigger` row (neither RLS-protected) by id/token
+ * with no authenticated request behind them at all.
+ */
+export async function getWorkflowTenantId(workflowId: string): Promise<string | null> {
+  const wf = await withAdminContext((tx) =>
+    tx.workflow.findFirst({ where: { id: workflowId, deletedAt: null }, select: { tenantId: true } }),
+  );
+  return wf?.tenantId ?? null;
 }
 
 /** True iff the workflow exists, is not soft-deleted, and belongs to the tenant. */
 export async function workflowBelongsToTenant(workflowId: string, tenantId: string): Promise<boolean> {
-  const wf = await prisma.workflow.findFirst({
-    where: { id: workflowId, tenantId, deletedAt: null },
-    select: { id: true },
-  });
+  const wf = await withTenant(tenantId, (tx) =>
+    tx.workflow.findFirst({
+      where: { id: workflowId, tenantId, deletedAt: null },
+      select: { id: true },
+    }),
+  );
   return wf !== null;
 }
 
 /**
- * True iff the run exists and its workflow (via `WorkflowVersion`) belongs to
- * the tenant — `Run` itself has no `tenantId` column (see C2.1's note on
- * denormalising one for RLS; A3 doesn't need it, a join is fine at this
- * volume). Every tenant-scoped run route calls this before doing anything
- * else, so a leaked/guessed run id from another tenant reads as a plain 404,
- * never as data.
+ * Which tenant owns a run, or null if it doesn't exist. Admin-context, same
+ * rationale as {@link getWorkflowTenantId}: BullMQ's `QueueEvents` `completed`/
+ * `failed` handlers (`apps/api/src/worker-events.ts`) only carry a bare
+ * `jobId` (parsed into `runId`/`nodeKey`) — no tenant context travels with
+ * them — so `onNodeSucceeded`/`onNodeFailed` resolve it here before doing
+ * anything else.
+ */
+export async function resolveTenantForRun(runId: string): Promise<string | null> {
+  const run = await withAdminContext((tx) => tx.run.findUnique({ where: { id: runId }, select: { tenantId: true } }));
+  return run?.tenantId ?? null;
+}
+
+/**
+ * True iff the run exists and belongs to the tenant. Now backed by RLS
+ * itself (roadmap C2.1) — `withTenant` alone would hide a wrong-tenant run,
+ * making the explicit `tenantId` filter redundant, but keeping it is exactly
+ * the "defense in depth" this function existed for since A3: if RLS were
+ * ever misconfigured, this check still catches it.
  */
 export async function runBelongsToTenant(runId: string, tenantId: string): Promise<boolean> {
-  const run = await prisma.run.findFirst({
-    where: { id: runId, workflowVersion: { workflow: { tenantId } } },
-    select: { id: true },
-  });
+  const run = await withTenant(tenantId, (tx) =>
+    tx.run.findFirst({
+      where: { id: runId, tenantId },
+      select: { id: true },
+    }),
+  );
   return run !== null;
 }
 

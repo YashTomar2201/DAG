@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 function fanOutGraph(): Graph {
@@ -47,28 +47,30 @@ describe('B3.2 — dynamic fan-out', () => {
   let versionId: string;
   let runId: string;
   let columnCount = 0;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
     stopQueueEvents = ctx.workerEvents.startQueueEventListeners();
 
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, fanOutGraph(), 'b32');
+    const seeded = await seedWorkflowVersion(ctx.db, fanOutGraph(), 'b32');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
+    db = tenantScopedPrisma(ctx.db, tenantId);
 
     const run = await ctx.orchestrator.startRun(versionId);
     runId = run.id;
 
     await waitUntil(
       async () => {
-        const r = await ctx.db.prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
+        const r = await db.run.findUnique({ where: { id: runId }, select: { status: true } });
         return r?.status === 'SUCCEEDED' || r?.status === 'FAILED';
       },
       { timeoutMs: 120_000 },
     );
 
-    const splitNr = await ctx.db.prisma.nodeRun.findUnique({
+    const splitNr = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId, nodeKey: 'split' } },
       select: { output: true },
     });
@@ -77,21 +79,21 @@ describe('B3.2 — dynamic fan-out', () => {
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await ctx.db.prisma.runEvent.deleteMany({
+    await db.runEvent.deleteMany({
       where: { run: { OR: [{ id: runId }, { parentRunId: runId }] } },
     });
-    await ctx.db.prisma.nodeRun.deleteMany({
+    await db.nodeRun.deleteMany({
       where: { run: { OR: [{ id: runId }, { parentRunId: runId }] } },
     });
-    await ctx.db.prisma.run.deleteMany({ where: { parentRunId: runId } });
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await db.run.deleteMany({ where: { parentRunId: runId } });
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
   it('spawns one child run per source element, all SUCCEEDED and fanout-tagged', async () => {
     expect(columnCount).toBeGreaterThan(5);
 
-    const children = await ctx.db.prisma.run.findMany({
+    const children = await db.run.findMany({
       where: { parentRunId: runId },
       orderBy: { fanOutIndex: 'asc' },
     });
@@ -103,9 +105,9 @@ describe('B3.2 — dynamic fan-out', () => {
 
   it('runs the children in parallel across workers', async () => {
     const childIds = (
-      await ctx.db.prisma.run.findMany({ where: { parentRunId: runId }, select: { id: true } })
+      await db.run.findMany({ where: { parentRunId: runId }, select: { id: true } })
     ).map((c) => c.id);
-    const workNrs = await ctx.db.prisma.nodeRun.findMany({
+    const workNrs = await db.nodeRun.findMany({
       where: { runId: { in: childIds }, nodeKey: 'work' },
       select: { workerId: true },
     });
@@ -115,9 +117,9 @@ describe('B3.2 — dynamic fan-out', () => {
 
   it('injects the per-element value into each child as the map node output', async () => {
     const childIds = (
-      await ctx.db.prisma.run.findMany({ where: { parentRunId: runId }, select: { id: true } })
+      await db.run.findMany({ where: { parentRunId: runId }, select: { id: true } })
     ).map((c) => c.id);
-    const seeds = await ctx.db.prisma.nodeRun.findMany({
+    const seeds = await db.nodeRun.findMany({
       where: { runId: { in: childIds }, nodeKey: 'map' },
       select: { status: true, output: true },
     });
@@ -131,23 +133,23 @@ describe('B3.2 — dynamic fan-out', () => {
   });
 
   it('runs the downstream node exactly once, after every child, with a fan-out summary', async () => {
-    const parent = await ctx.db.prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
+    const parent = await db.run.findUnique({ where: { id: runId }, select: { status: true } });
     expect(parent?.status).toBe('SUCCEEDED');
 
-    const merge = await ctx.db.prisma.nodeRun.findUnique({
+    const merge = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId, nodeKey: 'merge' } },
     });
     expect(merge?.status).toBe('SUCCEEDED');
     expect(merge?.attempt).toBe(0); // ran once, no retries
 
-    const children = await ctx.db.prisma.run.findMany({
+    const children = await db.run.findMany({
       where: { parentRunId: runId },
       select: { finishedAt: true },
     });
     const lastChild = Math.max(...children.map((c) => c.finishedAt!.getTime()));
     expect(merge!.startedAt!.getTime()).toBeGreaterThanOrEqual(lastChild - 2000);
 
-    const map = await ctx.db.prisma.nodeRun.findUnique({
+    const map = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId, nodeKey: 'map' } },
       select: { output: true },
     });
@@ -158,14 +160,14 @@ describe('B3.2 — dynamic fan-out', () => {
     });
 
     // subgraph node has NO NodeRun in the parent run
-    const parentWork = await ctx.db.prisma.nodeRun.findUnique({
+    const parentWork = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId, nodeKey: 'work' } },
     });
     expect(parentWork).toBeNull();
   });
 
   it('emits RUN_SPAWNED once and RUN_CHILD_COMPLETED per child (B3.5)', async () => {
-    const events = await ctx.db.prisma.runEvent.findMany({
+    const events = await db.runEvent.findMany({
       where: { runId, type: { in: ['RUN_SPAWNED', 'RUN_CHILD_COMPLETED'] } },
       orderBy: { id: 'asc' },
     });
@@ -188,16 +190,16 @@ describe('B3.2 — dynamic fan-out', () => {
   });
 
   it('replaying the spawn creates no duplicate children', async () => {
-    const before = await ctx.db.prisma.run.count({ where: { parentRunId: runId } });
+    const before = await db.run.count({ where: { parentRunId: runId } });
 
-    const nodeRunMap = await ctx.db.getNodeRunMap(runId);
-    await ctx.orchestrator.spawnFanOut(runId, 'map', fanOutGraph(), versionId, nodeRunMap);
+    const nodeRunMap = await ctx.db.getNodeRunMap(runId, tenantId);
+    await ctx.orchestrator.spawnFanOut(runId, 'map', tenantId, fanOutGraph(), versionId, nodeRunMap);
 
-    const after = await ctx.db.prisma.run.count({ where: { parentRunId: runId } });
+    const after = await db.run.count({ where: { parentRunId: runId } });
     expect(after).toBe(before);
 
     // and the downstream node still ran exactly once
-    const merge = await ctx.db.prisma.nodeRun.findUnique({
+    const merge = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId, nodeKey: 'merge' } },
       select: { attempt: true, status: true },
     });

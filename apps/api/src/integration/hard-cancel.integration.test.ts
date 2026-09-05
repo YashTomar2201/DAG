@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 const EPOCHS = 2000; // ~80 s of simulated training on a warm host — long enough to cancel mid-flight
@@ -22,6 +22,7 @@ describe('B4 — hard cancellation', () => {
   let tenantId: string;
   let workflowId: string;
   let versionId: string;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
@@ -30,15 +31,16 @@ describe('B4 — hard cancellation', () => {
     const graph = hermeticPipelineGraph();
     (graph.nodes.find((n) => n.key === 'train')!.config as Record<string, unknown>)['epochs'] = EPOCHS;
 
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, graph as Graph, 'b4');
+    const seeded = await seedWorkflowVersion(ctx.db, graph as Graph, 'b4');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
+    db = tenantScopedPrisma(ctx.db, tenantId);
   }, 60_000);
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -48,7 +50,7 @@ describe('B4 — hard cancellation', () => {
     // Wait until `train` is really executing on a worker.
     await waitUntil(
       async () => {
-        const nr = await ctx.db.prisma.nodeRun.findUnique({
+        const nr = await db.nodeRun.findUnique({
           where: { runId_nodeKey: { runId: run.id, nodeKey: 'train' } },
         });
         return nr?.status === 'RUNNING' && nr.workerId != null;
@@ -56,7 +58,7 @@ describe('B4 — hard cancellation', () => {
       { timeoutMs: 60_000 },
     );
 
-    const trainNr = await ctx.db.prisma.nodeRun.findUnique({
+    const trainNr = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: run.id, nodeKey: 'train' } },
       select: { attempt: true },
     });
@@ -82,18 +84,18 @@ describe('B4 — hard cancellation', () => {
     // Give the worker's CANCELLED transition a beat to land.
     await new Promise((r) => setTimeout(r, 1500));
 
-    const finalTrain = await ctx.db.prisma.nodeRun.findUnique({
+    const finalTrain = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: run.id, nodeKey: 'train' } },
     });
     expect(finalTrain?.status).toBe('CANCELLED');
     expect(finalTrain?.status).not.toBe('FAILED');
 
-    const finalRun = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
+    const finalRun = await db.run.findUnique({ where: { id: run.id } });
     expect(finalRun?.status).toBe('CANCELLED');
 
     // The Python loop was interrupted — the highest logged iteration is well
     // below EPOCHS (it would reach EPOCHS only if the process ran to completion).
-    const logs = await ctx.db.prisma.runEvent.findMany({
+    const logs = await db.runEvent.findMany({
       where: { runId: run.id, nodeKey: 'train', type: 'NODE_LOG' },
       select: { payload: true },
     });
@@ -106,7 +108,7 @@ describe('B4 — hard cancellation', () => {
     }
 
     // Every NodeRun is terminal — cancel never leaves a row stuck.
-    const all = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id }, select: { status: true } });
+    const all = await db.nodeRun.findMany({ where: { runId: run.id }, select: { status: true } });
     for (const nr of all) {
       expect(['SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED']).toContain(nr.status);
     }

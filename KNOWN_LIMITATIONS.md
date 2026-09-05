@@ -6,7 +6,7 @@ valuable than pretending they don't exist.
 
 ---
 
-## 1. Multi-Tenancy Is Namespace-Only, Not Row-Level-Secure — 🟡 IN PROGRESS (roadmap A3 done, C2 open)
+## 1. Multi-Tenancy Is Namespace-Only at the Broker Layer — 🟡 IN PROGRESS (roadmap A3 + C2.1 done, C2.2/C2.3 open)
 
 **What existed:** Every `Workflow`, `Run`, and `NodeRun` row carried a `tenantId` column, and the
 API read it from an unauthenticated `?tenantId=` query param anyone could type.
@@ -24,18 +24,29 @@ flow). The one exception, `GET /runs/:id/events` (SSE — `EventSource` can't se
 uses a short-lived (~30 min) signed token minted by an authenticated
 `POST /runs/:id/events-token` call instead.
 
-**What is still missing (C2, open):**
-- No row-level security (RLS) in Postgres — a bug in one API service function could still query
-  across tenants; A3 closes this at the *route* layer (every route checks tenant ownership) but
-  not at the *database* layer (nothing stops a future service function from forgetting to).
+**C2.1 (done):** Postgres Row-Level Security is now enabled on `Workflow`, `Run`, `NodeRun`, and
+`RunEvent` — a bug in a future API service function that forgets its own tenant-ownership check
+can no longer read or write another tenant's data, because the database itself refuses the query
+without the right session-level `app.tenant_id` set (fails closed: no context → 0 rows). This
+required a new restricted `dag_app` Postgres role for all runtime traffic, since RLS is
+unconditionally bypassed for superusers/table owners (the pre-existing `dag` role is one). Every
+DB call the API and worker make now goes through `withTenant(tenantId, fn)` /
+`withAdminContext(fn)` (`packages/db/src/tenant.ts`), scoped one Postgres operation at a time to
+preserve the existing atomic-conditional-update concurrency guarantees. `WorkflowVersion`,
+`Schedule`, `Trigger`, and `ApiKey` are deliberately **not** RLS-protected (out of roadmap C2.1's
+stated scope). Verified against real RLS (not an approximation) by switching the integration
+suite from `prisma db push` to `prisma migrate deploy`, and by a live cross-tenant smoke test
+against the real Docker stack (a second tenant's key gets 404s on the first tenant's workflows
+and runs; the first tenant's run still executes end-to-end through the real worker process). Full
+write-up in `knowledge_base/updates.md`'s C2.1 entry.
+
+**What is still missing (C2.2/C2.3, open):**
 - Redis keys (`run:{runId}:indegree`, `run:{runId}:dispatched`) are keyed by `runId` alone, not
   `tenantId`. Two tenants sharing a Redis instance get no namespace separation at the broker layer.
 - The per-run concurrency semaphore (`run:{id}:slots`) is likewise not tenant-scoped, so one
   tenant's fan-out can consume the entire cluster's capacity budget.
 
-**To close it (C2):**
-- Enable Postgres RLS on `NodeRun`, `Run`, and `Workflow` so a bug in the application layer cannot
-  read another tenant's data even if a route forgets its own check.
+**To close it (C2.2/C2.3):**
 - Namespace Redis keys as `{tenantId}:{runId}:indegree` (or use Redis ACLs to restrict key
   patterns per tenant).
 - Add a per-tenant concurrency quota (a second semaphore, or a tenant-level BullMQ rate limiter)

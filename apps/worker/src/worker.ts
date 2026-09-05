@@ -42,7 +42,7 @@ const CONCURRENCY = {
 // ─── Job processor ────────────────────────────────────────────────────────────
 
 async function processJob(job: Job<JobPayload>): Promise<unknown> {
-  const { runId, nodeKey, nodeRunId, type, config, input, attempt } = job.data;
+  const { runId, nodeKey, nodeRunId, tenantId, type, config, input, attempt } = job.data;
   const workerId = process.env['WORKER_ID'] ?? `worker-${process.pid}`;
 
   logger.info({ runId, nodeKey, type, attempt }, 'Worker: processing job');
@@ -59,7 +59,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
   // 0. Hard-cancel pre-check (roadmap B4): the run may have been cancelled
   //    while this job sat in the queue — don't even start the executor.
   if (await isRunCancelled(runId)) {
-    await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'CANCELLED', { finishedAt: new Date() });
+    await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'CANCELLED', tenantId, { finishedAt: new Date() });
     await publishNodeCancelled();
     logger.info({ runId, nodeKey }, 'Worker: run cancelled before start — skipping');
     return null;
@@ -68,7 +68,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
   // 1. Transition NodeRun QUEUED → RUNNING
   //    Use the conditional update pattern — if we lose the race (e.g. this job
   //    was re-delivered after a stall), the update returns false and we bail.
-  const claimed = await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'RUNNING', {
+  const claimed = await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'RUNNING', tenantId, {
     workerId,
     startedAt: new Date(),
   });
@@ -138,7 +138,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     // A cancelled run: land the NodeRun on CANCELLED (the cancel path likely
     // already did via updateMany) and return normally so BullMQ does NOT retry.
     if (controller.signal.aborted || err instanceof PythonCancelledError || (await isRunCancelled(runId))) {
-      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'CANCELLED', { finishedAt: new Date() });
+      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'CANCELLED', tenantId, { finishedAt: new Date() });
       await publishNodeCancelled();
       logger.info({ runId, nodeKey }, 'Worker: executor stopped by cancellation');
       return null;
@@ -158,7 +158,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
       // Hand the row back to QUEUED so the NEXT BullMQ attempt re-executes it.
       // Without this, the retry's QUEUED→RUNNING claim fails, the job returns
       // null "successfully", and a transient failure becomes a phantom success.
-      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'QUEUED', {
+      await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'QUEUED', tenantId, {
         error: errorInfo,
         startedAt: null,
         finishedAt: null,
@@ -174,7 +174,7 @@ async function processJob(job: Job<JobPayload>): Promise<unknown> {
     } else {
       // Terminal: stamp the taxonomy-rich error so `onNodeFailed` keeps it
       // instead of overwriting with the bare BullMQ failedReason.
-      await setNodeRunError(nodeRunId, errorInfo);
+      await setNodeRunError(nodeRunId, tenantId, errorInfo);
     }
     throw err;
   } finally {

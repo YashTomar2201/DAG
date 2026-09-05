@@ -18,6 +18,7 @@ import {
   deleteTrigger,
   workflowBelongsToTenant,
   getLatestVersionId,
+  getWorkflowTenantId,
   findRunByIdempotencyKey,
   type Trigger,
 } from '@dag/db';
@@ -135,13 +136,18 @@ export async function handleWebhookService(
     throw new UnauthorizedError('Signature does not match request body');
   }
 
-  const versionId = await getLatestVersionId(trigger.workflowId);
+  // No authenticated request behind a webhook delivery — resolve the owning
+  // tenant first (admin context; roadmap C2.1) before any RLS-protected lookup.
+  const tenantId = await getWorkflowTenantId(trigger.workflowId);
+  if (!tenantId) throw new NotFoundError('Trigger', token);
+
+  const versionId = await getLatestVersionId(trigger.workflowId, tenantId);
   if (!versionId) throw new ValidationError('This workflow has no saved version to run.');
 
   const bodyHash = createHash('sha256').update(rawBody).digest('hex');
   const idempotencyKey = `webhook:${trigger.id}:${bodyHash}`;
-  const preexisting = await findRunByIdempotencyKey(idempotencyKey);
-  const run = await startRun(versionId, idempotencyKey, { triggeredBy: 'webhook' });
+  const preexisting = await findRunByIdempotencyKey(idempotencyKey, tenantId);
+  const run = await startRun(versionId, idempotencyKey, { triggeredBy: 'webhook', tenantId });
 
   await updateTrigger(trigger.id, { lastRunId: run.id, lastFiredAt: new Date() });
 

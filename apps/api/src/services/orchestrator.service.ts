@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   prisma,
+  withTenant,
+  withAdminContext,
   createRun,
   tryTransitionRun,
   tryTransitionNodeRun,
@@ -52,6 +54,25 @@ function observeNodeDuration(startedAt: Date | null, nodeType: string, outcome: 
   if (!startedAt) return; // defensive — should never happen for a node that reached RUNNING
   const seconds = (Date.now() - startedAt.getTime()) / 1000;
   nodeDurationSeconds.observe({ nodeType, outcome }, seconds);
+}
+
+/**
+ * Loads a Run's `workflowVersionId` (roadmap C2.1: Run is RLS-protected, so
+ * this needs the caller's tenant context — WorkflowVersion itself is not
+ * RLS-protected, so the follow-up `prisma.workflowVersion.findUnique` stays
+ * a plain, unscoped call).
+ */
+async function getRunWorkflowVersionId(runId: string, tenantId: string): Promise<string | null> {
+  const run = await withTenant(tenantId, (tx) =>
+    tx.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } }),
+  );
+  return run?.workflowVersionId ?? null;
+}
+
+/** Same as {@link getRunWorkflowVersionId} but also returns `status` — the fan-out spawn/join guards need both. */
+async function getRunStatus(runId: string, tenantId: string): Promise<string | null> {
+  const run = await withTenant(tenantId, (tx) => tx.run.findUnique({ where: { id: runId }, select: { status: true } }));
+  return run?.status ?? null;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -146,13 +167,19 @@ function parseFanOutIdemKey(
   return { parentRunId: parts[0]!, mapNodeKey: parts[1]!, index };
 }
 
-function emitAndLog(runId: string, type: RunEventType, payload: Record<string, unknown>, nodeKey?: string) {
+function emitAndLog(
+  runId: string,
+  tenantId: string,
+  type: RunEventType,
+  payload: Record<string, unknown>,
+  nodeKey?: string,
+) {
   // 1. Fire and forget the Redis pub/sub for real-time UI
   publishRunEvent(runId, { runId, nodeKey, type, payload, ts: Date.now() })
     .catch((err: unknown) => logger.error({ err, runId }, 'Failed to publish event to redis'));
-  
+
   // 2. Persist to Postgres audit log
-  appendRunEvent(runId, type, payload as Prisma.InputJsonValue, nodeKey)
+  appendRunEvent(runId, tenantId, type, payload as Prisma.InputJsonValue, nodeKey)
     .catch((err: unknown) => logger.error({ err, runId }, 'Failed to append event to DB'));
 }
 
@@ -165,11 +192,19 @@ export async function startRun(
   idempotencyKey?: string,
   opts: { triggeredBy?: string; tenantId?: string } = {},
 ) {
-  const version = await prisma.workflowVersion.findUnique({
-    where: { id: workflowVersionId },
-    include: { workflow: { select: { tenantId: true } } },
-  });
+  // Roadmap C2.1: we don't know the tenant yet — that's what this query is
+  // for — so it has to run with the RLS bypass. Workflow is RLS-protected;
+  // WorkflowVersion is not (see the migration's doc comment), which is
+  // exactly why this one join needs the admin context and nothing else here
+  // does.
+  const version = await withAdminContext((tx) =>
+    tx.workflowVersion.findUnique({
+      where: { id: workflowVersionId },
+      include: { workflow: { select: { tenantId: true } } },
+    }),
+  );
   if (!version) throw new NotFoundError('WorkflowVersion', workflowVersionId);
+  const tenantId = version.workflow.tenantId;
   // Roadmap A3: `POST /runs` passes `tenantId` (the caller's verified
   // identity) so an authenticated caller can't start a run against a
   // workflowVersionId belonging to another tenant just by knowing its id.
@@ -177,7 +212,9 @@ export async function startRun(
   // handlers) that already resolved this exact versionId through a
   // tenant-scoped lookup (`getLatestVersionId(workflowId, tenantId)`) before
   // ever reaching here — re-checking would be redundant, not unsafe to skip.
-  if (opts.tenantId && version.workflow.tenantId !== opts.tenantId) {
+  // Either way, `tenantId` (the workflow's OWN, real tenant) — never
+  // `opts.tenantId` — is what gets used from here on for RLS context.
+  if (opts.tenantId && tenantId !== opts.tenantId) {
     throw new NotFoundError('WorkflowVersion', workflowVersionId);
   }
 
@@ -196,11 +233,12 @@ export async function startRun(
   //    'api' (a POST /runs), 'schedule', 'webhook', or 'fanout' (a child run).
   const run = await createRun(
     workflowVersionId,
+    tenantId,
     opts.triggeredBy ?? 'api',
     nodeKeys,
     idempotencyKey,
   );
-  
+
   // If the run was already started (idempotency hit), we don't re-seed
   if (run.status !== 'PENDING') {
     return run;
@@ -208,7 +246,7 @@ export async function startRun(
 
   // Transition to RUNNING
   const startedAt = new Date();
-  const transitioned = await tryTransitionRun(run.id, 'PENDING', 'RUNNING', { startedAt });
+  const transitioned = await tryTransitionRun(run.id, 'PENDING', 'RUNNING', tenantId, { startedAt });
   if (!transitioned) return run; // someone else started it
 
   // `run` was captured from `createRun`, BEFORE the transition above — its
@@ -221,7 +259,7 @@ export async function startRun(
   run.startedAt = startedAt;
 
   logger.info({ runId: run.id }, 'Run started');
-  emitAndLog(run.id, 'RUN_STARTED', { startedAt: new Date() });
+  emitAndLog(run.id, tenantId, 'RUN_STARTED', { startedAt: new Date() });
 
   // 2. Seed in-degrees in Redis (control edges only)
   await seedInDegrees(run.id, controlEdges);
@@ -235,7 +273,7 @@ export async function startRun(
   const initialNodes = controlNodes.filter((n) => !inDegreeCounts.has(n.key));
 
   for (const node of initialNodes) {
-    await dispatchNode(run.id, node.key, graph, version.id);
+    await dispatchNode(run.id, node.key, tenantId, graph, version.id);
   }
 
   return run;
@@ -246,39 +284,44 @@ export async function startRun(
 export async function dispatchNode(
   runId: string,
   nodeKey: string,
+  tenantId: string,
   graph?: Graph,
   _versionId?: string
 ) {
   // 1. tryTransitionNodeRun(PENDING → QUEUED)
-  const nr = await findNodeRun(runId, nodeKey);
+  const nr = await findNodeRun(runId, nodeKey, tenantId);
   if (!nr) return; // shouldn't happen unless DB corrupted
-  
+
   // We check `tryTransitionNodeRun` *before* enqueueing. If it returns false,
   // another actor (like a concurrent API process) already dispatched it.
-  const claimed = await tryTransitionNodeRun(nr.id, 'PENDING', 'QUEUED');
+  const claimed = await tryTransitionNodeRun(nr.id, 'PENDING', 'QUEUED', tenantId);
   if (!claimed) return; // Lost the race, do nothing
 
   // Load graph if not provided (needed when dispatching from completion handler)
   if (!graph) {
-    const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
-    const version = await prisma.workflowVersion.findUnique({ where: { id: run!.workflowVersionId } });
-    if (!version) throw new NotFoundError('WorkflowVersion', run!.workflowVersionId);
+    const workflowVersionId = await getRunWorkflowVersionId(runId, tenantId);
+    const version = workflowVersionId
+      ? await prisma.workflowVersion.findUnique({ where: { id: workflowVersionId } })
+      : null;
+    if (!version) throw new NotFoundError('WorkflowVersion', workflowVersionId ?? runId);
     graph = getGraphFromVersion(version);
   }
 
   const node = getNodeFromGraph(graph, nodeKey);
-  
+
   // Phase 7: Resolve templates in node input config against completed parent outputs
-  const nodeRunMap = await getNodeRunMap(runId);
+  const nodeRunMap = await getNodeRunMap(runId, tenantId);
   const resolvedInput = resolveNodeInputs(graph, nodeKey, nodeRunMap);
 
   // Persist resolved inputs on the row before enqueuing
-  await prisma.nodeRun.update({
-    where: { id: nr.id },
-    // Prisma's Json field expects InputJsonValue — cast through unknown, the
-    // same pattern packages/db/src/repositories.ts uses for graph/topoOrder.
-    data: { input: resolvedInput as unknown as Prisma.InputJsonValue },
-  });
+  await withTenant(tenantId, (tx) =>
+    tx.nodeRun.update({
+      where: { id: nr.id },
+      // Prisma's Json field expects InputJsonValue — cast through unknown, the
+      // same pattern packages/db/src/repositories.ts uses for graph/topoOrder.
+      data: { input: resolvedInput as unknown as Prisma.InputJsonValue },
+    }),
+  );
 
   // 2. Queue the job
   const jobId = createJobId(runId, nodeKey, nr.attempt);
@@ -296,6 +339,7 @@ export async function dispatchNode(
     runId,
     nodeKey,
     nodeRunId: nr.id,
+    tenantId,
     type: node.type as NodeType,
     config: node.config,
     input: resolvedInput,
@@ -311,13 +355,13 @@ export async function dispatchNode(
   });
 
   logger.info({ runId, nodeKey, jobId, queue: queue.name, attempts, baseDelay, cap }, 'Dispatched node');
-  emitAndLog(runId, 'NODE_QUEUED', { jobId, attempts }, nodeKey);
+  emitAndLog(runId, tenantId, 'NODE_QUEUED', { jobId, attempts }, nodeKey);
 }
 
 // ─── Completion Handlers ──────────────────────────────────────────────────────
 
-export async function onNodeSucceeded(runId: string, nodeKey: string, output: unknown) {
-  const nr = await findNodeRun(runId, nodeKey);
+export async function onNodeSucceeded(runId: string, nodeKey: string, tenantId: string, output: unknown) {
+  const nr = await findNodeRun(runId, nodeKey, tenantId);
   if (!nr || nr.status !== 'RUNNING') return; // Might have been already completed or cancelled
 
   // Phase 7: Validate output size before persisting.
@@ -327,26 +371,28 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
   } catch (err) {
     if (err instanceof OutputTooLargeError) {
       logger.error({ runId, nodeKey, err }, 'Node output too large — failing run');
-      await onNodeFailed(runId, nodeKey, { message: err.message, taxonomy: 'unrecoverable' });
+      await onNodeFailed(runId, nodeKey, tenantId, { message: err.message, taxonomy: 'unrecoverable' });
       return;
     }
     throw err;
   }
 
   // 1. Persist output and transition
-  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'SUCCEEDED', {
+  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'SUCCEEDED', tenantId, {
     output: output as Prisma.InputJsonValue,
     finishedAt: new Date(),
   });
-  
+
   if (!success) return; // Lost update race
 
   logger.info({ runId, nodeKey }, 'Node succeeded');
-  emitAndLog(runId, 'NODE_SUCCEEDED', { output }, nodeKey);
+  emitAndLog(runId, tenantId, 'NODE_SUCCEEDED', { output }, nodeKey);
 
   // Load graph to find children
-  const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
-  const version = await prisma.workflowVersion.findUnique({ where: { id: run!.workflowVersionId } });
+  const workflowVersionId = await getRunWorkflowVersionId(runId, tenantId);
+  const version = workflowVersionId
+    ? await prisma.workflowVersion.findUnique({ where: { id: workflowVersionId } })
+    : null;
   if (!version) return;
   const graph = getGraphFromVersion(version);
   observeNodeDuration(nr.startedAt, getNodeFromGraph(graph, nodeKey).type, 'succeeded');
@@ -355,32 +401,32 @@ export async function onNodeSucceeded(runId: string, nodeKey: string, output: un
   //    its downstream node (that decrement is deferred to the fan-out join);
   //    every other node type propagates normally.
   try {
-    const nodeRunMap = await getNodeRunMap(runId); // includes this node's just-persisted output
+    const nodeRunMap = await getNodeRunMap(runId, tenantId); // includes this node's just-persisted output
     if (getNodeFromGraph(graph, nodeKey).type === 'flow.map') {
-      await spawnFanOut(runId, nodeKey, graph, version.id, nodeRunMap);
+      await spawnFanOut(runId, nodeKey, tenantId, graph, version.id, nodeRunMap);
     } else {
-      await propagateToChildren(runId, nodeKey, graph, version.id, nodeRunMap, /* parentActive */ true);
+      await propagateToChildren(runId, nodeKey, tenantId, graph, version.id, nodeRunMap, /* parentActive */ true);
     }
   } catch (err) {
     if (err instanceof UnresolvedTemplateError || err instanceof ConditionTypeError) {
       logger.error({ runId, nodeKey, err: err.message }, 'Condition evaluation failed — aborting run');
-      await abortRun(runId, err.message);
+      await abortRun(runId, tenantId, err.message);
       return;
     }
     throw err;
   }
 
   // 4. Check if the entire run is complete
-  if (await allNodeRunsTerminal(runId)) {
-    const completed = await tryTransitionRun(runId, 'RUNNING', 'SUCCEEDED', { finishedAt: new Date() });
+  if (await allNodeRunsTerminal(runId, tenantId)) {
+    const completed = await tryTransitionRun(runId, 'RUNNING', 'SUCCEEDED', tenantId, { finishedAt: new Date() });
     if (completed) {
       logger.info({ runId }, 'Run succeeded');
-      emitAndLog(runId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
+      emitAndLog(runId, tenantId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
     }
   }
 
   // 5. If this is a fan-out child that just went terminal, maybe fire the join.
-  await onFanOutChildTerminal(runId);
+  await onFanOutChildTerminal(runId, tenantId);
 }
 
 export interface NodeFailure {
@@ -388,8 +434,8 @@ export interface NodeFailure {
   taxonomy?: 'retryable' | 'unrecoverable';
 }
 
-export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFailure) {
-  const nr = await findNodeRun(runId, nodeKey);
+export async function onNodeFailed(runId: string, nodeKey: string, tenantId: string, error: NodeFailure) {
+  const nr = await findNodeRun(runId, nodeKey, tenantId);
   if (!nr || nr.status !== 'RUNNING') return;
 
   // The worker stamps a `{ message, taxonomy, attempt, maxAttempts }` error on
@@ -398,7 +444,7 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
   const stamped = nr.error as { taxonomy?: string } | null;
   const finalError = stamped?.taxonomy ? stamped : { ...error };
 
-  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'FAILED', {
+  const success = await tryTransitionNodeRun(nr.id, 'RUNNING', 'FAILED', tenantId, {
     error: finalError as unknown as Prisma.InputJsonValue,
     finishedAt: new Date(),
   });
@@ -406,11 +452,13 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
   if (!success) return;
 
   logger.error({ runId, nodeKey, error: finalError }, 'Node failed');
-  emitAndLog(runId, 'NODE_FAILED', { error: finalError }, nodeKey);
+  emitAndLog(runId, tenantId, 'NODE_FAILED', { error: finalError }, nodeKey);
 
   // BFS all descendants to SKIPPED
-  const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
-  const version = await prisma.workflowVersion.findUnique({ where: { id: run!.workflowVersionId } });
+  const workflowVersionId = await getRunWorkflowVersionId(runId, tenantId);
+  const version = workflowVersionId
+    ? await prisma.workflowVersion.findUnique({ where: { id: workflowVersionId } })
+    : null;
   if (!version) return;
 
   const graph = getGraphFromVersion(version);
@@ -437,25 +485,25 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
 
   // Transition all descendants to SKIPPED
   for (const skipKey of toSkip) {
-    const childNr = await findNodeRun(runId, skipKey);
+    const childNr = await findNodeRun(runId, skipKey, tenantId);
     if (childNr && ['PENDING', 'QUEUED'].includes(childNr.status)) {
-      await tryTransitionNodeRun(childNr.id, childNr.status, 'SKIPPED', { finishedAt: new Date() });
-      emitAndLog(runId, 'NODE_SKIPPED', { reason: `Ancestor ${nodeKey} failed` }, skipKey);
+      await tryTransitionNodeRun(childNr.id, childNr.status, 'SKIPPED', tenantId, { finishedAt: new Date() });
+      emitAndLog(runId, tenantId, 'NODE_SKIPPED', { reason: `Ancestor ${nodeKey} failed` }, skipKey);
     }
   }
 
   // Run -> FAILED
-  if (await allNodeRunsTerminal(runId)) {
-    const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', { finishedAt: new Date() });
+  if (await allNodeRunsTerminal(runId, tenantId)) {
+    const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', tenantId, { finishedAt: new Date() });
     if (failed) {
       logger.info({ runId }, 'Run failed');
-      emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason: `Node ${nodeKey} failed` });
+      emitAndLog(runId, tenantId, 'RUN_FAILED', { finishedAt: new Date(), reason: `Node ${nodeKey} failed` });
     }
   }
 
   // A failed fan-out child still counts toward the join (B3.2 joins on a
   // summary; B3.4 adds the fail-fast policy).
-  await onFanOutChildTerminal(runId);
+  await onFanOutChildTerminal(runId, tenantId);
 }
 
 // ─── Dynamic fan-out — spawn & join (roadmap B3.2) ───────────────────────────
@@ -475,6 +523,7 @@ export async function onNodeFailed(runId: string, nodeKey: string, error: NodeFa
 export async function spawnFanOut(
   runId: string,
   mapNodeKey: string,
+  tenantId: string,
   graph: Graph,
   versionId: string,
   nodeRunMap: Map<string, NodeRun>,
@@ -487,7 +536,7 @@ export async function spawnFanOut(
   const resolved = resolveNodeInputs(graph, mapNodeKey, nodeRunMap);
   const items = asFanOutArray(resolved['overSource']);
   if (!items) {
-    await abortRun(runId, `flow.map "${mapNodeKey}": overSource did not resolve to an array`);
+    await abortRun(runId, tenantId, `flow.map "${mapNodeKey}": overSource did not resolve to an array`);
     return;
   }
 
@@ -495,6 +544,7 @@ export async function spawnFanOut(
   if (items.length > maxFanOut) {
     await abortRun(
       runId,
+      tenantId,
       `flow.map "${mapNodeKey}": fan-out of ${items.length} exceeds maxFanOut ${maxFanOut}`,
     );
     return;
@@ -503,23 +553,23 @@ export async function spawnFanOut(
   const subgraphKeys = config.subgraph ?? [];
   const unknown = subgraphKeys.filter((k) => !graph.nodes.some((n) => n.key === k));
   if (unknown.length > 0) {
-    await abortRun(runId, `flow.map "${mapNodeKey}": subgraph references unknown node(s) ${unknown.join(', ')}`);
+    await abortRun(runId, tenantId, `flow.map "${mapNodeKey}": subgraph references unknown node(s) ${unknown.join(', ')}`);
     return;
   }
   if (subgraphKeys.includes(mapNodeKey)) {
-    await abortRun(runId, `flow.map "${mapNodeKey}": subgraph cannot contain the map node itself`);
+    await abortRun(runId, tenantId, `flow.map "${mapNodeKey}": subgraph cannot contain the map node itself`);
     return;
   }
 
   // Edges internal to the subgraph → child-run in-degrees.
   const { subEdges, roots } = subgraphExecPlan(graph, subgraphKeys);
 
-  emitAndLog(runId, 'NODE_LOG', { line: `flow.map: fanning out over ${items.length} element(s)` }, mapNodeKey);
-  emitAndLog(runId, 'RUN_SPAWNED', { mapNodeKey, total: items.length }, mapNodeKey);
+  emitAndLog(runId, tenantId, 'NODE_LOG', { line: `flow.map: fanning out over ${items.length} element(s)` }, mapNodeKey);
+  emitAndLog(runId, tenantId, 'RUN_SPAWNED', { mapNodeKey, total: items.length }, mapNodeKey);
 
   // Zero elements: nothing to run — join straight away with an empty summary.
   if (items.length === 0) {
-    await joinFanOut(runId, mapNodeKey, graph, versionId);
+    await joinFanOut(runId, mapNodeKey, tenantId, graph, versionId);
     return;
   }
 
@@ -527,11 +577,8 @@ export async function spawnFanOut(
     // Fail-fast (B3.4) can abort the parent while we are still spawning — an
     // early child failure may already have run its course. Stop creating more
     // children into a run that is no longer RUNNING.
-    const parentStatus = await prisma.run.findUnique({
-      where: { id: runId },
-      select: { status: true },
-    });
-    if (parentStatus?.status !== 'RUNNING') {
+    const parentStatus = await getRunStatus(runId, tenantId);
+    if (parentStatus !== 'RUNNING') {
       logger.info({ runId, mapNodeKey, spawned: i }, 'Fan-out spawn halted — parent no longer running');
       break;
     }
@@ -539,6 +586,7 @@ export async function spawnFanOut(
     const idempotencyKey = `${runId}:${mapNodeKey}:${i}`;
     const { run: child, created } = await createFanOutChildRun({
       workflowVersionId: versionId,
+      tenantId,
       parentRunId: runId,
       fanOutIndex: i,
       subgraphKeys,
@@ -548,38 +596,39 @@ export async function spawnFanOut(
     });
     if (!created) continue; // replay — this child already exists (and may be running/done)
 
-    await tryTransitionRun(child.id, 'PENDING', 'RUNNING', { startedAt: new Date() });
+    await tryTransitionRun(child.id, 'PENDING', 'RUNNING', tenantId, { startedAt: new Date() });
     await seedInDegrees(child.id, subEdges);
     for (const rootKey of roots) {
-      await dispatchNode(child.id, rootKey, graph, versionId);
+      await dispatchNode(child.id, rootKey, tenantId, graph, versionId);
     }
   }
 
   // If a concurrent fail-fast aborted the parent while we spawned, a child
   // created in the race window between abortRun's cancel sweep and our loop's
   // status check can still be RUNNING — sweep it up.
-  const finalStatus = await prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
-  if (finalStatus?.status !== 'RUNNING') {
-    await cancelChildRunsOf(runId);
+  const finalStatus = await getRunStatus(runId, tenantId);
+  if (finalStatus !== 'RUNNING') {
+    await cancelChildRunsOf(runId, tenantId);
     return;
   }
 
   // A replay after every child was already created still needs to check the
   // join — the crash may have happened after the last child finished.
-  await maybeJoinAfterSpawn(runId, mapNodeKey, graph, versionId);
+  await maybeJoinAfterSpawn(runId, mapNodeKey, tenantId, graph, versionId);
 }
 
 /** After a (possibly replayed) spawn, fire the join if every child is already terminal. */
 async function maybeJoinAfterSpawn(
   parentRunId: string,
   mapNodeKey: string,
+  tenantId: string,
   graph: Graph,
   versionId: string,
 ): Promise<void> {
-  const remaining = await countNonTerminalChildren(parentRunId);
+  const remaining = await countNonTerminalChildren(parentRunId, tenantId);
   if (remaining === 0) {
-    const total = (await getChildRunSummary(parentRunId)).total;
-    if (total > 0) await joinFanOut(parentRunId, mapNodeKey, graph, versionId);
+    const total = (await getChildRunSummary(parentRunId, tenantId)).total;
+    if (total > 0) await joinFanOut(parentRunId, mapNodeKey, tenantId, graph, versionId);
   }
 }
 
@@ -592,27 +641,26 @@ async function maybeJoinAfterSpawn(
  *      the downstream reduce node).
  *   2. Otherwise, fire the join once every sibling is terminal.
  */
-async function onFanOutChildTerminal(childRunId: string): Promise<void> {
-  const info = await getRunTreeInfo(childRunId);
+async function onFanOutChildTerminal(childRunId: string, tenantId: string): Promise<void> {
+  const info = await getRunTreeInfo(childRunId, tenantId);
   if (!info?.parentRunId) return;
   const parsed = parseFanOutIdemKey(info.idempotencyKey);
   if (!parsed) return;
   const { parentRunId, mapNodeKey } = parsed;
 
-  const parent = await prisma.run.findUnique({
-    where: { id: parentRunId },
-    select: { workflowVersionId: true, status: true },
-  });
-  if (!parent || parent.status !== 'RUNNING') return; // parent already terminal — nothing to do
-  const version = await prisma.workflowVersion.findUnique({ where: { id: parent.workflowVersionId } });
+  const parentVersionId = await getRunWorkflowVersionId(parentRunId, tenantId);
+  const parentStatus = await getRunStatus(parentRunId, tenantId);
+  if (!parentVersionId || parentStatus !== 'RUNNING') return; // parent already terminal — nothing to do
+  const version = await prisma.workflowVersion.findUnique({ where: { id: parentVersionId } });
   if (!version) return;
   const graph = getGraphFromVersion(version);
 
   // Live progress for the UI (B3.5): one event per child reaching a terminal
   // state, carrying the running per-status totals.
-  const summary = await getChildRunSummary(parentRunId);
+  const summary = await getChildRunSummary(parentRunId, tenantId);
   emitAndLog(
     parentRunId,
+    tenantId,
     'RUN_CHILD_COMPLETED',
     {
       mapNodeKey,
@@ -638,6 +686,7 @@ async function onFanOutChildTerminal(childRunId: string): Promise<void> {
       );
       emitAndLog(
         parentRunId,
+        tenantId,
         'NODE_LOG',
         { line: `flow.map: ${summary.failed} child run(s) failed (threshold ${threshold}) — aborting` },
         mapNodeKey,
@@ -646,6 +695,7 @@ async function onFanOutChildTerminal(childRunId: string): Promise<void> {
       // nodes, and fails the parent.
       await abortRun(
         parentRunId,
+        tenantId,
         `flow.map "${mapNodeKey}": ${summary.failed} child run(s) failed (threshold ${threshold})`,
       );
       return;
@@ -653,8 +703,8 @@ async function onFanOutChildTerminal(childRunId: string): Promise<void> {
   }
 
   // 2. Join once all siblings are terminal.
-  if ((await countNonTerminalChildren(parentRunId)) > 0) return;
-  await joinFanOut(parentRunId, mapNodeKey, graph, version.id);
+  if ((await countNonTerminalChildren(parentRunId, tenantId)) > 0) return;
+  await joinFanOut(parentRunId, mapNodeKey, tenantId, graph, version.id);
 }
 
 /**
@@ -665,6 +715,7 @@ async function onFanOutChildTerminal(childRunId: string): Promise<void> {
 async function joinFanOut(
   parentRunId: string,
   mapNodeKey: string,
+  tenantId: string,
   graph: Graph,
   versionId: string,
 ): Promise<void> {
@@ -672,16 +723,13 @@ async function joinFanOut(
 
   // A fail-fast abort (B3.4) can land between the claim and here; never resume
   // a run that is no longer RUNNING.
-  const parentStatus = await prisma.run.findUnique({
-    where: { id: parentRunId },
-    select: { status: true },
-  });
-  if (parentStatus?.status !== 'RUNNING') {
+  const parentStatus = await getRunStatus(parentRunId, tenantId);
+  if (parentStatus !== 'RUNNING') {
     await clearFanOutJoinClaim(parentRunId, mapNodeKey);
     return;
   }
 
-  const summary = await getChildRunSummary(parentRunId);
+  const summary = await getChildRunSummary(parentRunId, tenantId);
 
   // B3.3: if a `flow.reduce` node is downstream, collect every child's sink
   // output (ordered by fanOutIndex) into a results file on the artifact volume
@@ -702,7 +750,7 @@ async function joinFanOut(
   if (hasReduceDownstream) {
     const mapConfig = getNodeFromGraph(graph, mapNodeKey).config as FlowMapConfig;
     const sinks = subgraphSinkKeys(graph, mapConfig.subgraph ?? []);
-    const rows = await getFanOutChildOutputs(parentRunId, sinks);
+    const rows = await getFanOutChildOutputs(parentRunId, sinks, tenantId);
     const elements = rows.map((r) => r.element); // ordered by fanOutIndex, null for a failed child
 
     const resultsPath = path.join(ARTIFACT_DIR, parentRunId, mapNodeKey, 'results.json');
@@ -714,38 +762,41 @@ async function joinFanOut(
     mergedOutput['resultsCount'] = elements.length;
   }
 
-  const mapNr = await findNodeRun(parentRunId, mapNodeKey);
+  const mapNr = await findNodeRun(parentRunId, mapNodeKey, tenantId);
   if (mapNr) {
     const prev = (mapNr.output ?? {}) as Record<string, unknown>;
-    await prisma.nodeRun.update({
-      where: { id: mapNr.id },
-      data: { output: { ...prev, ...mergedOutput } as unknown as Prisma.InputJsonValue },
-    });
+    await withTenant(tenantId, (tx) =>
+      tx.nodeRun.update({
+        where: { id: mapNr.id },
+        data: { output: { ...prev, ...mergedOutput } as unknown as Prisma.InputJsonValue },
+      }),
+    );
   }
 
   emitAndLog(
     parentRunId,
+    tenantId,
     'NODE_LOG',
     { line: `flow.map: joined — ${summary.succeeded}/${summary.total} child run(s) succeeded` },
     mapNodeKey,
   );
 
   try {
-    const nodeRunMap = await getNodeRunMap(parentRunId); // now carries the merged fanOut summary
-    await propagateToChildren(parentRunId, mapNodeKey, graph, versionId, nodeRunMap, /* parentActive */ true);
+    const nodeRunMap = await getNodeRunMap(parentRunId, tenantId); // now carries the merged fanOut summary
+    await propagateToChildren(parentRunId, mapNodeKey, tenantId, graph, versionId, nodeRunMap, /* parentActive */ true);
   } catch (err) {
     if (err instanceof UnresolvedTemplateError || err instanceof ConditionTypeError) {
-      await abortRun(parentRunId, err.message);
+      await abortRun(parentRunId, tenantId, err.message);
       return;
     }
     throw err;
   }
 
-  if (await allNodeRunsTerminal(parentRunId)) {
-    const done = await tryTransitionRun(parentRunId, 'RUNNING', 'SUCCEEDED', { finishedAt: new Date() });
+  if (await allNodeRunsTerminal(parentRunId, tenantId)) {
+    const done = await tryTransitionRun(parentRunId, 'RUNNING', 'SUCCEEDED', tenantId, { finishedAt: new Date() });
     if (done) {
       logger.info({ runId: parentRunId }, 'Run succeeded');
-      emitAndLog(parentRunId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
+      emitAndLog(parentRunId, tenantId, 'RUN_SUCCEEDED', { finishedAt: new Date() });
     }
   }
 }
@@ -761,7 +812,7 @@ async function joinFanOut(
  * re-dispatched. The map node's join claim is released so the join fires again
  * once every child (old survivors + retried ones) is terminal.
  */
-export async function retryFanOutChildren(parentRunId: string, versionId: string): Promise<number> {
+export async function retryFanOutChildren(parentRunId: string, tenantId: string, versionId: string): Promise<number> {
   const version = await prisma.workflowVersion.findUnique({ where: { id: versionId } });
   if (!version) return 0;
   const graph = getGraphFromVersion(version);
@@ -773,42 +824,50 @@ export async function retryFanOutChildren(parentRunId: string, versionId: string
     const subgraphKeys = (mapNode.config as FlowMapConfig).subgraph ?? [];
     const { subEdges, roots } = subgraphExecPlan(graph, subgraphKeys);
 
-    const badChildren = await prisma.run.findMany({
-      where: {
-        parentRunId,
-        idempotencyKey: { startsWith: `${parentRunId}:${mapNode.key}:` },
-        status: { in: ['FAILED', 'CANCELLED'] },
-      },
-      select: { id: true },
-    });
+    const badChildren = await withTenant(tenantId, (tx) =>
+      tx.run.findMany({
+        where: {
+          parentRunId,
+          idempotencyKey: { startsWith: `${parentRunId}:${mapNode.key}:` },
+          status: { in: ['FAILED', 'CANCELLED'] },
+        },
+        select: { id: true },
+      }),
+    );
     if (badChildren.length === 0) continue;
 
     for (const child of badChildren) {
-      const nrs = await prisma.nodeRun.findMany({
-        where: { runId: child.id, nodeKey: { in: subgraphKeys } },
-        select: { id: true, attempt: true },
-      });
+      const nrs = await withTenant(tenantId, (tx) =>
+        tx.nodeRun.findMany({
+          where: { runId: child.id, nodeKey: { in: subgraphKeys } },
+          select: { id: true, attempt: true },
+        }),
+      );
       for (const nr of nrs) {
-        await prisma.nodeRun.update({
-          where: { id: nr.id },
-          data: {
-            status: 'PENDING',
-            attempt: nr.attempt + 1,
-            error: undefined,
-            startedAt: null,
-            finishedAt: null,
-          },
-        });
+        await withTenant(tenantId, (tx) =>
+          tx.nodeRun.update({
+            where: { id: nr.id },
+            data: {
+              status: 'PENDING',
+              attempt: nr.attempt + 1,
+              error: undefined,
+              startedAt: null,
+              finishedAt: null,
+            },
+          }),
+        );
       }
-      await prisma.run.update({
-        where: { id: child.id },
-        data: { status: 'RUNNING', startedAt: new Date(), finishedAt: null },
-      });
+      await withTenant(tenantId, (tx) =>
+        tx.run.update({
+          where: { id: child.id },
+          data: { status: 'RUNNING', startedAt: new Date(), finishedAt: null },
+        }),
+      );
       await clearDispatched(child.id);
       await seedInDegrees(child.id, subEdges);
       for (const rootKey of roots) {
         try {
-          await dispatchNode(child.id, rootKey, graph, versionId);
+          await dispatchNode(child.id, rootKey, tenantId, graph, versionId);
         } catch (err) {
           logger.error({ childRunId: child.id, rootKey, err }, 'retry: fan-out child root dispatch failed');
         }
@@ -842,6 +901,7 @@ export async function retryFanOutChildren(parentRunId: string, versionId: string
 async function propagateToChildren(
   runId: string,
   parentKey: string,
+  tenantId: string,
   graph: Graph,
   versionId: string,
   nodeRunMap: Map<string, NodeRun>,
@@ -858,9 +918,9 @@ async function propagateToChildren(
     if (!ready) continue;
 
     if (await hasActiveParent(runId, childKey)) {
-      await dispatchNode(runId, childKey, graph, versionId);
+      await dispatchNode(runId, childKey, tenantId, graph, versionId);
     } else {
-      await skipNode(runId, childKey, graph, versionId, nodeRunMap);
+      await skipNode(runId, childKey, tenantId, graph, versionId, nodeRunMap);
     }
   }
 }
@@ -869,18 +929,19 @@ async function propagateToChildren(
 async function skipNode(
   runId: string,
   nodeKey: string,
+  tenantId: string,
   graph: Graph,
   versionId: string,
   nodeRunMap: Map<string, NodeRun>,
 ): Promise<void> {
-  const nr = await findNodeRun(runId, nodeKey);
+  const nr = await findNodeRun(runId, nodeKey, tenantId);
   if (!nr || !['PENDING', 'QUEUED'].includes(nr.status)) return;
 
-  const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', { finishedAt: new Date() });
+  const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', tenantId, { finishedAt: new Date() });
   if (!ok) return;
 
-  emitAndLog(runId, 'NODE_SKIPPED', { reason: 'no active branch reached this node' }, nodeKey);
-  await propagateToChildren(runId, nodeKey, graph, versionId, nodeRunMap, /* parentActive */ false);
+  emitAndLog(runId, tenantId, 'NODE_SKIPPED', { reason: 'no active branch reached this node' }, nodeKey);
+  await propagateToChildren(runId, nodeKey, tenantId, graph, versionId, nodeRunMap, /* parentActive */ false);
 }
 
 /**
@@ -889,28 +950,28 @@ async function skipNode(
  * unevaluable condition (the user's graph bug, surfaced loudly) and for a
  * fan-out that breached its failure threshold.
  */
-async function abortRun(runId: string, reason: string): Promise<void> {
-  await cancelChildRunsOf(runId);
+async function abortRun(runId: string, tenantId: string, reason: string): Promise<void> {
+  await cancelChildRunsOf(runId, tenantId);
 
-  const nodeRunMap = await getNodeRunMap(runId);
+  const nodeRunMap = await getNodeRunMap(runId, tenantId);
   for (const [key, nr] of nodeRunMap) {
     if (nr.status === 'PENDING' || nr.status === 'QUEUED') {
-      const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', { finishedAt: new Date() });
-      if (ok) emitAndLog(runId, 'NODE_SKIPPED', { reason }, key);
+      const ok = await tryTransitionNodeRun(nr.id, nr.status, 'SKIPPED', tenantId, { finishedAt: new Date() });
+      if (ok) emitAndLog(runId, tenantId, 'NODE_SKIPPED', { reason }, key);
     }
   }
-  const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', { finishedAt: new Date() });
+  const failed = await tryTransitionRun(runId, 'RUNNING', 'FAILED', tenantId, { finishedAt: new Date() });
   if (failed) {
     logger.info({ runId, reason }, 'Run aborted');
-    emitAndLog(runId, 'RUN_FAILED', { finishedAt: new Date(), reason });
+    emitAndLog(runId, tenantId, 'RUN_FAILED', { finishedAt: new Date(), reason });
   }
 
   // Second child sweep AFTER the FAILED transition: a concurrent `spawnFanOut`
   // sees FAILED on its per-iteration status check and stops, but may have
   // created one more child in the window since the first sweep — catch it here
   // (and `spawnFanOut`'s own post-loop sweep is the third backstop).
-  await cancelChildRunsOf(runId);
+  await cancelChildRunsOf(runId, tenantId);
 
   // An aborted fan-out child is still terminal — let the parent's join proceed.
-  await onFanOutChildTerminal(runId);
+  await onFanOutChildTerminal(runId, tenantId);
 }

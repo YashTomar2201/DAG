@@ -16,6 +16,7 @@ import {
   listEnabledSchedules,
   workflowBelongsToTenant,
   getLatestVersionId,
+  getWorkflowTenantId,
   findRunByIdempotencyKey,
   type Schedule,
 } from '@dag/db';
@@ -171,7 +172,15 @@ export async function fireSchedule(
   }
   if (!schedule.enabled) return { ran: false };
 
-  const versionId = await getLatestVersionId(schedule.workflowId);
+  // No authenticated request behind a cron tick — resolve the owning tenant
+  // first (admin context; roadmap C2.1) before any RLS-protected lookup.
+  const tenantId = await getWorkflowTenantId(schedule.workflowId);
+  if (!tenantId) {
+    logger.warn({ scheduleId, workflowId: schedule.workflowId }, 'Schedule tick skipped — workflow not found');
+    return { ran: false };
+  }
+
+  const versionId = await getLatestVersionId(schedule.workflowId, tenantId);
   if (!versionId) {
     logger.warn(
       { scheduleId, workflowId: schedule.workflowId },
@@ -182,8 +191,8 @@ export async function fireSchedule(
 
   const plannedIso = new Date(plannedFireMillis(jobId)).toISOString();
   const idempotencyKey = `schedule:${scheduleId}:${plannedIso}`;
-  const preexisting = await findRunByIdempotencyKey(idempotencyKey);
-  const run = await startRun(versionId, idempotencyKey, { triggeredBy: 'schedule' });
+  const preexisting = await findRunByIdempotencyKey(idempotencyKey, tenantId);
+  const run = await startRun(versionId, idempotencyKey, { triggeredBy: 'schedule', tenantId });
 
   await updateSchedule(scheduleId, {
     lastRunId: run.id,

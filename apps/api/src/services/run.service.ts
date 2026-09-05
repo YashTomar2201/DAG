@@ -1,4 +1,4 @@
-import { prisma, getRunEvents, getChildRunSummary, listChildRuns, runBelongsToTenant } from '@dag/db';
+import { withTenant, getRunEvents, getChildRunSummary, listChildRuns, runBelongsToTenant } from '@dag/db';
 import { NotFoundError } from '../errors';
 import { dispatchNode, retryFanOutChildren } from './orchestrator.service';
 import { cancelRunTree } from './cancel.service';
@@ -22,30 +22,32 @@ import { logger } from '../logger';
 export async function getRunService(runId: string, tenantId: string) {
   if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
-  const run = await prisma.run.findUnique({
-    where: { id: runId },
-    include: {
-      nodeRuns: {
-        orderBy: { nodeKey: 'asc' },
-        select: {
-          id: true,
-          nodeKey: true,
-          status: true,
-          attempt: true,
-          startedAt: true,
-          finishedAt: true,
-          workerId: true,
-          output: true,
-          error: true,
-          // Do NOT select input here — it can be large (resolved template)
+  const run = await withTenant(tenantId, (tx) =>
+    tx.run.findUnique({
+      where: { id: runId },
+      include: {
+        nodeRuns: {
+          orderBy: { nodeKey: 'asc' },
+          select: {
+            id: true,
+            nodeKey: true,
+            status: true,
+            attempt: true,
+            startedAt: true,
+            finishedAt: true,
+            workerId: true,
+            output: true,
+            error: true,
+            // Do NOT select input here — it can be large (resolved template)
+          },
         },
       },
-    },
-  });
+    }),
+  );
 
   if (!run) throw new NotFoundError('Run', runId);
 
-  const children = await getChildRunSummary(runId);
+  const children = await getChildRunSummary(runId, tenantId);
 
   return { ...run, children };
 }
@@ -65,7 +67,7 @@ export async function listRunChildrenService(
   if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
   const limit = Math.min(Math.max(opts.limit ?? CHILDREN_PAGE_DEFAULT, 1), CHILDREN_PAGE_MAX);
-  return listChildRuns(runId, { limit, cursor: opts.cursor });
+  return listChildRuns(runId, tenantId, { limit, cursor: opts.cursor });
 }
 
 /**
@@ -76,7 +78,7 @@ export async function getRunEventsService(runId: string, tenantId: string, after
   if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
   const cursorId = afterId ? BigInt(afterId) : undefined;
-  return getRunEvents(runId, cursorId);
+  return getRunEvents(runId, tenantId, cursorId);
 }
 
 // ─── Run cancellation ────────────────────────────────────────────────────────
@@ -89,7 +91,7 @@ export async function getRunEventsService(runId: string, tenantId: string, after
 export async function cancelRunService(runId: string, tenantId: string) {
   if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
-  const result = await cancelRunTree(runId);
+  const result = await cancelRunTree(runId, tenantId);
   logger.info({ runId, ...result }, 'Run cancel');
   return result;
 }
@@ -112,13 +114,15 @@ export async function cancelRunService(runId: string, tenantId: string) {
 export async function retryFailedNodesService(runId: string, tenantId: string) {
   if (!(await runBelongsToTenant(runId, tenantId))) throw new NotFoundError('Run', runId);
 
-  const run = await prisma.run.findUnique({
-    where: { id: runId },
-    include: {
-      nodeRuns: { select: { id: true, nodeKey: true, status: true, attempt: true } },
-      workflowVersion: true,
-    },
-  });
+  const run = await withTenant(tenantId, (tx) =>
+    tx.run.findUnique({
+      where: { id: runId },
+      include: {
+        nodeRuns: { select: { id: true, nodeKey: true, status: true, attempt: true } },
+        workflowVersion: true,
+      },
+    }),
+  );
   if (!run) throw new NotFoundError('Run', runId);
 
   // Only a FAILED run can be retried
@@ -132,36 +136,42 @@ export async function retryFailedNodesService(runId: string, tenantId: string) {
 
   // Reset failed nodes to PENDING with incremented attempt
   for (const nr of failedNodes) {
-    await prisma.nodeRun.update({
-      where: { id: nr.id },
-      data: {
-        status: 'PENDING',
-        attempt: nr.attempt + 1,
-        error: undefined,
-        startedAt: null,
-        finishedAt: null,
-      },
-    });
+    await withTenant(tenantId, (tx) =>
+      tx.nodeRun.update({
+        where: { id: nr.id },
+        data: {
+          status: 'PENDING',
+          attempt: nr.attempt + 1,
+          error: undefined,
+          startedAt: null,
+          finishedAt: null,
+        },
+      }),
+    );
   }
 
   // Reset skipped descendants to PENDING so they can run after retry
   for (const nr of skippedNodes) {
-    await prisma.nodeRun.update({
-      where: { id: nr.id },
-      data: {
-        status: 'PENDING',
-        error: undefined,
-        startedAt: null,
-        finishedAt: null,
-      },
-    });
+    await withTenant(tenantId, (tx) =>
+      tx.nodeRun.update({
+        where: { id: nr.id },
+        data: {
+          status: 'PENDING',
+          error: undefined,
+          startedAt: null,
+          finishedAt: null,
+        },
+      }),
+    );
   }
 
   // Transition run back to RUNNING
-  await prisma.run.update({
-    where: { id: runId },
-    data: { status: 'RUNNING', finishedAt: null },
-  });
+  await withTenant(tenantId, (tx) =>
+    tx.run.update({
+      where: { id: runId },
+      data: { status: 'RUNNING', finishedAt: null },
+    }),
+  );
 
   // ── Dispatch the retried nodes ──────────────────────────────────────────
   // Resetting a FAILED row to PENDING does not, by itself, get the node back
@@ -181,7 +191,7 @@ export async function retryFailedNodesService(runId: string, tenantId: string) {
   // the normal atomic path, and dispatch them normally.
   for (const nr of failedNodes) {
     try {
-      await dispatchNode(runId, nr.nodeKey);
+      await dispatchNode(runId, nr.nodeKey, tenantId);
     } catch (err) {
       logger.error({ runId, nodeKey: nr.nodeKey, err }, 'retry-failed: dispatch failed');
     }
@@ -193,7 +203,7 @@ export async function retryFailedNodesService(runId: string, tenantId: string) {
   // each flow.map node and release its join claim so the join can re-fire.
   let respawnedChildren = 0;
   try {
-    respawnedChildren = await retryFanOutChildren(runId, run.workflowVersionId);
+    respawnedChildren = await retryFanOutChildren(runId, tenantId, run.workflowVersionId);
   } catch (err) {
     logger.error({ runId, err }, 'retry-failed: fan-out child re-spawn failed');
   }

@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 function branchGraph(overrides?: { badRef?: boolean }): Graph {
@@ -48,20 +48,21 @@ describe('B1.1 — conditional edges', () => {
 
   afterAll(async () => {
     stopQueueEvents?.();
-    for (const c of cleanups) await cleanupWorkflow(ctx.db.prisma, c.tenantId, c.workflowId);
+    for (const c of cleanups) await cleanupWorkflow(ctx.db, c.tenantId, c.workflowId);
     await teardownTestEnv(ctx);
   });
 
   async function runGraph(graph: Graph, prefix: string) {
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, graph, prefix);
+    const seeded = await seedWorkflowVersion(ctx.db, graph, prefix);
     cleanups.push({ tenantId: seeded.tenantId, workflowId: seeded.workflowId });
+    const db = tenantScopedPrisma(ctx.db, seeded.tenantId);
     const run = await ctx.orchestrator.startRun(seeded.versionId);
     await waitUntil(async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
+      const r = await db.run.findUnique({ where: { id: run.id } });
       return r?.status === 'FAILED' || r?.status === 'SUCCEEDED';
     });
-    const finalRun = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
-    const nodeRuns = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id } });
+    const finalRun = await db.run.findUnique({ where: { id: run.id } });
+    const nodeRuns = await db.nodeRun.findMany({ where: { runId: run.id } });
     return { status: finalRun?.status, byKey: new Map(nodeRuns.map((n) => [n.nodeKey, n.status])) };
   }
 

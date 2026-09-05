@@ -68,24 +68,28 @@ export default async function globalSetup() {
     new RedisContainer('redis:7-alpine').start(),
   ]);
 
-  const databaseUrl = pg.getConnectionUri();
+  const adminDatabaseUrl = pg.getConnectionUri();
   const redisUrl = `redis://${redis.getHost()}:${redis.getMappedPort(6379)}`;
   const artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dag-it-artifacts-'));
 
   console.warn(`[testcontainers] postgres ready at ${pg.getHost()}:${pg.getMappedPort(5432)}`);
   console.warn(`[testcontainers] redis ready at ${redis.getHost()}:${redis.getMappedPort(6379)}`);
 
-  // Push the Prisma schema onto the fresh, empty database. `db push` (not
-  // `migrate deploy`) because packages/db has no committed migration history
-  // yet — see decisions_log.md "Known gap: no Prisma migration files".
+  // Replay the REAL committed migrations (not `db push`) — roadmap C2.1's
+  // Row-Level Security is raw SQL inside a migration file (CREATE ROLE,
+  // ENABLE ROW LEVEL SECURITY, CREATE POLICY), which `db push` has no way to
+  // know about: it only diffs the declarative schema.prisma shape. Using the
+  // same `migrate deploy` production runs means the integration suite is
+  // exercised against the exact same RLS setup, not a closer-but-not-quite
+  // approximation of it.
   const schemaPath = path.join(REPO_ROOT, 'packages', 'db', 'prisma', 'schema.prisma');
-  console.warn('[testcontainers] pushing Prisma schema onto the test database ...');
+  console.warn('[testcontainers] applying migrations to the test database ...');
   execFileSync(
     'pnpm',
-    ['--filter', '@dag/db', 'exec', 'prisma', 'db', 'push', `--schema=${schemaPath}`, '--skip-generate', '--accept-data-loss'],
+    ['--filter', '@dag/db', 'exec', 'prisma', 'migrate', 'deploy', `--schema=${schemaPath}`],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, DATABASE_URL: databaseUrl },
+      env: { ...process.env, DATABASE_URL: adminDatabaseUrl },
       stdio: 'inherit',
       // Windows resolves `pnpm` to pnpm.cmd, a batch shim — execFileSync
       // needs `shell: true` to invoke it (matches the shell:true used for
@@ -93,6 +97,17 @@ export default async function globalSetup() {
       shell: true,
     },
   );
+
+  // The migration's CREATE ROLE gives us `dag_app` (NOSUPERUSER, RLS-restricted)
+  // — this is the connection string every test file and spawned worker
+  // process actually uses, so RLS is genuinely enforced against them, not
+  // silently bypassed the way it would be under the container's bootstrap
+  // superuser (see the migration's own doc comment on why that role can't
+  // just keep being used at runtime).
+  const appUrl = new URL(adminDatabaseUrl);
+  appUrl.username = 'dag_app';
+  appUrl.password = 'dag_app_secret';
+  const databaseUrl = appUrl.toString();
 
   fs.mkdirSync(HANDOFF_DIR, { recursive: true });
   fs.writeFileSync(HANDOFF_FILE, JSON.stringify({ databaseUrl, redisUrl, artifactDir }, null, 2));

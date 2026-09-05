@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 /** One node that fails; `fail.py` exits 1 with a plain (retryable) error. */
@@ -54,16 +54,18 @@ describe('B5 — retry policy', () => {
   let tenantId: string;
   let workflowId: string;
   let nextVersion = 1;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   const seed = async (g: Graph) => {
     if (nextVersion === 1) {
-      const s = await seedWorkflowVersion(ctx.db.prisma, g, 'b5');
+      const s = await seedWorkflowVersion(ctx.db, g, 'b5');
       tenantId = s.tenantId;
       workflowId = s.workflowId;
+      db = tenantScopedPrisma(ctx.db, tenantId);
       nextVersion = 2;
       return s.versionId;
     }
-    const v = await ctx.db.prisma.workflowVersion.create({
+    const v = await db.workflowVersion.create({
       data: { workflowId, version: nextVersion++, graph: g as unknown as object, topoOrder: {} as unknown as object },
     });
     return v.id;
@@ -73,12 +75,12 @@ describe('B5 — retry policy', () => {
     const run = await ctx.orchestrator.startRun(versionId);
     await waitUntil(
       async () => {
-        const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id }, select: { status: true } });
+        const r = await db.run.findUnique({ where: { id: run.id }, select: { status: true } });
         return r?.status === 'FAILED' || r?.status === 'SUCCEEDED';
       },
       { timeoutMs: 60_000 },
     );
-    const nr = await ctx.db.prisma.nodeRun.findUnique({
+    const nr = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: run.id, nodeKey } },
     });
     const job = await ctx.queue.cpuQueue.getJob(ctx.queue.createJobId(run.id, nodeKey, nr!.attempt));
@@ -93,14 +95,14 @@ describe('B5 — retry policy', () => {
   afterAll(async () => {
     stopQueueEvents?.();
     if (workflowId) {
-      await ctx.db.prisma.runEvent.deleteMany({
+      await db.runEvent.deleteMany({
         where: { run: { workflowVersion: { workflowId } } },
       });
-      await ctx.db.prisma.nodeRun.deleteMany({
+      await db.nodeRun.deleteMany({
         where: { run: { workflowVersion: { workflowId } } },
       });
-      await ctx.db.prisma.run.deleteMany({ where: { workflowVersion: { workflowId } } });
-      await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+      await db.run.deleteMany({ where: { workflowVersion: { workflowId } } });
+      await cleanupWorkflow(ctx.db, tenantId, workflowId);
     }
     await teardownTestEnv(ctx);
   });
@@ -113,7 +115,7 @@ describe('B5 — retry policy', () => {
     expect(attemptsMade).toBe(1);
     expect(nr?.error).toMatchObject({ taxonomy: 'retryable', attempt: 1, maxAttempts: 1 });
 
-    const failEvt = await ctx.db.prisma.runEvent.findFirst({
+    const failEvt = await db.runEvent.findFirst({
       where: { runId, nodeKey: 'boom', type: 'NODE_FAILED' },
     });
     expect((failEvt?.payload as { error?: { taxonomy?: string } }).error?.taxonomy).toBe('retryable');
@@ -133,12 +135,12 @@ describe('B5 — retry policy', () => {
     const run = await ctx.orchestrator.startRun(vid);
     await waitUntil(
       async () => {
-        const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id }, select: { status: true } });
+        const r = await db.run.findUnique({ where: { id: run.id }, select: { status: true } });
         return r?.status === 'FAILED';
       },
       { timeoutMs: 60_000 },
     );
-    const nr = await ctx.db.prisma.nodeRun.findUnique({
+    const nr = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: run.id, nodeKey: 'gate' } },
     });
     const job = await ctx.queue.cpuQueue.getJob(ctx.queue.createJobId(run.id, 'gate', nr!.attempt));

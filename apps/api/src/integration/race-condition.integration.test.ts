@@ -45,20 +45,20 @@ describe('Phase 12 — race condition: b and c completing simultaneously', () =>
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, diamondGraph(), 'race-condition');
+    const seeded = await seedWorkflowVersion(ctx.db, diamondGraph(), 'race-condition');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
   }, 60_000);
 
   afterAll(async () => {
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
   it('dispatches d exactly once no matter how b and c interleave', async () => {
     const nodeKeys = ['a', 'b', 'c', 'd'];
-    const run = await ctx.db.createRun(versionId, 'race-condition-test', nodeKeys);
+    const run = await ctx.db.createRun(versionId, tenantId, 'race-condition-test', nodeKeys);
 
     // Seed the real in-degree hash exactly as startRun would (b=1, c=1, d=2
     // for this graph's edges) — this is the real Redis state the Lua script
@@ -67,24 +67,24 @@ describe('Phase 12 — race condition: b and c completing simultaneously', () =>
 
     // Put b and c straight into RUNNING by hand — see the file header for
     // why this bypasses dispatchNode/BullMQ entirely for the setup step.
-    const bRun = await ctx.db.findNodeRun(run.id, 'b');
-    const cRun = await ctx.db.findNodeRun(run.id, 'c');
-    await ctx.db.prisma.nodeRun.update({ where: { id: bRun!.id }, data: { status: 'RUNNING' } });
-    await ctx.db.prisma.nodeRun.update({ where: { id: cRun!.id }, data: { status: 'RUNNING' } });
+    const bRun = await ctx.db.findNodeRun(run.id, 'b', tenantId);
+    const cRun = await ctx.db.findNodeRun(run.id, 'c', tenantId);
+    await ctx.db.withTenant(tenantId, (tx) => tx.nodeRun.update({ where: { id: bRun!.id }, data: { status: 'RUNNING' } }));
+    await ctx.db.withTenant(tenantId, (tx) => tx.nodeRun.update({ where: { id: cRun!.id }, data: { status: 'RUNNING' } }));
 
     // ── THE RACE ─────────────────────────────────────────────────────────
     // Both parents of `d` report success in the same tick. Real Postgres
     // conditional updates, real Lua decrement, real dispatchNode → real
     // BullMQ `queue.add()` for `d` — nothing here is mocked.
     await Promise.all([
-      ctx.orchestrator.onNodeSucceeded(run.id, 'b', { rows: 1 }),
-      ctx.orchestrator.onNodeSucceeded(run.id, 'c', { rows: 1 }),
+      ctx.orchestrator.onNodeSucceeded(run.id, 'b', tenantId, { rows: 1 }),
+      ctx.orchestrator.onNodeSucceeded(run.id, 'c', tenantId, { rows: 1 }),
     ]);
 
     // ── Assertion 1: exactly one NodeRun row for `d` ────────────────────
-    const dNodeRuns = await ctx.db.prisma.nodeRun.findMany({
-      where: { runId: run.id, nodeKey: 'd' },
-    });
+    const dNodeRuns = await ctx.db.withTenant(tenantId, (tx) =>
+      tx.nodeRun.findMany({ where: { runId: run.id, nodeKey: 'd' } }),
+    );
     expect(dNodeRuns).toHaveLength(1);
     // QUEUED (not yet picked up) or RUNNING/SUCCEEDED (one of the two
     // shared workers already grabbed it) are both proof of exactly one
@@ -92,9 +92,9 @@ describe('Phase 12 — race condition: b and c completing simultaneously', () =>
     expect(['QUEUED', 'RUNNING', 'SUCCEEDED']).toContain(dNodeRuns[0]!.status);
 
     // ── Assertion 2: exactly one dispatch event for `d` ─────────────────
-    const dispatchEvents = await ctx.db.prisma.runEvent.findMany({
-      where: { runId: run.id, nodeKey: 'd', type: 'NODE_QUEUED' },
-    });
+    const dispatchEvents = await ctx.db.withTenant(tenantId, (tx) =>
+      tx.runEvent.findMany({ where: { runId: run.id, nodeKey: 'd', type: 'NODE_QUEUED' } }),
+    );
     expect(dispatchEvents).toHaveLength(1);
 
     // ── Assertion 3: exactly one execution was ever enqueued for `d` ────

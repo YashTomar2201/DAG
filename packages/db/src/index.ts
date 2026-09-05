@@ -12,6 +12,12 @@
 // Singleton client
 export { prisma } from './client';
 
+// Tenant context (roadmap C2.1) — every RLS-protected query goes through one
+// of these instead of a bare `prisma.<model>.<op>()`. See tenant.ts's doc
+// comment for why.
+export { withTenant, withAdminContext } from './tenant';
+export type { Db } from './tenant';
+
 // Repository helpers — one function per operation, named after the action
 export {
   // Workflow
@@ -49,8 +55,10 @@ export {
   countRunsByStatus,
   // Schedules & Triggers (B2)
   getLatestVersionId,
+  getWorkflowTenantId,
   workflowBelongsToTenant,
   runBelongsToTenant,
+  resolveTenantForRun,
   // API Keys (A3)
   findActiveApiKeyByHash,
   createApiKey,

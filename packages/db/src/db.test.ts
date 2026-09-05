@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   prisma,
+  withTenant,
   createRun,
   tryTransitionNodeRun,
   findNodeRun,
@@ -27,14 +28,19 @@ const HAS_DB = Boolean(process.env['DATABASE_URL']);
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Creates the minimal rows needed to seed a Run (Tenant → Workflow → Version → Run) */
-async function seedTestRun(nodeKeys: string[]): Promise<{ runId: string; nodeRunIds: Map<string, string> }> {
+async function seedTestRun(
+  nodeKeys: string[],
+): Promise<{ runId: string; tenantId: string; nodeRunIds: Map<string, string> }> {
   // Tenant
   const tenant = await prisma.tenant.create({ data: { name: `test-tenant-${Date.now()}` } });
 
-  // Workflow
-  const workflow = await prisma.workflow.create({
-    data: { tenantId: tenant.id, name: 'Test Workflow' },
-  });
+  // Workflow — Workflow is RLS-protected (roadmap C2.1), so this insert must
+  // run inside a transaction scoped to the tenant it's checked against.
+  const workflow = await withTenant(tenant.id, (tx) =>
+    tx.workflow.create({
+      data: { tenantId: tenant.id, name: 'Test Workflow' },
+    }),
+  );
 
   // WorkflowVersion (minimal graph + topoOrder)
   const version = await prisma.workflowVersion.create({
@@ -47,39 +53,38 @@ async function seedTestRun(nodeKeys: string[]): Promise<{ runId: string; nodeRun
   });
 
   // Run + NodeRuns
-  const run = await createRun(version.id, 'test', nodeKeys);
+  const run = await createRun(version.id, tenant.id, 'test', nodeKeys);
 
   // Collect nodeRun ids
   const nodeRunIds = new Map<string, string>();
   for (const key of nodeKeys) {
-    const nr = await findNodeRun(run.id, key);
+    const nr = await findNodeRun(run.id, key, tenant.id);
     if (nr) nodeRunIds.set(key, nr.id);
   }
 
-  return { runId: run.id, nodeRunIds };
+  return { runId: run.id, tenantId: tenant.id, nodeRunIds };
 }
 
 /** Cleans up all rows created by the test (top-down cascade) */
-async function cleanupRun(runId: string) {
-  await prisma.runEvent.deleteMany({ where: { runId } });
-  await prisma.nodeRun.deleteMany({ where: { runId } });
-  const run = await prisma.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
-  await prisma.run.delete({ where: { id: runId } });
+async function cleanupRun(runId: string, tenantId: string) {
+  const run = await withTenant(tenantId, async (tx) => {
+    await tx.runEvent.deleteMany({ where: { runId } });
+    await tx.nodeRun.deleteMany({ where: { runId } });
+    const r = await tx.run.findUnique({ where: { id: runId }, select: { workflowVersionId: true } });
+    await tx.run.delete({ where: { id: runId } });
+    return r;
+  });
   if (run) {
+    // WorkflowVersion/Workflow: WorkflowVersion isn't RLS-protected; Workflow
+    // is, so its delete needs the same tenant context.
     const version = await prisma.workflowVersion.findUnique({
       where: { id: run.workflowVersionId },
       select: { workflowId: true },
     });
     await prisma.workflowVersion.delete({ where: { id: run.workflowVersionId } });
     if (version) {
-      const workflow = await prisma.workflow.findUnique({
-        where: { id: version.workflowId },
-        select: { tenantId: true },
-      });
-      await prisma.workflow.delete({ where: { id: version.workflowId } });
-      if (workflow) {
-        await prisma.tenant.delete({ where: { id: workflow.tenantId } });
-      }
+      await withTenant(tenantId, (tx) => tx.workflow.delete({ where: { id: version.workflowId } }));
+      await prisma.tenant.delete({ where: { id: tenantId } });
     }
   }
 }
@@ -88,60 +93,62 @@ async function cleanupRun(runId: string) {
 
 describe.skipIf(!HAS_DB)('Phase 3 — Persistence layer (requires real DB)', () => {
   let runId: string;
+  let tenantId: string;
   let nodeRunId: string;
 
   beforeAll(async () => {
-    const { runId: rid, nodeRunIds } = await seedTestRun(['extract', 'preprocess']);
+    const { runId: rid, tenantId: tid, nodeRunIds } = await seedTestRun(['extract', 'preprocess']);
     runId = rid;
+    tenantId = tid;
     nodeRunId = nodeRunIds.get('extract')!;
   });
 
   afterAll(async () => {
-    await cleanupRun(runId);
+    await cleanupRun(runId, tenantId);
     await prisma.$disconnect();
   });
 
   // ── Core acceptance check ─────────────────────────────────────────────────
 
   it('tryTransitionNodeRun: first call PENDING→QUEUED returns true', async () => {
-    const result = await tryTransitionNodeRun(nodeRunId, 'PENDING', 'QUEUED');
+    const result = await tryTransitionNodeRun(nodeRunId, 'PENDING', 'QUEUED', tenantId);
     expect(result).toBe(true);
   });
 
   it('tryTransitionNodeRun: second call PENDING→QUEUED returns false (already QUEUED)', async () => {
     // The row is now QUEUED; trying PENDING→QUEUED again should fail
-    const result = await tryTransitionNodeRun(nodeRunId, 'PENDING', 'QUEUED');
+    const result = await tryTransitionNodeRun(nodeRunId, 'PENDING', 'QUEUED', tenantId);
     expect(result).toBe(false);
   });
 
   it('the NodeRun row is still QUEUED after the failed second transition', async () => {
-    const nr = await prisma.nodeRun.findUnique({ where: { id: nodeRunId } });
+    const nr = await withTenant(tenantId, (tx) => tx.nodeRun.findUnique({ where: { id: nodeRunId } }));
     expect(nr?.status).toBe('QUEUED');
   });
 
   // ── Additional conditional-update paths ───────────────────────────────────
 
   it('tryTransitionNodeRun: QUEUED→RUNNING with workerId succeeds', async () => {
-    const result = await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'RUNNING', {
+    const result = await tryTransitionNodeRun(nodeRunId, 'QUEUED', 'RUNNING', tenantId, {
       workerId: 'worker-1',
       startedAt: new Date(),
     });
     expect(result).toBe(true);
 
-    const nr = await prisma.nodeRun.findUnique({ where: { id: nodeRunId } });
+    const nr = await withTenant(tenantId, (tx) => tx.nodeRun.findUnique({ where: { id: nodeRunId } }));
     expect(nr?.status).toBe('RUNNING');
     expect(nr?.workerId).toBe('worker-1');
   });
 
   it('tryTransitionNodeRun: RUNNING→SUCCEEDED with output succeeds', async () => {
     const output = { rows: 1000, metadataPath: `artifacts/${runId}/extract/data.csv` };
-    const result = await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'SUCCEEDED', {
+    const result = await tryTransitionNodeRun(nodeRunId, 'RUNNING', 'SUCCEEDED', tenantId, {
       output,
       finishedAt: new Date(),
     });
     expect(result).toBe(true);
 
-    const nr = await prisma.nodeRun.findUnique({ where: { id: nodeRunId } });
+    const nr = await withTenant(tenantId, (tx) => tx.nodeRun.findUnique({ where: { id: nodeRunId } }));
     expect(nr?.status).toBe('SUCCEEDED');
     expect(nr?.output).toEqual(output);
   });
@@ -149,14 +156,14 @@ describe.skipIf(!HAS_DB)('Phase 3 — Persistence layer (requires real DB)', () 
   // ── Run-level transition ───────────────────────────────────────────────────
 
   it('tryTransitionRun: PENDING→RUNNING succeeds', async () => {
-    const result = await tryTransitionRun(runId, 'PENDING', 'RUNNING', {
+    const result = await tryTransitionRun(runId, 'PENDING', 'RUNNING', tenantId, {
       startedAt: new Date(),
     });
     expect(result).toBe(true);
   });
 
   it('tryTransitionRun: PENDING→RUNNING a second time returns false', async () => {
-    const result = await tryTransitionRun(runId, 'PENDING', 'RUNNING');
+    const result = await tryTransitionRun(runId, 'PENDING', 'RUNNING', tenantId);
     expect(result).toBe(false);
   });
 
@@ -164,9 +171,11 @@ describe.skipIf(!HAS_DB)('Phase 3 — Persistence layer (requires real DB)', () 
 
   it('createMany would reject a duplicate (runId, nodeKey) via DB constraint', async () => {
     await expect(
-      prisma.nodeRun.createMany({
-        data: [{ runId, nodeKey: 'extract', status: 'PENDING', attempt: 0 }],
-      }),
+      withTenant(tenantId, (tx) =>
+        tx.nodeRun.createMany({
+          data: [{ runId, tenantId, nodeKey: 'extract', status: 'PENDING', attempt: 0 }],
+        }),
+      ),
     ).rejects.toThrow();
   });
 });

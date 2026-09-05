@@ -20,8 +20,49 @@
 import type { Graph } from '@dag/contracts';
 import { topologicalSort } from '@dag/graph-core';
 import type { prisma as PrismaInstance } from '@dag/db';
+import type { withTenant as WithTenantInstance } from '@dag/db';
 
 type Prisma = typeof PrismaInstance;
+type WithTenant = typeof WithTenantInstance;
+
+/**
+ * A `prisma`-shaped object pre-bound to one tenant, for test files whose raw
+ * assertions read/write Workflow/Run/NodeRun/RunEvent (all RLS-protected —
+ * roadmap C2.1) against a single, already-known tenant for the whole
+ * `describe` block. Each call still opens its own short `withTenant`
+ * transaction under the hood — same pattern as every production call site —
+ * this just avoids writing that wrapping out at every one of dozens of call
+ * sites across the integration suite. NOT a real PrismaClient: only the
+ * (model, method) proxying this suite's assertions actually use is
+ * implemented; reach for `db.withTenant` directly for anything fancier
+ * (multi-statement transactions, etc).
+ */
+export function tenantScopedPrisma(db: { withTenant: WithTenant }, tenantId: string): Prisma {
+  const modelCache = new Map<string, unknown>();
+  return new Proxy({} as Prisma, {
+    get(_target, modelName: string) {
+      if (!modelCache.has(modelName)) {
+        modelCache.set(
+          modelName,
+          new Proxy(
+            {},
+            {
+              get(_t2, methodName: string) {
+                return (...args: unknown[]) =>
+                  db.withTenant(tenantId, async (tx) =>
+                    (
+                      (tx as unknown as Record<string, Record<string, (...a: unknown[]) => Promise<unknown>>>)[modelName]!
+                    )[methodName]!(...args),
+                  );
+              },
+            },
+          ),
+        );
+      }
+      return modelCache.get(modelName);
+    },
+  });
+}
 
 export function hermeticPipelineGraph(): Graph {
   return {
@@ -105,15 +146,19 @@ export function diamondGraph(): Graph {
  * Phase 4 (validate once, cache forever — see architecture.md).
  */
 export async function seedWorkflowVersion(
-  prisma: Prisma,
+  db: { prisma: Prisma; withTenant: WithTenant },
   graph: Graph,
   namePrefix: string,
 ) {
+  const { prisma, withTenant } = db;
   const tenant = await prisma.tenant.create({ data: { name: `${namePrefix}-tenant-${Date.now()}` } });
-  const workflow = await prisma.workflow.create({
-    data: { tenantId: tenant.id, name: `${namePrefix}-workflow` },
-  });
+  // Workflow is RLS-protected (roadmap C2.1) — the insert must run inside a
+  // transaction scoped to the tenant it's checked against.
+  const workflow = await withTenant(tenant.id, (tx) =>
+    tx.workflow.create({ data: { tenantId: tenant.id, name: `${namePrefix}-workflow` } }),
+  );
   const topoOrder = topologicalSort(graph);
+  // WorkflowVersion is not RLS-protected — a plain call is correct.
   const version = await prisma.workflowVersion.create({
     data: {
       workflowId: workflow.id,
@@ -128,20 +173,23 @@ export async function seedWorkflowVersion(
 
 /** Deletes a Run and everything under it, plus its Workflow/Tenant ancestry. */
 export async function cleanupWorkflow(
-  prisma: Prisma,
+  db: { prisma: Prisma; withTenant: WithTenant },
   tenantId: string,
   workflowId: string,
 ) {
+  const { prisma, withTenant } = db;
   const versions = await prisma.workflowVersion.findMany({ where: { workflowId }, select: { id: true } });
   const versionIds = versions.map((v) => v.id);
-  const runs = await prisma.run.findMany({ where: { workflowVersionId: { in: versionIds } }, select: { id: true } });
-  const runIds = runs.map((r) => r.id);
 
-  await prisma.runEvent.deleteMany({ where: { runId: { in: runIds } } });
-  await prisma.nodeRun.deleteMany({ where: { runId: { in: runIds } } });
-  await prisma.run.deleteMany({ where: { id: { in: runIds } } });
+  await withTenant(tenantId, async (tx) => {
+    const runs = await tx.run.findMany({ where: { workflowVersionId: { in: versionIds } }, select: { id: true } });
+    const runIds = runs.map((r) => r.id);
+    await tx.runEvent.deleteMany({ where: { runId: { in: runIds } } });
+    await tx.nodeRun.deleteMany({ where: { runId: { in: runIds } } });
+    await tx.run.deleteMany({ where: { id: { in: runIds } } });
+  });
   await prisma.workflowVersion.deleteMany({ where: { workflowId } });
-  await prisma.workflow.delete({ where: { id: workflowId } });
+  await withTenant(tenantId, (tx) => tx.workflow.delete({ where: { id: workflowId } }));
   await prisma.tenant.delete({ where: { id: tenantId } });
 }
 

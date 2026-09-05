@@ -23,7 +23,7 @@ describe('B2 — webhook triggers', () => {
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
     svc = await import('../services/trigger.service');
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, hermeticPipelineGraph(), 'b2-trig');
+    const seeded = await seedWorkflowVersion(ctx.db, hermeticPipelineGraph(), 'b2-trig');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
@@ -31,14 +31,14 @@ describe('B2 — webhook triggers', () => {
 
   afterAll(async () => {
     await ctx.db.prisma.trigger.deleteMany({ where: { workflowId } });
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
   const webhookRunCount = async () =>
-    (await ctx.db.prisma.run.findMany({ where: { workflowVersionId: versionId } })).filter(
-      (r) => r.triggeredBy === 'webhook',
-    ).length;
+    (
+      await ctx.db.withTenant(tenantId, (tx) => tx.run.findMany({ where: { workflowVersionId: versionId } }))
+    ).filter((r) => r.triggeredBy === 'webhook').length;
 
   it('creates a trigger, revealing the secret exactly once', async () => {
     const created = await svc.createTriggerService(workflowId, tenantId);
@@ -78,7 +78,7 @@ describe('B2 — webhook triggers', () => {
 
     expect(await webhookRunCount()).toBe(before + 1);
 
-    const run = await ctx.db.prisma.run.findUnique({ where: { id: first.runId } });
+    const run = await ctx.db.withTenant(tenantId, (tx) => tx.run.findUnique({ where: { id: first.runId } }));
     expect(run!.triggeredBy).toBe('webhook');
 
     // A different body is a different key → a new run.

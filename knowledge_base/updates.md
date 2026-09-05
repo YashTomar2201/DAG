@@ -5,6 +5,131 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-05 — C2.1: Postgres Row-Level Security
+
+**Phase:** roadmap C2.1. A3 closed tenant isolation at the *route* layer (every
+route checks tenant ownership of the id it's given); C2.1 closes it at the
+*database* layer, so a bug in a future service function that forgets its own
+tenant check still cannot read or write another tenant's `Workflow`/`Run`/
+`NodeRun`/`RunEvent` rows. `WorkflowVersion`/`Schedule`/`Trigger`/`ApiKey` are
+deliberately out of scope (per the roadmap text) — a documented boundary, not
+an oversight.
+
+### The superuser gotcha (why this took a new Postgres role)
+
+Postgres RLS policies are unconditionally **bypassed for superusers and table
+owners**, regardless of any policy configuration. `docker-compose.yml`'s `dag`
+role (created via `POSTGRES_USER`) is a bootstrap superuser — RLS enabled on
+top of it would silently do nothing, verified by hand (raw psql, `SET SESSION
+AUTHORIZATION dag_app`: unset tenant context → 0 rows, correct tenant → 57,
+wrong tenant → 0, admin sentinel → 58; the same queries run as `dag` return 58
+rows regardless of the context setting). The fix: a new, restricted `dag_app`
+role (`NOSUPERUSER NOBYPASSRLS`), created by the migration itself, used for
+**all runtime traffic** — `api`, `worker`, and the integration test suite.
+`migrate` (schema DDL, `CREATE ROLE`) and the `db:seed` script still run as the
+`dag` superuser, since seeding `Tenant`/`ApiKey` predates any tenant having a
+context to set.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** + migration
+  `20260905014356_c2_1_row_level_security` — denormalizes `tenantId` onto
+  `Run`, `NodeRun`, `RunEvent` (a policy can't reach through a join to
+  `Workflow.tenantId`), backfills every existing row, then: creates `dag_app`
+  if missing (dynamic `format('GRANT CONNECT ON DATABASE %I …', current_database())`
+  and no `FOR ROLE dag` clause on `ALTER DEFAULT PRIVILEGES` — both needed so
+  the same migration file works against production's `dag_engine`/`dag` *and*
+  Testcontainers' differently-named database and bootstrap user); enables RLS
+  and a `tenant_isolation` policy on `Workflow`/`Run`/`NodeRun`/`RunEvent`:
+  `USING ("tenantId" = current_setting('app.tenant_id', true) OR
+  current_setting('app.tenant_id', true) = '__dag_admin__')` — fails **closed**
+  (no context set → 0 rows), with one sentinel value for the handful of
+  legitimately cross-tenant admin paths.
+- **`packages/db/src/tenant.ts`** (new) — `withTenant(tenantId, fn)` and
+  `withAdminContext(fn)`, both `prisma.$transaction(tx => { SELECT
+  set_config('app.tenant_id', $1, true); return fn(tx); })`. Each call is
+  scoped to exactly **one** DB operation — not one transaction wrapping a
+  whole request — to preserve the existing atomic-conditional-update
+  concurrency model (`tryTransitionNodeRun`/`tryTransitionRun` must keep
+  committing independently; see Phase 3's decision log). `withAdminContext`
+  exists only for call sites with no tenant context yet: `getWorkflowTenantId`
+  / `resolveTenantForRun` (schedule/trigger/BullMQ-event entry points that
+  only carry a bare id) and the `/metrics` status-count queries — never
+  reachable from external input.
+- **`packages/db/src/repositories.ts`** — every RLS-relevant function now
+  takes a `tenantId` and wraps its body in `withTenant`; `createFanOutChildRun`
+  keeps its existence-check and post-failure retry-check as two **separate**
+  `withTenant` calls (a first draft merged them into one transaction, which
+  broke: Postgres aborts the rest of a transaction after any failing statement
+  inside it, so the retry-lookup itself would fail).
+- **`apps/api/src/services/{orchestrator,cancel,run,schedule,trigger}.service.ts`**,
+  **`apps/api/src/worker-events.ts`** — `tenantId` threaded through every
+  function that touches a run (`startRun` resolves it via `withAdminContext`
+  on the initial version lookup, since the tenant isn't known yet; from then
+  on `version.workflow.tenantId` is authoritative, never a caller-supplied
+  value used directly). Schedule/webhook fire and the BullMQ `QueueEvents`
+  handlers resolve their tenant via `getWorkflowTenantId`/`resolveTenantForRun`
+  before touching anything RLS-protected.
+- **`packages/contracts/src/job.ts`**, **`packages/queue/src/queues.ts`** —
+  `JobPayload.tenantId: string`. **`apps/worker/src/worker.ts`** —
+  `processJob` reads `job.data.tenantId` and passes it to every
+  `tryTransitionNodeRun`/`setNodeRunError` call. This was the one call site
+  the initial pass missed (worker.ts predates the repository signature
+  change) — caught by the integration suite's `fan-out-failure` tests all
+  timing out at 60s once `migrate deploy` replaced `db push` and the worker's
+  DB calls started throwing on a missing required argument.
+- **`apps/api/src/integration/global-setup.ts`** — switched from `prisma db
+  push --accept-data-loss` to `prisma migrate deploy`, so the Testcontainers
+  suite is exercised against the **exact same** RLS setup production runs, not
+  a `db push`-inferred approximation of it (RLS is raw SQL in a migration
+  file — `db push` only diffs the declarative schema shape and has no way to
+  know about it). The container's admin connection string is used only for
+  migrating; the handoff file written for every test file and the two shared
+  worker processes uses the `dag_app` connection string instead.
+- **`apps/api/src/integration/fixtures.ts`** — `tenantScopedPrisma(db,
+  tenantId)`, a `Proxy` that auto-wraps every `model.method(...)` call in
+  `withTenant`, so ~13 integration test files could replace `ctx.db.prisma.` →
+  `db.` mechanically instead of hand-restructuring every raw Prisma call under
+  real RLS. `seedWorkflowVersion`/`cleanupWorkflow` now take the whole `db`
+  object (`{prisma, withTenant}`), not a bare `prisma` client — their own
+  unscoped `Workflow` writes were the root cause of a cascade of failures once
+  RLS was actually enforced (`db push` had let them slide silently).
+- **`infra/docker-compose.yml`** — `api` and `worker`'s `DATABASE_URL` now
+  point at `dag_app`, not the `dag` superuser; `migrate` (schema DDL) stays on
+  `dag`.
+
+### Verification
+
+- Raw psql against `dag_app` (bypassing the application layer entirely):
+  unset `app.tenant_id` → 0 rows; correct tenant → 57; wrong tenant → 0;
+  `__dag_admin__` sentinel → 58. Confirms RLS is genuinely enforced by
+  Postgres, not an application-layer illusion.
+- Full Testcontainers integration suite, `migrate deploy` (not `db push`):
+  **16 files / 52 tests green**, run in isolation (a prior run's 16 ENOENT
+  failures were a self-inflicted collision — two overlapping background test
+  runs sharing one hardcoded temp handoff file path, not a product bug).
+- Live smoke against the real Docker stack (`dag_app` wired into `api`/
+  `worker`, rebuilt): created a second tenant + API key directly in Postgres;
+  as that tenant, `GET /workflows` returned an empty list and `GET
+  /workflows/:id` on the first tenant's workflow **404**'d; as the first
+  tenant, the same workflow listed normally and a **real run executed
+  end-to-end through the live worker process** (`RUNNING` → `SUCCEEDED`,
+  confirming the worker-side `tenantId` plumbing fix works outside
+  Testcontainers too) and its run also 404'd for the second tenant. Smoke-test
+  rows cleaned up afterward.
+- `pnpm -r typecheck` green across all 8 workspace packages (`@dag/contracts`,
+  `@dag/queue`, `@dag/db`, `@dag/worker`, `@dag/api` explicitly re-checked
+  after the worker fix).
+
+### Rebuild note
+
+`@dag/contracts` (`JobPayload.tenantId`) + `@dag/queue` + worker + api →
+`docker compose build api worker`. Schema change → `docker compose build
+migrate`, `run --rm migrate` (or let the compose `depends_on:
+service_completed_successfully` chain handle it on `up`).
+
+---
+
 ## 2026-09-05 — A3: API-key authentication (unblocks C2)
 
 **Phase:** roadmap A3, pulled forward ahead of C2 because C2 (Postgres RLS,

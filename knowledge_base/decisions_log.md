@@ -1287,3 +1287,114 @@ testing all agree on one working credential with zero manual steps, matching
 the "it just works" experience the old `?tenantId=default` shim gave for
 free. This is explicitly a local-dev convenience: a real deployment seed
 would generate a random key and print it once, never commit a fixed string.
+
+---
+
+## Roadmap C2.1 — Postgres Row-Level Security
+
+### Decision: A New Restricted Role (`dag_app`), Not RLS on the Existing `dag` Role
+
+**Why:** Postgres unconditionally bypasses RLS policies for superusers and table owners — a
+documented, non-configurable behavior, not a bug to work around at the policy level. The
+`docker-compose.yml` `dag` role (created via `POSTGRES_USER`) is a bootstrap superuser; enabling
+RLS on top of it would compile, apply, and pass a naive smoke test while silently protecting
+nothing. Verified by hand with raw `psql`: `SET SESSION AUTHORIZATION dag_app` with no
+`app.tenant_id` set returns 0 rows from a policy-protected table; the identical query as `dag`
+returns every row regardless of the setting. The fix is a second, deliberately weaker role
+(`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`) used for all runtime traffic — `api`, `worker`,
+and the integration suite — while `dag` is kept only for what still requires it: schema DDL
+(`migrate`) and seeding `Tenant`/`ApiKey` rows before any tenant context exists to set.
+
+**Trade-off:** Two roles to keep in sync (grants must be re-applied if a new table is added) instead
+of one. Acceptable — the migration file itself is where both the schema change and the grant live,
+so they can't drift independently the way a manually-run `GRANT` script could.
+
+### Decision: `USING (tenantId = current_setting(...) OR current_setting(...) = sentinel)`, Fail Closed
+
+**Why:** The policy's `USING` clause reads `current_setting('app.tenant_id', true)` — the `true`
+second argument makes an unset setting return `NULL` rather than raising, and `NULL = anything` is
+`NULL` (falsy) in SQL, so a connection that never called `set_config` sees **zero rows**, not every
+row. This is the safe failure direction: a bug that forgets to set the tenant context produces an
+empty result set (a visible, debuggable "nothing came back"), never a silent cross-tenant leak. The
+one sentinel value (`__dag_admin__`) that satisfies the `OR` branch is never derived from caller
+input anywhere in the codebase — it is a hardcoded string reachable only through
+`withAdminContext()`, itself called only from a handful of internal, non-request-scoped call sites
+(`getWorkflowTenantId`, `resolveTenantForRun`, the `/metrics` status counts). An attacker cannot
+produce this value through any API surface; it isn't parsed from anything a client sends.
+
+### Decision: `withTenant`/`withAdminContext` Scope Each `SET LOCAL` to One Operation, Not One Request
+
+**Why:** The naive reading of "set the tenant context per transaction" is to open one transaction at
+the top of a request, `SET LOCAL app.tenant_id`, and run every DB call inside it. That would have
+silently broken a load-bearing invariant from Phase 3: `tryTransitionNodeRun`/`tryTransitionRun`'s
+conditional `UPDATE ... WHERE status = $from` pattern depends on each transition being its own
+independent, immediately-committing transaction — two concurrent workers racing to transition the
+same row must each get an immediate, authoritative answer (did I win the race or not), not have
+that answer deferred until some enclosing request-level transaction commits or rolls back together.
+`withTenant(tenantId, fn)` is instead built as `prisma.$transaction(async tx => { SET LOCAL
+app.tenant_id; return fn(tx) })`, called once per logical DB operation — matching the granularity
+every call site already used before RLS existed. A service function that needs several DB calls
+calls `withTenant` several times, each its own transaction, exactly reproducing the pre-RLS
+concurrency shape with a tenant context attached.
+
+### Decision: `prisma migrate deploy` in the Integration Suite, Not `db push`
+
+**Why:** `db push` diffs the *declarative* shape of `schema.prisma` against the live database and
+applies whatever DDL closes the gap — it has no representation for `CREATE ROLE`, `ENABLE ROW LEVEL
+SECURITY`, or `CREATE POLICY`, none of which exist in the Prisma schema language at all; they only
+exist as raw SQL inside the migration file. Before this phase, the integration suite ran `db push`,
+which meant every prior "RLS is tested" claim would have been testing a database with the `tenantId`
+columns but **no RLS policies at all** — a false positive waiting to happen the moment someone wrote
+a raw, unscoped Prisma call and the test suite had no way to catch it. Switching to `migrate deploy`
+(replaying the exact same migration file production runs) is what makes "the integration suite
+passes" mean "RLS is enforced," not "the columns exist."
+
+**Consequence this forced elsewhere:** `migrate deploy` actually applying the RLS policies is what
+surfaced ~15 integration test files' pre-existing raw, unscoped `ctx.db.prisma.*` calls as hard
+failures (`new row violates row-level security policy`) — under `db push`'s no-op RLS, those same
+calls had always silently "worked." The `tenantScopedPrisma` Proxy fixture (see below) exists
+specifically to fix that fallout mechanically rather than by hand-restructuring every call site.
+
+### Decision: `tenantScopedPrisma` Proxy Fixture, Not a Per-Call-Site Rewrite
+
+**Why:** Once `migrate deploy` made RLS real, every integration test file's direct `ctx.db.prisma.*`
+calls against `Workflow`/`Run`/`NodeRun`/`RunEvent` started failing — Prisma's raw client has no
+tenant context set, so every write is rejected and every read returns nothing. Rewriting each call
+site to `ctx.db.withTenant(tenantId, tx => tx.model.method(...))` by hand, across ~15 files with
+dozens of call sites each, would have been both slow and a large diff to review for a purely
+mechanical transformation. `tenantScopedPrisma(db, tenantId)` returns a `Proxy` shaped exactly like
+`prisma` itself — `db.run.findUnique(...)` transparently becomes `withTenant(tenantId, tx =>
+tx.run.findUnique(...))` — so the actual fix in every test file was a search-and-replace
+(`ctx.db.prisma.` → `db.`) plus one `const db = tenantScopedPrisma(ctx.db, tenantId)` per file,
+instead of restructuring call-site syntax file by file.
+
+### Bug found during the refactor: `createFanOutChildRun`'s error-recovery lookup can't share its failing transaction
+
+**Why:** The pre-RLS code ran its existence-check and its post-failure retry-lookup as two separate,
+non-transactional `prisma.run.findUnique` calls (an artifact of Phase 3's `@@unique` constraint
+being the actual dedup guard — the lookups were just diagnostic, not load-bearing). The first RLS
+refactor pass "cleaned this up" by moving both into one `withTenant` transaction, on the theory that
+one transaction per logical operation was cleaner. That broke: Postgres aborts every subsequent
+statement in a transaction once *any* statement inside it fails (`current transaction is aborted,
+commands ignored until end of transaction block`) — so the very lookup meant to run *after* the
+`create` failed was itself doomed to fail, inside the same doomed transaction. Reverted to two
+independent `withTenant` calls, matching the original two-independent-calls shape exactly. The
+lesson generalizes: "wrap it in a transaction" is not free to apply retroactively to code whose
+error-handling assumed failures don't poison later statements in the same block.
+
+### Bug found in `apps/worker`: the `JobPayload.tenantId` plumbing gap
+
+**Why:** `packages/db/src/repositories.ts`'s RLS refactor made `tenantId` a required parameter on
+every `tryTransitionNodeRun`/`setNodeRunError` call — necessary, since those functions can no longer
+run without a tenant context to set. But `apps/worker/src/worker.ts`'s `processJob` was not updated
+in the same pass (it lives in a different package, imported from `@dag/db` rather than defined
+alongside it, and nothing forced a re-read of every consumer at refactor time). The gap passed
+`pnpm --filter @dag/api typecheck` clean, because `apps/api` never calls those specific worker-side
+functions — it was only caught because `apps/worker` itself was typechecked directly, and confirmed
+functionally by the integration suite: `fan-out-failure.integration.test.ts`'s four tests all timed
+out at the full 60 s budget once `migrate deploy` made RLS real, because every worker-side node
+transition was throwing on a missing required argument and the run could never reach a terminal
+state. The general lesson: a signature change to a shared package is only as safe as the last
+consumer that got typechecked — `pnpm -r typecheck` (not per-package) is the check that actually
+proves nothing was missed, and a hanging/timing-out integration test is itself a signal worth
+reading literally rather than attributing to test flakiness.

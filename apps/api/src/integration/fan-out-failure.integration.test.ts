@@ -17,7 +17,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 const REAL = 'python/data/titanic.csv';
@@ -58,17 +58,19 @@ describe('B3.4 — fan-out failure & cancellation', () => {
   let tenantId: string;
   let workflowId: string;
   let nextVersion = 1;
+  let db: ReturnType<typeof tenantScopedPrisma>;
   const runIds: string[] = [];
 
   const seed = async (g: Graph) => {
     if (nextVersion === 1) {
-      const s = await seedWorkflowVersion(ctx.db.prisma, g, 'b34');
+      const s = await seedWorkflowVersion(ctx.db, g, 'b34');
       tenantId = s.tenantId;
       workflowId = s.workflowId;
+      db = tenantScopedPrisma(ctx.db, tenantId);
       nextVersion = 2;
       return s.versionId;
     }
-    const v = await ctx.db.prisma.workflowVersion.create({
+    const v = await db.workflowVersion.create({
       data: { workflowId, version: nextVersion++, graph: g as unknown as object, topoOrder: {} as unknown as object },
     });
     return v.id;
@@ -82,15 +84,15 @@ describe('B3.4 — fan-out failure & cancellation', () => {
   const waitTerminal = (runId: string, want?: string) =>
     waitUntil(
       async () => {
-        const r = await ctx.db.prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
+        const r = await db.run.findUnique({ where: { id: runId }, select: { status: true } });
         return want ? r?.status === want : r?.status === 'SUCCEEDED' || r?.status === 'FAILED' || r?.status === 'CANCELLED';
       },
       { timeoutMs: 120_000 },
     );
   const children = (parentRunId: string) =>
-    ctx.db.prisma.run.findMany({ where: { parentRunId }, orderBy: { fanOutIndex: 'asc' } });
+    db.run.findMany({ where: { parentRunId }, orderBy: { fanOutIndex: 'asc' } });
   const nodeRun = (runId: string, nodeKey: string) =>
-    ctx.db.prisma.nodeRun.findUnique({ where: { runId_nodeKey: { runId, nodeKey } } });
+    db.nodeRun.findUnique({ where: { runId_nodeKey: { runId, nodeKey } } });
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
@@ -100,11 +102,11 @@ describe('B3.4 — fan-out failure & cancellation', () => {
   afterAll(async () => {
     stopQueueEvents?.();
     for (const rid of runIds) {
-      await ctx.db.prisma.runEvent.deleteMany({ where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } } });
-      await ctx.db.prisma.nodeRun.deleteMany({ where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } } });
-      await ctx.db.prisma.run.deleteMany({ where: { parentRunId: rid } });
+      await db.runEvent.deleteMany({ where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } } });
+      await db.nodeRun.deleteMany({ where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } } });
+      await db.run.deleteMany({ where: { parentRunId: rid } });
     }
-    if (workflowId) await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    if (workflowId) await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -121,7 +123,7 @@ describe('B3.4 — fan-out failure & cancellation', () => {
     // moment to settle rather than racing the last cancel.
     await waitUntil(
       async () =>
-        (await ctx.db.prisma.run.count({
+        (await db.run.count({
           where: { parentRunId: runId, status: { in: ['PENDING', 'RUNNING'] } },
         })) === 0,
       { timeoutMs: 20_000 },
@@ -133,7 +135,7 @@ describe('B3.4 — fan-out failure & cancellation', () => {
     expect(kids.some((k) => k.status === 'FAILED')).toBe(true);
     expect(kids.some((k) => k.status === 'CANCELLED')).toBe(true); // siblings cancelled
 
-    expect((await ctx.db.prisma.run.findUnique({ where: { id: runId }, select: { status: true } }))?.status).toBe('FAILED');
+    expect((await db.run.findUnique({ where: { id: runId }, select: { status: true } }))?.status).toBe('FAILED');
     expect((await nodeRun(runId, 'reduce'))?.status).toBe('SKIPPED');
     expect((await nodeRun(runId, 'merge'))?.status).toBe('SKIPPED');
   });
@@ -170,8 +172,8 @@ describe('B3.4 — fan-out failure & cancellation', () => {
 
     await waitUntil(
       async () => {
-        const p = await ctx.db.prisma.run.findUnique({ where: { id: runId }, select: { status: true } });
-        const nonTerminal = await ctx.db.prisma.run.count({
+        const p = await db.run.findUnique({ where: { id: runId }, select: { status: true } });
+        const nonTerminal = await db.run.count({
           where: { parentRunId: runId, status: { in: ['PENDING', 'RUNNING'] } },
         });
         return p?.status === 'CANCELLED' && nonTerminal === 0;

@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { hermeticPipelineGraph, seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 describe('Phase 12 — failure propagates to SKIPPED descendants', () => {
@@ -19,6 +19,7 @@ describe('Phase 12 — failure propagates to SKIPPED descendants', () => {
   let tenantId: string;
   let workflowId: string;
   let versionId: string;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
@@ -33,15 +34,16 @@ describe('Phase 12 — failure propagates to SKIPPED descendants', () => {
     const evaluateNode = graph.nodes.find((n) => n.key === 'evaluate')!;
     (evaluateNode.config as Record<string, unknown>)['minAccuracy'] = 0.99;
 
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, graph as Graph, 'failure-propagation');
+    const seeded = await seedWorkflowVersion(ctx.db, graph as Graph, 'failure-propagation');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
+    db = tenantScopedPrisma(ctx.db, tenantId);
   }, 60_000);
 
   afterAll(async () => {
     stopQueueEvents?.();
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -49,12 +51,12 @@ describe('Phase 12 — failure propagates to SKIPPED descendants', () => {
     const run = await ctx.orchestrator.startRun(versionId);
 
     await waitUntil(async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
+      const r = await db.run.findUnique({ where: { id: run.id } });
       return r?.status === 'FAILED' || r?.status === 'SUCCEEDED';
     });
 
-    const finalRun = await ctx.db.prisma.run.findUnique({ where: { id: run.id } });
-    const nodeRuns = await ctx.db.prisma.nodeRun.findMany({ where: { runId: run.id } });
+    const finalRun = await db.run.findUnique({ where: { id: run.id } });
+    const nodeRuns = await db.nodeRun.findMany({ where: { runId: run.id } });
     const byKey = new Map(nodeRuns.map((n) => [n.nodeKey, n]));
 
     expect(finalRun?.status).toBe('FAILED');

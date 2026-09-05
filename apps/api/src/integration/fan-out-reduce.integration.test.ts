@@ -15,7 +15,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import { bootstrapTestEnv, teardownTestEnv } from './test-env';
-import { seedWorkflowVersion, cleanupWorkflow, waitUntil } from './fixtures';
+import { seedWorkflowVersion, cleanupWorkflow, waitUntil, tenantScopedPrisma } from './fixtures';
 import type { Graph } from '@dag/contracts';
 
 function reduceGraph(mode: 'mean' | 'concat'): Graph {
@@ -52,12 +52,13 @@ function reduceGraph(mode: 'mean' | 'concat'): Graph {
 
 async function runToTerminal(
   ctx: Awaited<ReturnType<typeof bootstrapTestEnv>>,
+  db: ReturnType<typeof tenantScopedPrisma>,
   versionId: string,
 ): Promise<string> {
   const run = await ctx.orchestrator.startRun(versionId);
   await waitUntil(
     async () => {
-      const r = await ctx.db.prisma.run.findUnique({ where: { id: run.id }, select: { status: true } });
+      const r = await db.run.findUnique({ where: { id: run.id }, select: { status: true } });
       return r?.status === 'SUCCEEDED' || r?.status === 'FAILED';
     },
     { timeoutMs: 120_000 },
@@ -74,17 +75,20 @@ describe('B3.3 — fan-out reduce', () => {
   let concatRunId: string;
   let columnCount = 0;
   let rowsPerChild = 0;
+  let db: ReturnType<typeof tenantScopedPrisma>;
 
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
     stopQueueEvents = ctx.workerEvents.startQueueEventListeners();
 
-    const seededMean = await seedWorkflowVersion(ctx.db.prisma, reduceGraph('mean'), 'b33m');
+    const seededMean = await seedWorkflowVersion(ctx.db, reduceGraph('mean'), 'b33m');
     tenantId = seededMean.tenantId;
     workflowId = seededMean.workflowId;
-    meanRunId = await runToTerminal(ctx, seededMean.versionId);
+    db = tenantScopedPrisma(ctx.db, tenantId);
+    meanRunId = await runToTerminal(ctx, db, seededMean.versionId);
 
-    const seededConcat = await ctx.db.prisma.workflowVersion.create({
+    // WorkflowVersion isn't RLS-protected — a plain create is correct.
+    const seededConcat = await db.workflowVersion.create({
       data: {
         workflowId,
         version: 2,
@@ -92,15 +96,15 @@ describe('B3.3 — fan-out reduce', () => {
         topoOrder: {} as unknown as object,
       },
     });
-    concatRunId = await runToTerminal(ctx, seededConcat.id);
+    concatRunId = await runToTerminal(ctx, db, seededConcat.id);
 
-    const split = await ctx.db.prisma.nodeRun.findUnique({
+    const split = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: meanRunId, nodeKey: 'split' } },
       select: { output: true },
     });
     columnCount = ((split?.output as { columns?: unknown[] })?.columns ?? []).length;
 
-    const oneWork = await ctx.db.prisma.nodeRun.findFirst({
+    const oneWork = await db.nodeRun.findFirst({
       where: { run: { parentRunId: meanRunId }, nodeKey: 'work', status: 'SUCCEEDED' },
       select: { output: true },
     });
@@ -110,15 +114,15 @@ describe('B3.3 — fan-out reduce', () => {
   afterAll(async () => {
     stopQueueEvents?.();
     for (const rid of [meanRunId, concatRunId]) {
-      await ctx.db.prisma.runEvent.deleteMany({
+      await db.runEvent.deleteMany({
         where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } },
       });
-      await ctx.db.prisma.nodeRun.deleteMany({
+      await db.nodeRun.deleteMany({
         where: { run: { OR: [{ id: rid }, { parentRunId: rid }] } },
       });
-      await ctx.db.prisma.run.deleteMany({ where: { parentRunId: rid } });
+      await db.run.deleteMany({ where: { parentRunId: rid } });
     }
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
@@ -126,7 +130,7 @@ describe('B3.3 — fan-out reduce', () => {
     expect(columnCount).toBeGreaterThan(5);
     expect(rowsPerChild).toBeGreaterThan(0);
 
-    const map = await ctx.db.prisma.nodeRun.findUnique({
+    const map = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: meanRunId, nodeKey: 'map' } },
       select: { output: true },
     });
@@ -143,13 +147,13 @@ describe('B3.3 — fan-out reduce', () => {
   });
 
   it('mean mode computes a real aggregate over all children', async () => {
-    const parent = await ctx.db.prisma.run.findUnique({
+    const parent = await db.run.findUnique({
       where: { id: meanRunId },
       select: { status: true },
     });
     expect(parent?.status).toBe('SUCCEEDED');
 
-    const reduce = await ctx.db.prisma.nodeRun.findUnique({
+    const reduce = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: meanRunId, nodeKey: 'reduce' } },
     });
     expect(reduce?.status).toBe('SUCCEEDED');
@@ -161,7 +165,7 @@ describe('B3.3 — fan-out reduce', () => {
     });
 
     // downstream ran after the reduce
-    const merge = await ctx.db.prisma.nodeRun.findUnique({
+    const merge = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: meanRunId, nodeKey: 'merge' } },
       select: { status: true, attempt: true, startedAt: true },
     });
@@ -170,13 +174,13 @@ describe('B3.3 — fan-out reduce', () => {
   });
 
   it('concat mode flattens the children into one by-reference array', async () => {
-    const parent = await ctx.db.prisma.run.findUnique({
+    const parent = await db.run.findUnique({
       where: { id: concatRunId },
       select: { status: true },
     });
     expect(parent?.status).toBe('SUCCEEDED');
 
-    const reduce = await ctx.db.prisma.nodeRun.findUnique({
+    const reduce = await db.nodeRun.findUnique({
       where: { runId_nodeKey: { runId: concatRunId, nodeKey: 'reduce' } },
       select: { status: true, output: true },
     });

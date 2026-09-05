@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { prisma } from '@dag/db';
+import { prisma, withTenant } from '@dag/db';
 import type { Prisma } from '@dag/db';
 import { ioQueue, cpuQueue, connection } from '@dag/queue';
 import { startRun, onNodeSucceeded } from './services/orchestrator.service';
@@ -44,9 +44,9 @@ describe.skipIf(!CAN_RUN)('Phase 6 — Orchestrator (requires DB and Redis)', ()
     const tenant = await prisma.tenant.create({ data: { name: 'test-tenant' } });
     tenantId = tenant.id;
 
-    const workflow = await prisma.workflow.create({
-      data: { tenantId, name: 'Orchestrator Test' },
-    });
+    const workflow = await withTenant(tenantId, (tx) =>
+      tx.workflow.create({ data: { tenantId, name: 'Orchestrator Test' } }),
+    );
     workflowId = workflow.id;
 
     const version = await prisma.workflowVersion.create({
@@ -66,11 +66,13 @@ describe.skipIf(!CAN_RUN)('Phase 6 — Orchestrator (requires DB and Redis)', ()
 
   afterAll(async () => {
     // Clean up
-    await prisma.runEvent.deleteMany({ where: { runId } });
-    await prisma.nodeRun.deleteMany({ where: { runId } });
-    await prisma.run.deleteMany({ where: { workflowVersionId: versionId } });
+    await withTenant(tenantId, async (tx) => {
+      await tx.runEvent.deleteMany({ where: { runId } });
+      await tx.nodeRun.deleteMany({ where: { runId } });
+      await tx.run.deleteMany({ where: { workflowVersionId: versionId } });
+    });
     await prisma.workflowVersion.delete({ where: { id: versionId } });
-    await prisma.workflow.delete({ where: { id: workflowId } });
+    await withTenant(tenantId, (tx) => tx.workflow.delete({ where: { id: workflowId } }));
     await prisma.tenant.delete({ where: { id: tenantId } });
 
     await ioQueue.obliterate({ force: true }).catch(() => {});
@@ -89,7 +91,7 @@ describe.skipIf(!CAN_RUN)('Phase 6 — Orchestrator (requires DB and Redis)', ()
 
     expect(run.status).toBe('RUNNING');
 
-    const nodeRuns = await prisma.nodeRun.findMany({ where: { runId } });
+    const nodeRuns = await withTenant(tenantId, (tx) => tx.nodeRun.findMany({ where: { runId } }));
     
     // 5 nodes total
     expect(nodeRuns).toHaveLength(5);
@@ -115,28 +117,28 @@ describe.skipIf(!CAN_RUN)('Phase 6 — Orchestrator (requires DB and Redis)', ()
 
   it('hand-completing extract triggers exactly one new job (preprocess) in cpuQueue', async () => {
     // We mock the worker by manually transitioning 'extract' to RUNNING so it can SUCCEED
-    const extractRun = await prisma.nodeRun.findUnique({
-      where: { runId_nodeKey: { runId, nodeKey: 'extract' } }
-    });
-    
-    await prisma.nodeRun.update({
-      where: { id: extractRun!.id },
-      data: { status: 'RUNNING', workerId: 'test-worker' }
-    });
+    const extractRun = await withTenant(tenantId, (tx) =>
+      tx.nodeRun.findUnique({ where: { runId_nodeKey: { runId, nodeKey: 'extract' } } }),
+    );
+
+    await withTenant(tenantId, (tx) =>
+      tx.nodeRun.update({
+        where: { id: extractRun!.id },
+        data: { status: 'RUNNING', workerId: 'test-worker' },
+      }),
+    );
 
     // Fire the orchestrator success hook
-    await onNodeSucceeded(runId, 'extract', { rows: 100 });
+    await onNodeSucceeded(runId, 'extract', tenantId, { rows: 100 });
 
     // 'extract' should be SUCCEEDED
-    const updatedExtract = await prisma.nodeRun.findUnique({
-      where: { id: extractRun!.id }
-    });
+    const updatedExtract = await withTenant(tenantId, (tx) => tx.nodeRun.findUnique({ where: { id: extractRun!.id } }));
     expect(updatedExtract!.status).toBe('SUCCEEDED');
 
     // 'preprocess' should now be QUEUED
-    const preprocessRun = await prisma.nodeRun.findUnique({
-      where: { runId_nodeKey: { runId, nodeKey: 'preprocess' } }
-    });
+    const preprocessRun = await withTenant(tenantId, (tx) =>
+      tx.nodeRun.findUnique({ where: { runId_nodeKey: { runId, nodeKey: 'preprocess' } } }),
+    );
     expect(preprocessRun!.status).toBe('QUEUED');
 
     // Check BullMQ - exactly 1 job in cpuQueue

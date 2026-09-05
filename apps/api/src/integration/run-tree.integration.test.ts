@@ -23,16 +23,18 @@ describe('B3.1 — run tree', () => {
   beforeAll(async () => {
     ctx = await bootstrapTestEnv();
     svc = await import('../services/run.service');
-    const seeded = await seedWorkflowVersion(ctx.db.prisma, hermeticPipelineGraph(), 'b31');
+    const seeded = await seedWorkflowVersion(ctx.db, hermeticPipelineGraph(), 'b31');
     tenantId = seeded.tenantId;
     workflowId = seeded.workflowId;
     versionId = seeded.versionId;
 
     // A parent run with 5 children inserted out of order: fanOutIndex 3,0,4,1,2
     // with statuses SUCCEEDED×3, FAILED×1, RUNNING×1.
-    const parent = await ctx.db.prisma.run.create({
-      data: { workflowVersionId: versionId, triggeredBy: 'api', status: 'RUNNING' },
-    });
+    const parent = await ctx.db.withTenant(tenantId, (tx) =>
+      tx.run.create({
+        data: { workflowVersionId: versionId, tenantId, triggeredBy: 'api', status: 'RUNNING' },
+      }),
+    );
     parentId = parent.id;
 
     const spec: Array<{ i: number; status: 'SUCCEEDED' | 'FAILED' | 'RUNNING' }> = [
@@ -43,33 +45,40 @@ describe('B3.1 — run tree', () => {
       { i: 2, status: 'SUCCEEDED' },
     ];
     for (const s of spec) {
-      await ctx.db.prisma.run.create({
-        data: {
-          workflowVersionId: versionId,
-          triggeredBy: 'fanout',
-          parentRunId: parentId,
-          fanOutIndex: s.i,
-          status: s.status,
-        },
-      });
+      await ctx.db.withTenant(tenantId, (tx) =>
+        tx.run.create({
+          data: {
+            workflowVersionId: versionId,
+            tenantId,
+            triggeredBy: 'fanout',
+            parentRunId: parentId,
+            fanOutIndex: s.i,
+            status: s.status,
+          },
+        }),
+      );
     }
   }, 60_000);
 
   afterAll(async () => {
-    await ctx.db.prisma.run.deleteMany({ where: { parentRunId: parentId } });
-    await ctx.db.prisma.run.deleteMany({ where: { id: parentId } });
-    await cleanupWorkflow(ctx.db.prisma, tenantId, workflowId);
+    await ctx.db.withTenant(tenantId, async (tx) => {
+      await tx.run.deleteMany({ where: { parentRunId: parentId } });
+      await tx.run.deleteMany({ where: { id: parentId } });
+    });
+    await cleanupWorkflow(ctx.db, tenantId, workflowId);
     await teardownTestEnv(ctx);
   });
 
   it('reports an all-zero children summary for an ordinary run', async () => {
-    const plain = await ctx.db.createRun(versionId, 'api', ['extract']);
+    const plain = await ctx.db.createRun(versionId, tenantId, 'api', ['extract']);
     const detail = await svc.getRunService(plain.id, tenantId);
     expect(detail.children).toEqual({
       total: 0, pending: 0, running: 0, succeeded: 0, failed: 0, skipped: 0, cancelled: 0,
     });
-    await ctx.db.prisma.nodeRun.deleteMany({ where: { runId: plain.id } });
-    await ctx.db.prisma.run.delete({ where: { id: plain.id } });
+    await ctx.db.withTenant(tenantId, async (tx) => {
+      await tx.nodeRun.deleteMany({ where: { runId: plain.id } });
+      await tx.run.delete({ where: { id: plain.id } });
+    });
   });
 
   it('counts children per status with one groupBy', async () => {
