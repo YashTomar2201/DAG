@@ -1,0 +1,28 @@
+# Minimal RBAC for the wait-for-migrate initContainer in api.yaml / worker.yaml.
+# It runs `kubectl wait --for=condition=complete job/dag-migrate`, which needs
+# get/list/watch on Jobs in this namespace and nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dag-job-watcher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dag-job-watcher
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dag-job-watcher
+subjects:
+  - kind: ServiceAccount
+    name: dag-job-watcher
+roleRef:
+  kind: Role
+  name: dag-job-watcher
+  apiGroup: rbac.authorization.k8s.io

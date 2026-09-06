@@ -1,0 +1,44 @@
+# Host-based routing. The api serves its routes at the root (/workflows,
+# /runs, ...) and so does the web bundle — they can't share one host path, so
+# each gets its own hostname. `*.localtest.me` always resolves to 127.0.0.1,
+# so no /etc/hosts editing is needed on the host.
+#
+# Requires an ingress controller. On kind:
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+#   kubectl -n ingress-nginx wait --for=condition=ready pod \
+#     --selector=app.kubernetes.io/component=controller --timeout=180s
+#
+# Then reach the stack at http://web.dag.localtest.me:8080 and
+# http://api.dag.localtest.me:8080 (8080 = the hostPort mapped in
+# kind-cluster.yaml). Port-forwarding svc/api directly also works and is what
+# the README's smoke test uses.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dag
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" # SSE streams
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: web.dag.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: web
+                port:
+                  number: 80
+    - host: api.dag.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 3001

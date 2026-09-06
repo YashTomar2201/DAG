@@ -1,0 +1,42 @@
+# One-shot schema migration + dev seed, exactly like the compose `migrate`
+# service. Runs as the `dag` superuser (MIGRATE_DATABASE_URL) because it does
+# schema DDL and `CREATE ROLE dag_app` (the C2.1 migration). api/worker wait
+# for this Job to complete before starting (see the wait-for-migrate
+# initContainer in api.yaml / worker.yaml).
+#
+# Built from Dockerfile.api's `build` stage (tag dag-engine/migrate:local) —
+# that stage still has the Prisma CLI, a devDependency the runtime image
+# strips. See infra/k8s/README.md for the build command.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dag-migrate
+spec:
+  backoffLimit: 3
+  # Keep finished pods briefly for `kubectl logs`, then auto-clean.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: dag-migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: dag-engine/migrate:local
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - "pnpm --filter @dag/db run db:migrate:deploy && pnpm --filter @dag/db run db:seed"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dag-secrets
+                  key: MIGRATE_DATABASE_URL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              memory: 512Mi

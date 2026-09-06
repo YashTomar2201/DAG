@@ -1,0 +1,66 @@
+# Data plane. Fixed replicas: 2 (roadmap C3.1 — "No autoscaling yet";
+# KEDA arrives in C3.3). Pod anti-affinity is `preferred` (not `required`)
+# so on a single-node cluster both replicas still schedule — on a multi-node
+# cluster they spread across nodes, which with S3 artifacts lets a node
+# running `preprocess` and a different node running `train` read each other's
+# outputs.
+#
+# terminationGracePeriodSeconds: 120 — worker.close() on SIGTERM stops
+# accepting new jobs and lets in-flight ones finish. C3.2 tunes this to sit
+# above the longest node timeout and adds a real worker readiness probe;
+# 120s is a safe interim for the reference pipeline.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      serviceAccountName: dag-job-watcher
+      terminationGracePeriodSeconds: 120
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: worker
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        - name: wait-for-migrate
+          image: bitnami/kubectl:1.31
+          command: ["kubectl", "wait", "--for=condition=complete", "job/dag-migrate", "--timeout=300s"]
+      containers:
+        - name: worker
+          image: dag-engine/worker:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: dag-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dag-secrets
+                  key: DATABASE_URL
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+          resources:
+            requests:
+              cpu: 150m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: dag-artifacts

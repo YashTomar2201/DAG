@@ -1,0 +1,32 @@
+# Single-node kind cluster for local C3.1 testing on a memory-constrained box
+# (the full stack — postgres + redis + api + 2 workers + web — fits in ~2 GB
+# with the trimmed resource requests in these manifests).
+#
+#   kind create cluster --name dag-engine --config infra/k8s/kind-cluster.yaml
+#
+# kind does not taint its control-plane node, so a single node schedules
+# workloads fine. The node is labelled ingress-ready and maps host ports
+# 8080/8443 so an optional ingress-nginx install can receive host traffic
+# (see README.md).
+#
+# For a genuine multi-node run (roadmap's "workers on different nodes"), use
+# kind-cluster-multinode.yaml instead and switch artifacts to S3 — see
+# README.md's "Multi-node / S3" section. That needs ~8 GB free for Docker.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: dag-engine
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP

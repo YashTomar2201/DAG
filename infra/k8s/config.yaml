@@ -1,0 +1,25 @@
+# Non-secret runtime configuration shared by api + worker.
+#
+# The single-node base uses the `fs` artifact backend against one shared
+# ReadWriteOnce PVC (artifacts.yaml), mounted into both api and worker — every
+# pod is on the same node, so RWO is fine and kind's local-path provisioner
+# grants it without complaint.
+#
+# For a multi-node cluster the api and workers land on different hosts with no
+# shared disk — switch to `ARTIFACT_BACKEND: s3` against the in-cluster MinIO
+# (minio.yaml) as described in README.md's "Multi-node / S3" section. That is
+# also the shape a real cloud deployment uses.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dag-config
+data:
+  REDIS_URL: "redis://redis:6379"
+  API_PORT: "3001"
+  NODE_ENV: "production"
+  ARTIFACT_DIR: "/data/artifacts"
+  ARTIFACT_BACKEND: "fs"
+  # Per-queue worker concurrency (apps/worker/src/worker.ts reads these).
+  IO_CONCURRENCY: "8"
+  CPU_CONCURRENCY: "4"
+  GPU_CONCURRENCY: "1"

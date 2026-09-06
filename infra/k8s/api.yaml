@@ -1,0 +1,85 @@
+# Control plane. Single replica for C3.1 (the orchestrator's QueueEvents
+# consumer and the scheduler worker are safe to run singly; multi-replica
+# api is a later concern). C3.2 splits /health into /health/live +
+# /health/ready with a real Postgres+Redis reachability check — for now the
+# existing always-200 /health backs both probes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector:
+    app: api
+  ports:
+    - port: 3001
+      targetPort: 3001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+    spec:
+      serviceAccountName: dag-job-watcher
+      initContainers:
+        - name: wait-for-migrate
+          image: bitnami/kubectl:1.31
+          command: ["kubectl", "wait", "--for=condition=complete", "job/dag-migrate", "--timeout=300s"]
+      containers:
+        - name: api
+          image: dag-engine/api:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3001
+          envFrom:
+            - configMapRef:
+                name: dag-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: dag-secrets
+                  key: DATABASE_URL
+            - name: METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: dag-secrets
+                  key: METRICS_TOKEN
+            - name: EVENTS_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: dag-secrets
+                  key: EVENTS_TOKEN_SECRET
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 160Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: dag-artifacts

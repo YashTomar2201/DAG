@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Everything lands in the dag-engine namespace.
+namespace: dag-engine
+
+# Single-node base. For the multi-node / S3 path, add minio.yaml here and
+# apply the config + api/worker patches from README.md's "Multi-node / S3"
+# section (mirrors how docker-compose.s3.yml overlays the compose base).
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - config.yaml
+  - secret.yaml
+  - artifacts.yaml
+  - postgres.yaml
+  - redis.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - web.yaml
+  - ingress.yaml
+
+# A plain metadata label on every resource — not folded into selectors
+# (keeps Deployment/StatefulSet selectors, which are immutable, minimal).
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: dag-engine
+    includeSelectors: false

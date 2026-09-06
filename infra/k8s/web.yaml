@@ -1,0 +1,47 @@
+# The static editor bundle (nginx). VITE_API_URL / VITE_API_KEY are baked in
+# at image BUILD time (see Dockerfile.web) — the k8s image must be built with
+# --build-arg VITE_API_URL=http://api.dag.localtest.me:8080 so the browser
+# hits the api through the ingress. See infra/k8s/README.md.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: dag-engine/web:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

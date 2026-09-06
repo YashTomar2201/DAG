@@ -1,0 +1,31 @@
+# 3-node kind cluster (1 control-plane + 2 workers) for a genuine multi-node
+# run — the roadmap C3.1 "workers on different nodes" acceptance check. Needs
+# ~8 GB free for Docker Desktop; on a smaller box use kind-cluster.yaml
+# (single node) instead.
+#
+#   kind create cluster --name dag-engine --config infra/k8s/kind-cluster-multinode.yaml
+#
+# With more than one node the api pod and worker pods land on different hosts
+# with no shared disk, so you MUST switch artifacts to S3/MinIO — see
+# README.md's "Multi-node / S3" section (apply minio.yaml and the config
+# patch there). The single-node base uses a shared PVC and the fs backend.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: dag-engine
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+  - role: worker
+  - role: worker

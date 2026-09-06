@@ -1,0 +1,18 @@
+# Shared artifact volume for the single-node base. Every pod (api + both
+# worker replicas) runs on the one node, so a ReadWriteOnce PVC mounted into
+# all of them behaves exactly like the compose stack's shared `artifact_data`
+# volume — `preprocess` on one worker writes a file that `train` on the other
+# worker reads at the same path.
+#
+# This is the piece that does NOT survive going multi-node: RWO can't be
+# mounted by pods on different nodes. The multi-node path drops this PVC and
+# switches to S3/MinIO (README.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dag-artifacts
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
