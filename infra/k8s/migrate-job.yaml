@@ -12,7 +12,7 @@ kind: Job
 metadata:
   name: dag-migrate
 spec:
-  backoffLimit: 3
+  backoffLimit: 6
   # Keep finished pods briefly for `kubectl logs`, then auto-clean.
   ttlSecondsAfterFinished: 600
   template:
@@ -21,6 +21,17 @@ spec:
         app: dag-migrate
     spec:
       restartPolicy: Never
+      initContainers:
+        # Postgres and this Job are created together on `kubectl apply`; on a
+        # fresh node the postgres image pull + initdb can take longer than the
+        # Job's backoff budget. Block here until the DB actually answers rather
+        # than burning retries.
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - 'until pg_isready -h postgres -U dag -d dag_engine; do echo "waiting for postgres..."; sleep 3; done'
       containers:
         - name: migrate
           image: dag-engine/migrate:local

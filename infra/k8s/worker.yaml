@@ -36,7 +36,9 @@ spec:
                 topologyKey: kubernetes.io/hostname
       initContainers:
         - name: wait-for-migrate
-          image: bitnami/kubectl:1.31
+          # Official Kubernetes-published kubectl image (registry.k8s.io) —
+          # not bitnami/*, whose free Docker Hub images were deprecated in 2025.
+          image: registry.k8s.io/kubectl:v1.31.0
           command: ["kubectl", "wait", "--for=condition=complete", "job/dag-migrate", "--timeout=300s"]
       containers:
         - name: worker
