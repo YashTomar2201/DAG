@@ -30,6 +30,8 @@ export {
   listWorkflowVersions,
   renameWorkflow,
   softDeleteWorkflow,
+  // Server-backed run history (D2)
+  listWorkflowRuns,
   // Run lifecycle
   createRun,
   findRunByIdempotencyKey,
@@ -89,5 +91,5 @@ export type {
   Schedule,
   Trigger,
 } from './repositories';
-export type { WorkflowListRow, ChildRunSummary } from './repositories';
+export type { WorkflowListRow, ChildRunSummary, WorkflowRunRow } from './repositories';
 export type { Prisma } from './generated/client';

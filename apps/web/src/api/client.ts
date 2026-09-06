@@ -290,16 +290,34 @@ export async function getRun(runId: string): Promise<RunSummary> {
   return request<RunSummary>(`/runs/${runId}`);
 }
 
+/** One row of server-backed run history — GET /workflows/:id/runs (roadmap D2). */
+export interface WorkflowRunRow {
+  id: string;
+  workflowVersionId: string;
+  version: number;
+  status: string;
+  triggeredBy: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** Per-status NodeRun counts (`total` is always present). */
+  nodeCounts: Record<string, number>;
+}
+
 /**
- * Lists past runs for the Run History panel.
- * NOTE: There is no GET /workflows/:id/runs route on the API.
- * We work around this by fetching individual runs via the run store,
- * which already tracks runs from SSE events. This function is kept for
- * future use if a list endpoint is added; the RunHistory component
- * is updated to use the Zustand run store directly instead.
+ * Server-backed run history for a workflow (roadmap D2). Top-level runs,
+ * newest-first, cursor-paginated, optional status filter. Reload-safe — the
+ * list comes from Postgres, not from whatever this tab happened to observe.
  */
-export async function getRuns(runIds: string[]): Promise<RunSummary[]> {
-  return Promise.all(runIds.map((id) => getRun(id)));
+export async function getWorkflowRuns(
+  workflowId: string,
+  opts: { limit?: number; cursor?: string; status?: string } = {},
+): Promise<{ runs: WorkflowRunRow[]; nextCursor: string | null }> {
+  const p = new URLSearchParams();
+  if (opts.limit) p.set('limit', String(opts.limit));
+  if (opts.cursor) p.set('cursor', opts.cursor);
+  if (opts.status) p.set('status', opts.status);
+  const qs = p.toString();
+  return request(`/workflows/${workflowId}/runs${qs ? `?${qs}` : ''}`);
 }
 
 export async function retryFailed(runId: string): Promise<unknown> {

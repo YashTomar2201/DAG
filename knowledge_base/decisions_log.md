@@ -1616,3 +1616,45 @@ wiring is `kubectl kustomize`-validated and structurally simple; C3.1 already
 proved `kubectl apply -k` brings the stack up. Re-running the full k8s bring-up
 just to watch the same health responses through a probe instead of a curl was
 not worth another hour of fighting Docker on this hardware.
+
+---
+
+## Roadmap D2 — Server-Backed Run History
+
+### Decision: Order by `startedAt`, Don't Add a `Run.createdAt`
+
+**Why:** `Run` has never had a `createdAt` — `RunHistory.tsx` even carried a
+comment noting it. The tempting fix for "newest-first" is to add one, but that
+is a schema change + a backfill for every existing run, for a column whose only
+consumer is this list ordering. `startedAt` is set within milliseconds of a run
+being created (`startRun` transitions `PENDING → RUNNING` immediately), so
+ordering by `startedAt desc, id desc` is "newest first" for every run that has
+actually begun — and a run that is still `PENDING` with a null `startedAt`
+(Prisma sorts those last on `desc`) is a sub-second transient nobody is
+paginating through. The roadmap's own step names the index as
+`[workflowVersionId, startedAt]`, i.e. it expects `startedAt` to be the sort
+key.
+
+### Decision: Exclude Fan-Out Children (`parentRunId: null`) from the History List
+
+**Why:** A `flow.map` node spawns one child `Run` per input element — a single
+"logical" run of a fan-out workflow can be 500 rows in the `Run` table. Showing
+all of them flat in Run History would bury the actual top-level runs and make
+"page past 50" meaningless. The children are already reachable through the
+run drill-in (`GET /runs/:id/children`, the `FanOutPanel`), so the history list
+filters to `parentRunId: null` — one row per user-initiated run.
+
+### Decision: The Zustand `runSlice` Becomes a Live Overlay, Not the Source
+
+**Why:** Before D2 the store *was* the run history — which is why a reload
+emptied it. It can't just be deleted, though: it still carries the one thing
+the server list can't give you cheaply — the *live* status of the run this tab
+is currently watching over SSE, updated per event. So D2 inverts the
+relationship: the server list (`GET /workflows/:id/runs`) is the base, and
+`RunHistory` merges the store's entries on top by run id — the store wins for
+any run it knows about (live status), and a run the store has but the last
+fetch didn't (started seconds ago) is prepended. When a live run reaches a
+terminal state the component refetches the list once, so the persisted row
+picks up its final `nodeCounts` (which a freshly-created store entry doesn't
+have). This keeps the "it updates in real time" feel while making reload-safety
+free.

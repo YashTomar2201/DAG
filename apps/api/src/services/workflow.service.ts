@@ -9,10 +9,12 @@ import {
   getWorkflowWithVersions,
   getWorkflowVersion,
   listWorkflowVersions,
+  listWorkflowRuns,
   renameWorkflow,
   softDeleteWorkflow,
   workflowBelongsToTenant,
 } from '@dag/db';
+import type { RunStatus } from '@dag/contracts';
 import { CycleError, NotFoundError } from '../errors';
 
 // ─── Schema helpers ───────────────────────────────────────────────────────────
@@ -88,6 +90,20 @@ export async function listWorkflowVersionsService(id: string, tenantId: string) 
   const versions = await listWorkflowVersions(id, tenantId);
   if (versions === null) throw new NotFoundError('Workflow', id);
   return versions;
+}
+
+/**
+ * Server-backed run history for a workflow (roadmap D2). 404 if the workflow
+ * is missing / soft-deleted / not this tenant's. `status` optionally filters.
+ */
+export async function listWorkflowRunsService(
+  id: string,
+  tenantId: string,
+  opts: { limit?: number; cursor?: string; status?: RunStatus } = {},
+) {
+  if (!(await workflowBelongsToTenant(id, tenantId))) throw new NotFoundError('Workflow', id);
+  const limit = Math.min(Math.max(opts.limit ?? DEFAULT_LIST_LIMIT, 1), MAX_LIST_LIMIT);
+  return listWorkflowRuns(id, tenantId, { limit, cursor: opts.cursor, status: opts.status });
 }
 
 /** One full version (graph + topoOrder). 404 if it doesn't belong to the workflow/tenant. */

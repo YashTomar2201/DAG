@@ -94,6 +94,53 @@ describe('D1.1 — Workflow CRUD', () => {
     expect(second.nextCursor).toBeNull();
   });
 
+  it('D2 — lists a workflow\'s runs newest-first with counts, paginated, filterable', async () => {
+    const bravo = ids[1]!;
+    const version = await ctx.db.withTenant(tenantId, (tx) =>
+      tx.workflowVersion.findFirst({ where: { workflowId: bravo }, select: { id: true } }),
+    );
+    const vId = version!.id;
+
+    // bravo already has runIdForWf2 (started, no explicit status). Add a
+    // SUCCEEDED one and a FAILED one, strictly later.
+    const mk = async (status: 'SUCCEEDED' | 'FAILED') => {
+      await new Promise((r) => setTimeout(r, 8));
+      const run = await ctx.db.createRun(vId, tenantId, 'api', ['extract', 'preprocess']);
+      await ctx.db.withTenant(tenantId, (tx) =>
+        tx.run.update({ where: { id: run.id }, data: { status, startedAt: new Date() } }),
+      );
+      // one SUCCEEDED NodeRun so nodeCounts is non-trivial
+      await ctx.db.withTenant(tenantId, (tx) =>
+        tx.nodeRun.updateMany({ where: { runId: run.id, nodeKey: 'extract' }, data: { status: 'SUCCEEDED' } }),
+      );
+      return run.id;
+    };
+    const okId = await mk('SUCCEEDED');
+    const failId = await mk('FAILED');
+
+    const all = await wfService.listWorkflowRunsService(bravo, tenantId);
+    // newest first: failId, okId, runIdForWf2
+    expect(all.runs.map((r) => r.id)).toEqual([failId, okId, runIdForWf2]);
+    expect(all.runs[0]!.version).toBe(1);
+    expect(all.runs.find((r) => r.id === okId)!.nodeCounts['SUCCEEDED']).toBe(1);
+    expect(all.nextCursor).toBeNull();
+
+    // status filter
+    const failed = await wfService.listWorkflowRunsService(bravo, tenantId, { status: 'FAILED' });
+    expect(failed.runs.map((r) => r.id)).toEqual([failId]);
+
+    // pagination
+    const p1 = await wfService.listWorkflowRunsService(bravo, tenantId, { limit: 2 });
+    expect(p1.runs.map((r) => r.id)).toEqual([failId, okId]);
+    expect(p1.nextCursor).not.toBeNull();
+    const p2 = await wfService.listWorkflowRunsService(bravo, tenantId, { limit: 2, cursor: p1.nextCursor! });
+    expect(p2.runs.map((r) => r.id)).toEqual([runIdForWf2]);
+    expect(p2.nextCursor).toBeNull();
+
+    // cross-tenant → 404
+    await expect(wfService.listWorkflowRunsService(bravo, 'someone-else')).rejects.toThrow();
+  });
+
   it('rename changes the name without creating a version', async () => {
     const updated = await wfService.renameWorkflowService(ids[0]!, tenantId, 'alpha-renamed');
     expect(updated.name).toBe('alpha-renamed');

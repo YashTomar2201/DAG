@@ -219,6 +219,85 @@ export async function listWorkflowVersions(id: string, tenantId: string) {
   });
 }
 
+export interface WorkflowRunRow {
+  id: string;
+  workflowVersionId: string;
+  version: number;
+  status: string;
+  triggeredBy: string;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+  /** Per-status NodeRun counts for this run (0-filled). */
+  nodeCounts: Record<string, number>;
+}
+
+/**
+ * Server-backed run history (roadmap D2). A workflow's top-level runs
+ * (fan-out children excluded — they're reachable via the run drill-in),
+ * newest-first, cursor-paginated, optionally filtered by status. One
+ * `groupBy` for the node counts instead of an N+1.
+ */
+export async function listWorkflowRuns(
+  workflowId: string,
+  tenantId: string,
+  opts: { limit: number; cursor?: string; status?: RunStatus },
+): Promise<{ runs: WorkflowRunRow[]; nextCursor: string | null }> {
+  return withTenant(tenantId, async (tx) => {
+    const rows = await tx.run.findMany({
+      where: {
+        parentRunId: null,
+        workflowVersion: { workflowId },
+        ...(opts.status ? { status: opts.status } : {}),
+      },
+      orderBy: [{ startedAt: 'desc' }, { id: 'desc' }],
+      take: opts.limit + 1,
+      ...(opts.cursor ? { cursor: { id: opts.cursor }, skip: 1 } : {}),
+      select: {
+        id: true,
+        workflowVersionId: true,
+        status: true,
+        triggeredBy: true,
+        startedAt: true,
+        finishedAt: true,
+        workflowVersion: { select: { version: true } },
+      },
+    });
+
+    const hasMore = rows.length > opts.limit;
+    const page = hasMore ? rows.slice(0, opts.limit) : rows;
+    const runIds = page.map((r) => r.id);
+
+    const grouped = runIds.length
+      ? await tx.nodeRun.groupBy({
+          by: ['runId', 'status'],
+          where: { runId: { in: runIds } },
+          _count: { _all: true },
+        })
+      : [];
+    const counts = new Map<string, Record<string, number>>();
+    for (const g of grouped) {
+      const m = counts.get(g.runId) ?? {};
+      m[g.status] = g._count._all;
+      m['total'] = (m['total'] ?? 0) + g._count._all;
+      counts.set(g.runId, m);
+    }
+
+    return {
+      runs: page.map((r) => ({
+        id: r.id,
+        workflowVersionId: r.workflowVersionId,
+        version: r.workflowVersion.version,
+        status: r.status,
+        triggeredBy: r.triggeredBy,
+        startedAt: r.startedAt,
+        finishedAt: r.finishedAt,
+        nodeCounts: counts.get(r.id) ?? { total: 0 },
+      })),
+      nextCursor: hasMore ? page[page.length - 1]!.id : null,
+    };
+  });
+}
+
 /**
  * Renames a workflow. Returns the updated row, or null if it doesn't exist
  * for this tenant (or is soft-deleted).

@@ -5,6 +5,59 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-06 — D2: server-backed run history
+
+**Phase:** roadmap D2. `RunHistory` reconstructed its list from whatever runs
+the current browser tab happened to observe over SSE — reload the page and the
+history was empty, even though every run was sitting in Postgres.
+
+### Changes
+
+- **`packages/db/prisma/schema.prisma`** + migration
+  `20260906015215_d2_workflow_runs_index` — `@@index([workflowVersionId, startedAt])`
+  on `Run` for the "list a workflow's runs newest-first" query.
+- **`packages/db/src/repositories.ts`** — `listWorkflowRuns(workflowId,
+  tenantId, { limit, cursor, status? })`: top-level runs only (`parentRunId:
+  null` — fan-out children are reachable via the run drill-in), newest-first
+  (`startedAt desc, id desc`), cursor-paginated, optional status filter. Node
+  counts come from **one** `groupBy(['runId','status'])` folded in memory, not
+  an N+1. Returns each row's `version` number too, so the UI can show which
+  version a run used without a separate lookup.
+- **`apps/api/src/services/workflow.service.ts`** — `listWorkflowRunsService`
+  (404 via `workflowBelongsToTenant` if the workflow is missing / soft-deleted
+  / another tenant's; clamps `limit` to 1–100).
+- **`apps/api/src/routes/workflow.routes.ts`** — `GET /workflows/:id/runs?limit=&cursor=&status=`
+  (`status` validated against `RunStatusSchema`). Response
+  `{ runs: [...], nextCursor }`.
+- **`apps/web/src/api/client.ts`** — `WorkflowRunRow` + `getWorkflowRuns()`;
+  removed the dead `getRuns()` workaround and its "there is no such endpoint"
+  comment.
+- **`apps/web/src/components/RunHistory.tsx`** — fetches
+  `GET /workflows/:id/runs` on panel open / workflow change / filter change;
+  the Zustand `runSlice` is now a *live overlay* on top of the server list
+  (a run started in this tab keeps its status fresh over SSE; brand-new runs
+  appear immediately; when a live run goes terminal the list refetches so the
+  persisted row picks up its final node counts). New: a status-filter
+  `<select>` and a "Load more" pager. Stale top-of-file NOTE removed.
+
+### Verification
+
+- New case in `workflow-crud.integration.test.ts`: three runs on one workflow
+  (started / SUCCEEDED / FAILED) → `listWorkflowRunsService` returns them
+  newest-first with `version` and non-trivial `nodeCounts`; `?status=FAILED`
+  narrows to one; `limit: 2` + cursor pages `[fail, ok] → [started]`;
+  cross-tenant → 404.
+- Browser, against a locally-run api/worker + the real DB: opened a workflow
+  with 3 prior `curl`-created runs → Run History listed all 3 (server-fetched,
+  each showing `v1`, `2/2 nodes`, `SUCCEEDED`). **Reloaded the page → the 3
+  runs were still there** (pre-D2 this was empty after reload). Status filter
+  `FAILED` → "No failed runs", `SUCCEEDED` → 3. Started a new run → it appeared
+  at the top as `SUCCEEDED · live` and, once terminal, the list refetched and
+  showed its `2/2 nodes`. No console errors.
+- `pnpm -r typecheck` / `lint` / unit (48 api, 15 web, …) green.
+
+---
+
 ## 2026-09-06 — C3.2: health probes + graceful shutdown
 
 **Phase:** roadmap C3.2 — do this *before* autoscaling (C3.3), or a scale-down

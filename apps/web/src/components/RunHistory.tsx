@@ -1,18 +1,17 @@
 /**
  * Run History Panel.
- * Displays a list of past runs for the active workflow and a Gantt chart for the selected run.
+ * Lists a workflow's past runs and shows a Gantt chart for the selected one.
  *
- * NOTE: There is no GET /workflows/:id/runs endpoint on the API.
- * Runs are tracked in the Zustand runSlice as they are created — each call to
- * handleRun in App.tsx pushes the new RunRecord into the store via setRuns.
- * For the Gantt chart we fetch the full run (with nodeRuns) from GET /runs/:id
- * only when the user clicks to expand a run row.
+ * The list is server-backed (roadmap D2): GET /workflows/:id/runs, so a page
+ * reload still shows every past run. The Zustand runSlice is layered on top as
+ * a live-update cache — the run started in this tab keeps its status fresh over
+ * SSE while it's in flight, and brand-new runs appear immediately.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useRunStore } from '../store/runSlice';
 import { useGraphStore } from '../store/graphSlice';
-import { getRun, retryFailed, type RunSummary } from '../api/client';
+import { getRun, getWorkflowRuns, retryFailed, type RunSummary, type WorkflowRunRow } from '../api/client';
 import { GanttChart } from './GanttChart';
 import { IconHistory, IconClose, IconRetry } from './icons';
 
@@ -23,11 +22,22 @@ const STATUS_COLOR: Record<string, string> = {
   CANCELLED: 'var(--color-muted-soft)',
 };
 
-/** The Run row has no `createdAt` column — fall back through the timestamps we do get. */
+const STATUS_FILTERS = ['', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED'] as const;
+const PAGE_SIZE = 25;
+
 function formatRunTime(ts: string | null | undefined): string {
   if (!ts) return 'Just now';
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? 'Just now' : d.toLocaleString();
+}
+
+interface DisplayRun {
+  id: string;
+  workflowVersionId: string;
+  status: string;
+  startedAt: string | null;
+  version?: number;
+  nodeCounts?: Record<string, number>;
 }
 
 export function RunHistory({ workflowId }: { workflowId: string | null }) {
@@ -35,48 +45,109 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
   const [selectedRun, setSelectedRun] = useState<RunSummary | null>(null);
   const [loadingRunId, setLoadingRunId] = useState<string | null>(null);
 
+  const [fetched, setFetched] = useState<WorkflowRunRow[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<string>('');
+  const [loadingList, setLoadingList] = useState(false);
+
   const runs = useRunStore(s => s.runs);
   const upsertRun = useRunStore(s => s.upsertRun);
   const activeRunId = useRunStore(s => s.activeRunId);
+  const runStatus = useRunStore(s => s.runStatus);
 
-  // Map of node key → human label, so the Gantt chart can show "Train model"
-  // instead of the opaque "node-3".
   const nodeLabels = useGraphStore(s =>
     Object.fromEntries(s.nodes.map(n => [n.id, n.data.label])),
   );
-
-  // versionId → "v3", so each run row can show which version it ran (D1.3).
   const versionLabel = useGraphStore(s =>
     Object.fromEntries(s.versions.map(v => [v.id, `v${v.version}`])),
   );
 
-  // When a new active run ends (status becomes terminal), refresh its full detail
-  // so the Gantt chart shows timing even for the just-completed run.
-  const runStatus = useRunStore(s => s.runStatus);
+  // ── Fetch the server-backed list on open / workflow change / filter change ──
+  const refreshList = () => {
+    if (!workflowId) return;
+    setLoadingList(true);
+    getWorkflowRuns(workflowId, { limit: PAGE_SIZE, status: statusFilter || undefined })
+      .then(r => { setFetched(r.runs); setCursor(r.nextCursor); })
+      .catch(err => console.error('Failed to load run history:', err))
+      .finally(() => setLoadingList(false));
+  };
+
+  // refreshList reads workflowId + statusFilter (the deps); getWorkflowRuns is stable.
+  useEffect(() => {
+    if (isOpen && workflowId) refreshList();
+  }, [isOpen, workflowId, statusFilter]);
+
+  const loadMore = async () => {
+    if (!workflowId || !cursor) return;
+    setLoadingList(true);
+    try {
+      const r = await getWorkflowRuns(workflowId, {
+        limit: PAGE_SIZE,
+        cursor,
+        status: statusFilter || undefined,
+      });
+      setFetched(prev => [...prev, ...r.runs]);
+      setCursor(r.nextCursor);
+    } catch (err) {
+      console.error('Failed to load more runs:', err);
+    } finally {
+      setLoadingList(false);
+    }
+  };
+
+  // When the active run reaches a terminal state, pull its full detail for the
+  // Gantt chart AND refetch the list so the persisted row shows final counts.
   useEffect(() => {
     if (activeRunId && (runStatus === 'SUCCEEDED' || runStatus === 'FAILED' || runStatus === 'CANCELLED')) {
       getRun(activeRunId).then((fullRun) => {
-        // Replace the RunRecord in the store with the full RunSummary (in place,
-        // reading current store state — not a stale closure over `runs`).
         upsertRun(fullRun as unknown as (typeof runs)[number]);
         setSelectedRun(prev => (prev?.id === activeRunId ? fullRun : prev));
+        if (isOpen) refreshList();
       }).catch(console.error);
     }
-    // getRun / upsertRun / setSelectedRun are stable; run status + id are the real triggers.
+    // getRun / upsertRun are stable; runStatus + activeRunId are the real triggers.
   }, [runStatus, activeRunId]);
 
+  // ── Merge: server rows + live Zustand overlay ──────────────────────────────
+  const displayRuns = useMemo<DisplayRun[]>(() => {
+    const map = new Map<string, DisplayRun>();
+    for (const r of fetched) {
+      map.set(r.id, {
+        id: r.id,
+        workflowVersionId: r.workflowVersionId,
+        status: r.status,
+        startedAt: r.startedAt,
+        version: r.version,
+        nodeCounts: r.nodeCounts,
+      });
+    }
+    for (const r of runs) {
+      if (statusFilter && r.status !== statusFilter) {
+        map.delete(r.id);
+        continue;
+      }
+      const existing = map.get(r.id);
+      map.set(r.id, {
+        id: r.id,
+        workflowVersionId: r.workflowVersionId,
+        status: r.status,
+        startedAt: r.startedAt ?? r.createdAt ?? null,
+        version: existing?.version,
+        nodeCounts: existing?.nodeCounts,
+      });
+    }
+    return [...map.values()].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+  }, [fetched, runs, statusFilter]);
+
   async function handleSelectRun(runId: string) {
-    // If we already have full data (with nodeRuns), just show it
     const existing = runs.find(r => r.id === runId) as RunSummary | undefined;
     if (existing && 'nodeRuns' in existing && existing.nodeRuns) {
       setSelectedRun(existing);
       return;
     }
-    // Otherwise fetch the full run detail
     setLoadingRunId(runId);
     try {
-      const full = await getRun(runId);
-      setSelectedRun(full);
+      setSelectedRun(await getRun(runId));
     } catch (e) {
       console.error('Failed to load run detail:', e);
     } finally {
@@ -133,9 +204,28 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
           <IconHistory size={16} />
           Run history
         </span>
-        <button className="btn-ghost" onClick={() => setIsOpen(false)} aria-label="Close">
-          <IconClose size={15} />
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            aria-label="Filter by status"
+            style={{
+              fontSize: 11,
+              padding: '4px 6px',
+              borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--color-hairline)',
+              background: 'var(--color-canvas)',
+              color: 'var(--color-ink)',
+            }}
+          >
+            {STATUS_FILTERS.map(s => (
+              <option key={s || 'all'} value={s}>{s || 'All statuses'}</option>
+            ))}
+          </select>
+          <button className="btn-ghost" onClick={() => setIsOpen(false)} aria-label="Close">
+            <IconClose size={15} />
+          </button>
+        </div>
       </div>
 
       <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
@@ -143,14 +233,21 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
           <div className="body-md" style={{ color: 'var(--color-muted)', textAlign: 'center', padding: 32 }}>
             Save the workflow first to see runs.
           </div>
-        ) : runs.length === 0 ? (
+        ) : displayRuns.length === 0 ? (
           <div className="body-md" style={{ color: 'var(--color-muted)', textAlign: 'center', padding: 32 }}>
-            No runs yet. Hit <strong>Run pipeline</strong> to start one.
+            {loadingList
+              ? 'Loading…'
+              : statusFilter
+                ? `No ${statusFilter.toLowerCase()} runs.`
+                : <>No runs yet. Hit <strong>Run pipeline</strong> to start one.</>}
           </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* `runs` is stored newest-first (addRun prepends), so render as-is. */}
-            {runs.map(run => (
+            {displayRuns.map(run => {
+              const total = run.nodeCounts?.total ?? 0;
+              const succeeded = run.nodeCounts?.SUCCEEDED ?? 0;
+              const versionText = run.version != null ? `v${run.version}` : versionLabel[run.workflowVersionId];
+              return (
               <div
                 key={run.id}
                 style={{
@@ -176,10 +273,15 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                   <span className="body-sm" style={{ color: 'var(--color-ink)', fontWeight: 500, display: 'flex', alignItems: 'baseline', gap: 8 }}>
-                    {formatRunTime(run.startedAt ?? run.createdAt)}
-                    {versionLabel[run.workflowVersionId] && (
+                    {formatRunTime(run.startedAt)}
+                    {versionText && (
                       <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--color-muted-soft)', letterSpacing: '0.03em' }}>
-                        {versionLabel[run.workflowVersionId]}
+                        {versionText}
+                      </span>
+                    )}
+                    {total > 0 && (
+                      <span style={{ fontSize: 10, color: 'var(--color-muted-soft)' }}>
+                        {succeeded}/{total} nodes
                       </span>
                     )}
                   </span>
@@ -213,7 +315,6 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
                             onClick={async (e) => {
                               e.stopPropagation();
                               await retryFailed(run.id);
-                              // Refresh run detail after retry
                               const updated = await getRun(run.id);
                               setSelectedRun(updated);
                             }}
@@ -233,7 +334,19 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
                   </div>
                 )}
               </div>
-            ))}
+              );
+            })}
+
+            {cursor && (
+              <button
+                className="btn-secondary"
+                onClick={loadMore}
+                disabled={loadingList}
+                style={{ fontSize: 12, height: 34 }}
+              >
+                {loadingList ? 'Loading…' : 'Load more'}
+              </button>
+            )}
           </div>
         )}
       </div>

@@ -199,6 +199,9 @@ model Run {
   /// Hot query for the fan-out join: "how many children of X are still running?"
   @@index([parentRunId, status])
   @@index([tenantId])
+  /// Server-backed run history (roadmap D2): list a workflow's runs
+  /// newest-first, paginated.
+  @@index([workflowVersionId, startedAt])
 }
 
 /// One execution of one node inside a Run. This is the atomic unit of work

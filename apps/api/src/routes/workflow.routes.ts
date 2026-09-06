@@ -9,10 +9,12 @@ import {
   listWorkflowsService,
   getWorkflowService,
   listWorkflowVersionsService,
+  listWorkflowRunsService,
   getWorkflowVersionService,
   renameWorkflowService,
   deleteWorkflowService,
 } from '../services/workflow.service';
+import { RunStatusSchema } from '@dag/contracts';
 import { logger } from '../logger';
 
 export const workflowRouter: ExpressRouter = Router();
@@ -39,6 +41,12 @@ const RenameWorkflowBody = z.object({
 const ListWorkflowsQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).optional(),
   cursor: z.string().min(1).optional(),
+});
+
+const ListWorkflowRunsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional(),
+  cursor: z.string().min(1).optional(),
+  status: RunStatusSchema.optional(),
 });
 
 // ─── GET /workflows ──────────────────────────────────────────────────────────
@@ -76,6 +84,24 @@ workflowRouter.get('/:id/versions', async (req, res, next) => {
   try {
     const versions = await listWorkflowVersionsService(req.params['id'] as string, tenantOf(req));
     res.json({ versions });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ─── GET /workflows/:id/runs ─────────────────────────────────────────────────
+
+/**
+ * Server-backed run history (roadmap D2). Top-level runs for a workflow,
+ * newest-first, cursor-paginated, optional `?status=` filter. Each row carries
+ * `version` and a `nodeCounts` per-status breakdown.
+ * Response: { runs: [...], nextCursor: string | null }.
+ */
+workflowRouter.get('/:id/runs', async (req, res, next) => {
+  try {
+    const q = ListWorkflowRunsQuery.parse(req.query);
+    const result = await listWorkflowRunsService(req.params['id'] as string, tenantOf(req), q);
+    res.json(result);
   } catch (err) {
     next(err);
   }
