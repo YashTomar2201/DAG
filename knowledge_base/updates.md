@@ -5,6 +5,90 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-06 — C3.1: Kubernetes manifests at fixed replicas
+
+**Phase:** roadmap C3.1 — get the stack *running* on Kubernetes before making it
+*elastic* (C3.3 is KEDA autoscaling; C3.2 is health probes + graceful shutdown).
+
+### What shipped — `infra/k8s/`
+
+A `kustomize` base (18 resources) for the whole stack:
+
+- **`namespace.yaml`** — everything in `dag-engine`.
+- **`rbac.yaml`** — a `dag-job-watcher` ServiceAccount + Role (get/list/watch on
+  Jobs only) for the wait-for-migrate init container.
+- **`config.yaml`** (ConfigMap) / **`secret.yaml`** — non-secret runtime env vs.
+  the dev credentials. Two DB URLs, deliberately: `MIGRATE_DATABASE_URL` (the
+  `dag` superuser, for schema DDL + `CREATE ROLE dag_app`) and `DATABASE_URL`
+  (the restricted `dag_app` role, so C2.1's RLS actually applies to api/worker
+  traffic).
+- **`postgres.yaml`** / **`redis.yaml`** — single-replica StatefulSets with
+  RWO PVCs, `pg_isready` / `redis-cli ping` probes, AOF persistence on Redis.
+- **`artifacts.yaml`** — one shared `dag-artifacts` RWO PVC, mounted into api +
+  both worker replicas. On a single node this behaves exactly like the compose
+  stack's shared `artifact_data` volume.
+- **`migrate-job.yaml`** — a one-shot Job (`dag-engine/migrate:local` =
+  Dockerfile.api's `build` stage, which still has the Prisma CLI) running
+  `prisma migrate deploy && prisma db seed`, gated by a `wait-for-postgres`
+  init container so a slow first-node image pull doesn't exhaust its retries.
+- **`api.yaml`** — Deployment (1 replica) + Service. `wait-for-migrate` init
+  container (`kubectl wait --for=condition=complete job/dag-migrate`, using the
+  official `registry.k8s.io/kubectl` image — *not* `bitnami/kubectl`, whose
+  free Docker Hub images were deprecated in 2025). `/health` backs both probes
+  for now (C3.2 splits `/health/live` + `/health/ready`).
+- **`worker.yaml`** — Deployment, `replicas: 2` (roadmap: "No autoscaling
+  yet"). `preferred` pod anti-affinity on `kubernetes.io/hostname` — on a
+  single node both replicas still schedule; on a multi-node cluster they
+  spread. `terminationGracePeriodSeconds: 120` (C3.2 tunes this properly).
+- **`web.yaml`** — the static nginx bundle. `Ingress` (`ingress.yaml`,
+  host-based `*.dag.localtest.me`) is included but inert without an ingress
+  controller — the smoke test uses a port-forward.
+
+### Two shapes: single-node base vs. multi-node / S3
+
+The base uses the **`fs` artifact backend on one shared RWO PVC**. That is the
+piece that cannot go multi-node — RWO can't be mounted by pods on different
+nodes. `minio.yaml` + `kind-cluster-multinode.yaml` + a documented config/env
+swap (`infra/k8s/README.md`) switch to **`ARTIFACT_BACKEND=s3`** against an
+in-cluster MinIO, which is the roadmap's literal "workers on different nodes"
+shape and what a real cloud deployment uses. This `fs`↔`s3` overlay mirrors how
+`docker-compose.s3.yml` overlays the compose base.
+
+### Verification — a real `kubectl apply -k` + end-to-end pipeline
+
+Tested on a **single-node kind cluster** (`kind-cluster.yaml`; the 3-node
+config exists but needs ~8 GB for Docker, which this dev box doesn't have):
+
+- `kubectl apply -k infra/k8s` → all 7 pods healthy, `dag-migrate` Job
+  **Complete** (all 7 migrations applied — through C2.1 RLS and C2.3 tenant
+  quota — dev API key seeded).
+- The reference pipeline (`data.source → pandas.preprocess → torch.train →
+  model.evaluate`) started via the port-forwarded api and reached
+  **SUCCEEDED** in ~26 s. Every node did real work: 891 rows of the bundled
+  titanic CSV with a real sha256, a real `randomforest` fit (`trainScore
+  0.91`), `accuracy 0.923`.
+- **Cross-replica execution proven** from the worker pod logs: `extract` +
+  `preprocess` ran on pod `worker-…-f6f82`, `train` + `evaluate` ran on pod
+  `worker-…-lfk67`. `train` succeeding on a *different pod* than `preprocess`
+  ran on means it read `preprocess`'s parquet output from the shared PVC across
+  pods — the substance of the "workers see each other's files" check, on one
+  node. The literal different-*nodes* run is authored
+  (`kind-cluster-multinode.yaml` + the S3 path) and blocked only by RAM.
+- Two transient warnings, both self-resolved: api readiness probe fired ~2 s
+  before tsx finished transpiling and bound :3001 (fixed — bumped
+  `initialDelaySeconds` 5→15); a PVC optimistic-lock retry while api + both
+  workers raced to bind `dag-artifacts` at once.
+
+### Rebuild note
+
+Four images: `dag-engine/api:local` (Dockerfile.api), `dag-engine/migrate:local`
+(Dockerfile.api `--target build`), `dag-engine/worker:local` (Dockerfile.worker),
+`dag-engine/web:local` (Dockerfile.web, `--build-arg VITE_API_URL=…`). On kind:
+`kind load docker-image --name dag-engine <each>`. Full sequence in
+`infra/k8s/README.md`.
+
+---
+
 ## 2026-09-05 — C2.2 + C2.3: tenant-namespaced Redis keys + per-tenant concurrency quota
 
 **Phase:** roadmap C2.2 and C2.3, the two remaining "small follow-on" items under C2 — closing

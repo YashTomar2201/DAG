@@ -63,17 +63,20 @@ spec:
           volumeMounts:
             - name: artifacts
               mountPath: /data/artifacts
+          # tsx transpiles on boot, so the server binds a few seconds after the
+          # container starts — a short readiness delay just logs a spurious
+          # "connection refused" warning before the first success.
           readinessProbe:
             httpGet:
               path: /health
               port: 3001
-            initialDelaySeconds: 5
+            initialDelaySeconds: 15
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /health
               port: 3001
-            initialDelaySeconds: 15
+            initialDelaySeconds: 30
             periodSeconds: 10
           resources:
             requests:

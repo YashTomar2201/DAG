@@ -1475,3 +1475,71 @@ per-tenant) at a consistent, easy-to-reason-about scale rather than introducing 
 number with no stated justification. A real deployment would tune this per paying tier via the
 `Tenant` row directly — there is deliberately no route to change it yet (out of C2.3's stated scope,
 which is the enforcement mechanism, not a tenant-management UI).
+
+---
+
+## Roadmap C3.1 — Kubernetes Manifests at Fixed Replicas
+
+### Decision: One `kustomize` Base, Not a Helm Chart
+
+**Why:** The stack has ~12 objects with no per-environment templating need beyond
+"swap the artifact backend." `kustomize` (built into `kubectl`) covers that with a
+patch overlay and adds zero tooling; a Helm chart would introduce a values schema,
+`_helpers.tpl`, and a release lifecycle for a project that deploys to exactly one
+namespace on one cluster. The `fs`↔`s3` swap is documented as a manual edit +
+`minio.yaml` add rather than a formal `overlays/` dir, mirroring how
+`docker-compose.s3.yml` is an opt-in file rather than a profile — same project
+convention, kept deliberately.
+
+### Decision: The Single-Node Base Uses `fs` + a Shared RWO PVC; Multi-Node Is the S3 Overlay
+
+**Why:** The roadmap's C3 header says it plainly — "Needs C1 (shared artifact
+storage) first, or nodes on different machines can't read each other's files." On a
+multi-node cluster the api pod and worker pods land on different hosts with no
+shared disk, and kind's `local-path` provisioner only grants `ReadWriteOnce`. So
+the genuinely-multi-node shape *must* use object storage, and `minio.yaml` +
+`ARTIFACT_BACKEND=s3` is that shape (also what a real cloud deployment uses).
+
+But making S3 the base would force every local `kubectl apply` on a small box to
+run a MinIO pod and exercise the `S3ArtifactStore` path even when a single shared
+volume would do. So the **base is single-node + `fs` on one RWO PVC mounted into
+api + both workers** (all pods on the one node, so RWO is fine and it behaves
+exactly like compose's shared `artifact_data`), and multi-node is the documented
+overlay. This inverts nothing about correctness — the S3 path is already covered by
+the 54-test integration suite and last session's live MinIO smoke; C3.1 just
+doesn't *require* it to prove "the manifests bring up a working stack."
+
+### Decision: `wait-for-migrate` init container (`kubectl wait`) Instead of an API-side Migration Gate
+
+**Why:** The roadmap gives two options — "an init-container that waits for the
+migration Job, or the API starts against an empty schema and crash-loops
+confusingly." The API-crash-loop path is explicitly the bad one. `kubectl wait
+--for=condition=complete job/dag-migrate` in an init container is a few lines, needs
+only a get/list/watch-on-Jobs Role, and makes "the schema is migrated" a hard
+precondition every api/worker pod blocks on — the same guarantee compose gets from
+`depends_on: service_completed_successfully`. Used the official
+`registry.k8s.io/kubectl` image, not `bitnami/kubectl` — Bitnami moved their images
+to a paid catalog in 2025 and the free Docker Hub `bitnami/*` tags are being
+removed, which would be a latent "manifests worked last year, broke on a fresh pull"
+failure.
+
+### Decision: `wait-for-postgres` init container on the migrate Job, `backoffLimit: 6`
+
+**Why:** Postgres and the migrate Job are created in the same `kubectl apply`. On a
+fresh kind node the `postgres:16` pull + `initdb` can take longer than the Job's
+default retry budget (10s → 20s → 40s), so `prisma migrate deploy` fails three
+times on connection-refused and the Job is permanently `Failed` — leaving every
+api/worker pod's `wait-for-migrate` blocked forever. A `pg_isready`-loop init
+container on the Job (using the `postgres:16` image already being pulled) turns that
+race into a clean wait, and `backoffLimit: 6` covers the genuinely-transient case
+after that.
+
+### Known gap for C3.2: probes are minimal here on purpose
+
+`api.yaml`'s liveness/readiness both hit the existing always-200 `/health`. That
+proves "the process is up and serving," not "Postgres and Redis are both
+reachable" — which is what a real readiness probe needs so a pod with a dead
+dependency stops taking traffic. Splitting `/health/live` + `/health/ready` (with a
+real dependency check), adding a worker probe, tuning
+`terminationGracePeriodSeconds` above the longest node timeout, and a
+`PodDisruptionBudget` are all C3.2's stated scope — deliberately not pulled forward.

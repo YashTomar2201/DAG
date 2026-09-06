@@ -232,24 +232,33 @@ Full write-ups in [`knowledge_base/updates.md`](knowledge_base/updates.md).
 
 ---
 
-## 7. No Horizontal Scaling Proven Across Multiple Machines
+## 7. No Horizontal Scaling Proven Across Multiple Machines — 🟡 IN PROGRESS (roadmap C3.1 done, C3.2/C3.3 open)
 
 **What exists:** `docker compose up --scale worker=4` starts four worker containers on the *same
 Docker host* sharing the same CPU. The scale test confirms the dispatch/queue architecture is
 correct, but the throughput numbers reflect CPU-bound process-spawn contention on a 12-core dev
 machine, not true multi-machine scaling.
 
-**What is missing:** A test or deployment that puts worker containers on genuinely separate
-machines, so increasing worker count actually adds CPU capacity rather than competing for it.
+**C3.1 (done):** `infra/k8s/` — a `kustomize` base for the whole stack (Postgres + Redis
+StatefulSets, a one-shot `dag-migrate` Job gating api/worker via `wait-for-migrate` init
+containers, api Deployment, `worker` Deployment at `replicas: 2` with `preferred` pod
+anti-affinity, web, an optional Ingress). Verified on a single-node `kind` cluster: `kubectl
+apply -k infra/k8s` brings the stack up green (all 7 migrations applied, dev key seeded) and the
+reference pipeline runs end-to-end to SUCCEEDED, **split across both worker replicas** —
+`preprocess` on one pod, `train` on another, reading each other's artifacts through the shared
+PVC. The literal *different-nodes* run is authored (`kind-cluster-multinode.yaml` + an
+`ARTIFACT_BACKEND=s3` / in-cluster MinIO overlay, since RWO PVCs can't span nodes) but not run
+here — it needs ~8 GB for Docker, which the dev box doesn't have. Full write-up in
+`knowledge_base/updates.md`'s C3.1 entry; bring-up sequence in `infra/k8s/README.md`.
 
-**To close it:**
-- Deploy the Compose cluster to a cloud provider (three separate EC2/GCE instances: one for
-  api + postgres + redis, N for workers). The `docker-compose.yml` requires only one environment-
-  variable change (`REDIS_URL` / `DATABASE_URL` pointing at the shared infra host).
-- For production scale: port the cluster to Kubernetes with a `Deployment` for workers and a
-  Kubernetes HPA (Horizontal Pod Autoscaler) targeting `queue:cpu` depth via a KEDA scaler. KEDA
-  reads BullMQ's `queue.getWaitingCount()` via a Redis metric and scales the worker `Deployment`
-  replica count automatically.
+**What is still missing (C3.2 / C3.3):**
+- Real `/health/live` + `/health/ready` splits (readiness gated on Postgres *and* Redis
+  reachability), a worker probe, `terminationGracePeriodSeconds` tuned above the longest node
+  timeout, and a `PodDisruptionBudget` — so scale-down / node drain never kills running jobs
+  (C3.2).
+- KEDA `ScaledObject` on Redis list length (`bull:cpu:wait`) driving `worker` replicas 1→N
+  automatically, verified for scale-up *and* scale-down, plus the A4 benchmark re-run on
+  genuinely separate machines for a real horizontal-scaling curve (C3.3).
 
 ---
 
