@@ -22,6 +22,11 @@ const EnvSchema = z.object({
    * Recommended: io=8, cpu=4, gpu=1 (set differently per container)
    */
   WORKER_CONCURRENCY: z.coerce.number().int().positive().default(4),
+  /**
+   * Port for the tiny health server (roadmap C3.2) that backs the worker's
+   * Kubernetes liveness/readiness probes. 0 disables it (dev / tests).
+   */
+  WORKER_HEALTH_PORT: z.coerce.number().int().min(0).default(0),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 }).refine((e) => e.ARTIFACT_BACKEND !== 's3' || !!e.ARTIFACT_S3_BUCKET, {
   message: 'ARTIFACT_S3_BUCKET is required when ARTIFACT_BACKEND=s3',

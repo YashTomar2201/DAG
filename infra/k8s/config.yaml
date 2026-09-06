@@ -23,3 +23,6 @@ data:
   IO_CONCURRENCY: "8"
   CPU_CONCURRENCY: "4"
   GPU_CONCURRENCY: "1"
+  # Port for the worker's health server (roadmap C3.2). Must match the
+  # containerPort / probe port in worker.yaml.
+  WORKER_HEALTH_PORT: "3002"

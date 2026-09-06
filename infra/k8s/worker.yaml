@@ -5,10 +5,20 @@
 # running `preprocess` and a different node running `train` read each other's
 # outputs.
 #
-# terminationGracePeriodSeconds: 120 — worker.close() on SIGTERM stops
-# accepting new jobs and lets in-flight ones finish. C3.2 tunes this to sit
-# above the longest node timeout and adds a real worker readiness probe;
-# 120s is a safe interim for the reference pipeline.
+# C3.2:
+#   - a tiny node:http health server (apps/worker/src/health-server.ts) on
+#     WORKER_HEALTH_PORT backs liveness (/health/live — process up) and
+#     readiness (/health/ready — Redis + Postgres reachable, not mid-drain).
+#   - terminationGracePeriodSeconds is raised to sit above a realistic
+#     long-running job. worker.close() on SIGTERM stops new-job polling and
+#     lets in-flight jobs finish; Kubernetes waits this long before SIGKILL,
+#     so a `kubectl delete pod` / rolling update / scale-down mid-run lets the
+#     job complete instead of cutting it off. torch.train's hard ceiling is 4h
+#     (apps/worker/src/executors.ts) — 3600s covers a routine training job;
+#     raise toward 14400 for an environment that runs multi-hour jobs and
+#     wants zero forced kills on a drain.
+#   - a PodDisruptionBudget (pdb.yaml) keeps a voluntary node drain from
+#     evicting both replicas at once.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,7 +34,7 @@ spec:
         app: worker
     spec:
       serviceAccountName: dag-job-watcher
-      terminationGracePeriodSeconds: 120
+      terminationGracePeriodSeconds: 3600
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -44,6 +54,9 @@ spec:
         - name: worker
           image: dag-engine/worker:local
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: health
+              containerPort: 3002
           envFrom:
             - configMapRef:
                 name: dag-config
@@ -56,6 +69,23 @@ spec:
           volumeMounts:
             - name: artifacts
               mountPath: /data/artifacts
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: health
+            periodSeconds: 3
+            failureThreshold: 20
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: health
+            periodSeconds: 15
           resources:
             requests:
               cpu: 150m

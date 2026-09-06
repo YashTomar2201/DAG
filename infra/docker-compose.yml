@@ -128,6 +128,15 @@ services:
       REDIS_URL: redis://redis:6379
       ARTIFACT_DIR: /data/artifacts
       NODE_ENV: production
+      # roadmap C3.2 — the worker's tiny node:http health server (Redis +
+      # Postgres reachability). Same port the k8s probes use.
+      WORKER_HEALTH_PORT: 3002
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3002/health/ready', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     volumes:
       # Shared across every worker replica: PROJECT_GUIDE.md §4's
       # "preprocess on worker 1, train on worker 2" case only works if every

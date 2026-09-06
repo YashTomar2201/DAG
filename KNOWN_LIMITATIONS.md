@@ -232,7 +232,7 @@ Full write-ups in [`knowledge_base/updates.md`](knowledge_base/updates.md).
 
 ---
 
-## 7. No Horizontal Scaling Proven Across Multiple Machines — 🟡 IN PROGRESS (roadmap C3.1 done, C3.2/C3.3 open)
+## 7. No Horizontal Scaling Proven Across Multiple Machines — 🟡 IN PROGRESS (roadmap C3.1 + C3.2 done, C3.3 open)
 
 **What exists:** `docker compose up --scale worker=4` starts four worker containers on the *same
 Docker host* sharing the same CPU. The scale test confirms the dispatch/queue architecture is
@@ -251,14 +251,25 @@ PVC. The literal *different-nodes* run is authored (`kind-cluster-multinode.yaml
 here — it needs ~8 GB for Docker, which the dev box doesn't have. Full write-up in
 `knowledge_base/updates.md`'s C3.1 entry; bring-up sequence in `infra/k8s/README.md`.
 
-**What is still missing (C3.2 / C3.3):**
-- Real `/health/live` + `/health/ready` splits (readiness gated on Postgres *and* Redis
-  reachability), a worker probe, `terminationGracePeriodSeconds` tuned above the longest node
-  timeout, and a `PodDisruptionBudget` — so scale-down / node drain never kills running jobs
-  (C3.2).
+**C3.2 (done):** `/health/live` (process up — backs `livenessProbe`, no dependency check so a
+transient blip can't restart-loop) and `/health/ready` (Postgres *and* Redis reachable, and not
+mid-SIGTERM — backs `readinessProbe`) on both `api` (Express) and `worker` (a ~70-line
+`node:http` server on `WORKER_HEALTH_PORT`). Every dependency check is raced against a 2s timeout
+— found by live testing that a bare `connection.ping()` *hangs* rather than failing when Redis is
+down, because `@dag/queue`'s connection is `maxRetriesPerRequest: null`. SIGTERM fails readiness
+first, pauses for endpoint propagation, then drains. `worker.yaml` gets
+`terminationGracePeriodSeconds: 3600` (a long training job finishes before SIGKILL) and a
+`PodDisruptionBudget` (`minAvailable: 1`) so a node drain evicts workers one at a time. Verified
+on docker-compose: `stop redis` → `/health/ready` 503 in ~2s on both api and worker with
+`/health/live` still 200 and no restart; `docker kill -s SIGTERM` on a worker mid-`torch.train` →
+container stays Up 3+ min draining, job keeps running, then Exited (0); the run completes. Full
+write-up in `knowledge_base/updates.md`'s C3.2 entry.
+
+**What is still missing (C3.3):**
 - KEDA `ScaledObject` on Redis list length (`bull:cpu:wait`) driving `worker` replicas 1→N
-  automatically, verified for scale-up *and* scale-down, plus the A4 benchmark re-run on
-  genuinely separate machines for a real horizontal-scaling curve (C3.3).
+  automatically, verified for scale-up *and* scale-down (scale-down never killing running work —
+  which is what C3.2's grace period + PDB now buy), plus the A4 benchmark re-run on genuinely
+  separate machines for a real horizontal-scaling curve.
 
 ---
 

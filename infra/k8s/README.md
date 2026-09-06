@@ -1,12 +1,28 @@
-# DAG Engine on Kubernetes (roadmap C3.1)
+# DAG Engine on Kubernetes (roadmap C3.1 + C3.2)
 
 Fixed-replica manifests for the whole stack: `postgres` + `redis` + a one-shot
-`dag-migrate` Job + `api` (1 replica) + `worker` (2 replicas) + `web`, plus an
-optional `Ingress`.
+`dag-migrate` Job + `api` (1 replica) + `worker` (2 replicas) + `web`, plus a
+`PodDisruptionBudget` and an optional `Ingress`.
 
-No autoscaling yet — that's C3.3 (KEDA). Health probes here are minimal (the
-existing always-200 `/health`); C3.2 adds real liveness/readiness splits and
-tunes graceful shutdown.
+No autoscaling yet — that's C3.3 (KEDA).
+
+**Health & shutdown (C3.2).** Both `api` and `worker` expose:
+- `/health/live` — process is up. Backs `livenessProbe`; never checks
+  Postgres/Redis, so a transient dependency blip can't drive a restart loop.
+- `/health/ready` — Postgres *and* Redis both reachable, and not mid-SIGTERM.
+  Backs `readinessProbe`; a failure only pulls the pod from its Service /
+  tells the PDB it isn't serving — no restart. On SIGTERM this flips to 503
+  *first*, then the process drains, so Kubernetes stops routing here before
+  connections close.
+
+The worker has no Express app — its probe endpoints are a ~60-line
+`node:http` server (`apps/worker/src/health-server.ts`) on
+`WORKER_HEALTH_PORT` (3002). `worker.close()` on SIGTERM stops new-job polling
+and lets in-flight jobs finish; `terminationGracePeriodSeconds: 3600` gives a
+long training job time to complete before SIGKILL (raise toward 14400 —
+`torch.train`'s 4h ceiling — for an environment that must never force-kill a
+job on a drain). `minAvailable: 1` in `pdb.yaml` keeps a voluntary node drain
+from evicting both workers at once.
 
 ## Two shapes
 
@@ -97,6 +113,26 @@ curl -s localhost:3001/runs/$RID -H "Authorization: Bearer $KEY"
 
 # Which worker replica ran each node (both replicas share the queues):
 kubectl -n dag-engine logs -l app=worker --prefix --tail=-1 | grep "$RID"
+```
+
+### C3.2 checks — probes + graceful shutdown
+
+```bash
+# 1. Readiness reflects dependency health. Kill Redis and watch api/worker
+#    go NotReady (no restart — liveness still passes), then recover.
+kubectl -n dag-engine scale statefulset/redis --replicas=0
+kubectl -n dag-engine get pods -w        # api + workers -> READY 0/1, STATUS still Running
+kubectl -n dag-engine scale statefulset/redis --replicas=1   # -> READY 1/1 again
+
+# 2. `kubectl delete pod <worker>` mid-run doesn't fail the run. Start a run
+#    with a slow train (epochs: 400), then delete the worker holding it:
+kubectl -n dag-engine delete pod <the-worker-pod> --grace-period=3600 &
+#    -> the pod goes Terminating but keeps running its in-flight job until it
+#       finishes (worker.close() drains); the run still reaches SUCCEEDED, and
+#       the replacement pod picks up the rest.
+
+# 3. The PDB blocks a double eviction:
+kubectl -n dag-engine drain <node> --dry-run=server --ignore-daemonsets   # would evict 1 worker, not 2
 ```
 
 ---

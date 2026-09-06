@@ -1543,3 +1543,76 @@ dependency stops taking traffic. Splitting `/health/live` + `/health/ready` (wit
 real dependency check), adding a worker probe, tuning
 `terminationGracePeriodSeconds` above the longest node timeout, and a
 `PodDisruptionBudget` are all C3.2's stated scope — deliberately not pulled forward.
+
+---
+
+## Roadmap C3.2 — Health Probes and Graceful Shutdown
+
+### Decision: `/health/live` Never Checks Dependencies; `/health/ready` Always Does
+
+**Why:** A liveness probe failure *restarts the pod*. If liveness checked
+Postgres/Redis reachability, a 30-second network blip or a brief Postgres
+failover would restart every api and worker pod simultaneously — turning a
+transient dependency problem into a full-cluster restart storm, right when the
+dependency can least afford the reconnect load. Liveness must answer only "is
+this process wedged / deadlocked?", which for a Node event-loop app is
+"can it serve *any* HTTP response" — hence a bare 200. Readiness failure only
+removes the pod from its Service (and tells the PDB it isn't serving), no
+restart, so that's where the real "can I actually do work right now?"
+dependency check belongs.
+
+### Decision: Race Every Dependency Check Against a 2s Timeout
+
+**Why:** Found by live testing, not by reading the code. `@dag/queue`'s shared
+`connection` is `new Redis(url, { maxRetriesPerRequest: null })` — mandatory
+for BullMQ's blocking commands (`BRPOPLPUSH` etc.), but it also means *any*
+command issued while the connection is down doesn't reject, it queues
+indefinitely waiting for reconnect. So `await connection.ping()` in
+`/health/ready` **hung the whole request** when Redis was actually stopped,
+instead of failing to a 503. A probe that hangs is worse than one that fails:
+Kubernetes' own `timeoutSeconds` eventually fires, but the readiness signal is
+delayed and muddy. Racing each check (`prisma.$queryRaw`, `connection.ping()`)
+against a 2s `setTimeout` reject makes a dead dependency produce a crisp, fast
+503. The same guard is in the worker's `node:http` health server for the same
+reason.
+
+### Decision: SIGTERM Fails Readiness FIRST, Then Waits, Then Closes the Server
+
+**Why:** Kubernetes sends SIGTERM and, concurrently, starts removing the pod
+from Service endpoints — but endpoint propagation to every kube-proxy / LB is
+not instant. If the process called `server.close()` immediately on SIGTERM, it
+would start refusing connections while the LB still believed the pod was a
+valid target, producing a burst of connection-refused errors for real traffic.
+The sequence here is: (1) `beginShutdown()` so `/health/ready` returns 503 on
+the very next probe, (2) a fixed 5s pause to let the "NotReady → removed from
+endpoints" change propagate, (3) *then* `server.close()`. The pod stops
+receiving new traffic via the normal readiness mechanism before it stops
+accepting connections at the socket.
+
+### Decision: `terminationGracePeriodSeconds: 3600`, Not the 4h `torch.train` Ceiling
+
+**Why:** The roadmap says "above your longest node timeout, or Kubernetes
+SIGKILLs a training job mid-run." The literal longest is `torch.train`'s 4h
+hard cap (`executors.ts`), which would mean a `kubectl delete pod` could block
+for four hours. That is the correct value for a deployment that runs genuine
+multi-hour training and must *never* lose one to a drain — but as a committed
+default it makes every routine pod operation potentially hang for hours.
+3600s (1h) covers a realistic training job while keeping ordinary operations
+bounded; the manifest comment says to raise it toward 14400 for the
+zero-forced-kill case. The PDB (`minAvailable: 1`) is the other half — it
+ensures a drain takes the workers *one at a time*, so even at 3600s a
+multi-worker fleet keeps making progress throughout.
+
+### Decision: Verified on docker-compose, Not the kind Cluster
+
+**Why:** The C3.2 changes are (a) app code — the split health endpoints, the
+fail-fast guard, the SIGTERM sequencing — and (b) manifest wiring — probe
+paths, a containerPort, a PDB, a grace-period number. The app behavior is what
+carries real risk, and docker-compose exercises the *identical* code
+(`/health/live`, `/health/ready`, `worker.close()` on SIGTERM) with far less
+overhead than kind. On the 8 GB dev box, `kind load docker-image` of the ~3 GB
+image set repeatedly OOM-killed the single node's containerd. The manifest
+wiring is `kubectl kustomize`-validated and structurally simple; C3.1 already
+proved `kubectl apply -k` brings the stack up. Re-running the full k8s bring-up
+just to watch the same health responses through a probe instead of a curl was
+not worth another hour of fighting Docker on this hardware.

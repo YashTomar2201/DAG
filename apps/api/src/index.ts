@@ -14,6 +14,13 @@ import { prisma } from '@dag/db';
 import { startQueueEventListeners } from './worker-events';
 import { startSchedulerWorker } from './scheduler-worker';
 import { sweepBlockedDispatches } from './services/orchestrator.service';
+import { beginShutdown } from './lifecycle';
+
+// How long to keep serving after SIGTERM before closing the HTTP server, so
+// Kubernetes has time to observe /health/ready flip to 503 and pull this pod
+// from the Service's endpoints (roadmap C3.2). Below the manifest's
+// terminationGracePeriodSeconds.
+const READINESS_DRAIN_MS = 5_000;
 
 const app = createApp();
 
@@ -37,11 +44,24 @@ const blockedSweepTimer = setInterval(() => {
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 // Allow in-flight requests to complete before closing the DB connection pool.
 
+let shuttingDown = false;
+
 async function shutdown(signal: string) {
-  logger.info({ signal }, 'Shutdown signal received — draining connections');
+  if (shuttingDown) return; // a second SIGTERM shouldn't restart the sequence
+  shuttingDown = true;
+
+  logger.info({ signal }, 'Shutdown signal received — failing readiness, then draining');
+  // 1. Fail /health/ready NOW so Kubernetes stops routing new traffic here.
+  beginShutdown();
   closeQueueEvents();
   clearInterval(blockedSweepTimer);
   await closeScheduler().catch((err) => logger.error({ err }, 'Error closing scheduler worker'));
+
+  // 2. Give the endpoint-removal a moment to propagate before we stop
+  //    accepting connections (avoids a race where the LB still sends here).
+  await new Promise((r) => setTimeout(r, READINESS_DRAIN_MS));
+
+  // 3. Stop accepting new connections; let in-flight requests finish.
   server.close(async () => {
     await prisma.$disconnect();
     logger.info('Server closed, Prisma disconnected');

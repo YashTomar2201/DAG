@@ -14,6 +14,7 @@ import { createHash } from 'crypto';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from './app';
+import type * as DagQueue from '@dag/queue';
 
 // ─── Mock @dag/db ─────────────────────────────────────────────────────────────
 // We test the control-plane logic (validation, cycle detection, topo sort) in
@@ -23,11 +24,21 @@ import { createApp } from './app';
 export const TEST_API_KEY = 'test-api-key';
 const TEST_API_KEY_HASH = createHash('sha256').update(TEST_API_KEY).digest('hex');
 
+vi.mock('@dag/queue', async (importOriginal) => {
+  // Keep the real module (metrics.ts / orchestrator.service.ts need ioQueue
+  // etc.), but swap `connection` for a stub so /health/ready's ping() doesn't
+  // reach for a real Redis.
+  const actual = await importOriginal<typeof DagQueue>();
+  return { ...actual, connection: { ping: vi.fn().mockResolvedValue('PONG') } };
+});
+
 vi.mock('@dag/db', () => ({
   prisma: {
     workflow: {
       findUnique: vi.fn().mockResolvedValue({ id: 'wf-1' }),
     },
+    // /health/ready runs `SELECT 1` through this.
+    $queryRaw: vi.fn().mockResolvedValue([{ '?column?': 1 }]),
   },
   createWorkflow: vi.fn().mockResolvedValue({ workflowId: 'wf-1', versionId: 'v-1' }),
   createWorkflowVersion: vi.fn().mockImplementation(async (_wfId: string, graph: unknown, topoOrder: unknown) => ({
@@ -121,6 +132,27 @@ describe('Phase 4 — Control Plane API', () => {
     const res = await request(app).get('/health');
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('ok');
+  });
+
+  it('GET /health/live → 200 (no dependency check)', async () => {
+    const res = await request(app).get('/health/live');
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('ok');
+  });
+
+  it('GET /health/ready → 200 when Postgres and Redis are reachable', async () => {
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'ready', checks: { postgres: true, redis: true } });
+  });
+
+  it('GET /health/ready → 503 when Redis is unreachable', async () => {
+    const { connection } = await import('@dag/queue');
+    vi.mocked(connection.ping).mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const res = await request(app).get('/health/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('not_ready');
+    expect(res.body.checks.redis).toBe(false);
   });
 
   // ── Auth (roadmap A3) ────────────────────────────────────────────────────────

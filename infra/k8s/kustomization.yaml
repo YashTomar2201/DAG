@@ -18,6 +18,7 @@ resources:
   - migrate-job.yaml
   - api.yaml
   - worker.yaml
+  - pdb.yaml
   - web.yaml
   - ingress.yaml
 

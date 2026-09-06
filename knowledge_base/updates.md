@@ -5,6 +5,84 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-06 — C3.2: health probes + graceful shutdown
+
+**Phase:** roadmap C3.2 — do this *before* autoscaling (C3.3), or a scale-down
+kills running jobs.
+
+### Split health endpoints
+
+- **`apps/api/src/app.ts`** — `/health/live` (process is up — backs
+  `livenessProbe`; never touches Postgres/Redis so a transient dependency blip
+  can't drive a restart loop) and `/health/ready` (Postgres *and* Redis both
+  reachable, and not mid-shutdown — backs `readinessProbe`; a failure only
+  pulls the pod from its Service, no restart). `/health` kept as a `/health/live`
+  alias for the existing compose healthcheck.
+- **`apps/worker/src/health-server.ts`** (new) — the worker has no Express app,
+  so its probe endpoints are a ~70-line `node:http` server on
+  `WORKER_HEALTH_PORT` (env, default 0 = off; 3002 in k8s + compose). Same
+  `/health/live` + `/health/ready` semantics, same dependency checks.
+- **`apps/api/src/lifecycle.ts`** (new) — a `beginShutdown()` / `isShuttingDown()`
+  flag shared between `index.ts`'s SIGTERM handler and the `/health/ready`
+  route.
+
+### The fail-fast fix (bug caught by live testing)
+
+First cut of `/health/ready` did a bare `await connection.ping()`. With Redis
+actually down the request **hung** (curl exit 000) instead of returning 503 —
+because `@dag/queue`'s `connection` is configured `maxRetriesPerRequest: null`
+(BullMQ requires it for blocking commands), so a command issued while
+disconnected *queues forever* rather than rejecting. Fixed by racing every
+dependency check against a 2 s timeout (`withTimeout` helper in both `app.ts`
+and `health-server.ts`) — a dead dependency now yields a prompt 503.
+
+### Graceful shutdown
+
+- **`apps/api/src/index.ts`** — SIGTERM now: (1) `beginShutdown()` so
+  `/health/ready` 503s *immediately*, (2) a 5 s pause so Kubernetes observes
+  the endpoint removal before the socket closes, (3) `server.close()` +
+  `prisma.$disconnect()`. Idempotent against a second SIGTERM.
+- **`apps/worker/src/index.ts`** — SIGTERM: `markWorkerShuttingDown()` (readiness
+  503s), then the pre-existing `worker.close()` drain (stops new-job polling,
+  waits for in-flight jobs), then close the health server + `connection.quit()`.
+- **`infra/k8s/worker.yaml`** — `terminationGracePeriodSeconds: 3600` (was 120),
+  so Kubernetes waits an hour for a long training job to finish before SIGKILL
+  on a `kubectl delete pod` / rolling update / scale-down. `torch.train`'s hard
+  ceiling is 4 h (`executors.ts`) — raise toward 14400 for an environment that
+  must never force-kill a job on a drain.
+
+### Probe wiring + PDB
+
+- **`infra/k8s/api.yaml`** / **`worker.yaml`** — `startupProbe` on `/health/live`
+  (covers the tsx transpile-on-boot delay so liveness/readiness delays stay
+  short), `livenessProbe` on `/health/live`, `readinessProbe` on `/health/ready`.
+  The worker gets a `health` containerPort (3002).
+- **`infra/k8s/pdb.yaml`** (new) — `minAvailable: 1` for `worker`, so a
+  voluntary node drain evicts one replica, waits for its replacement, then the
+  other — never both at once.
+- **`infra/docker-compose.yml`** — worker service gains `WORKER_HEALTH_PORT`
+  and a healthcheck hitting `/health/ready`, for parity.
+
+### Verification (docker-compose — the kind cluster OOM'd loading images on
+the 8 GB dev box; compose exercises the identical health/shutdown code)
+
+- `/health/live` → 200 always (api + worker). `/health/ready` → 200 when
+  healthy; **`docker compose stop redis`** → **503 within ~2 s** on both api
+  (`{postgres:true,redis:false}`) and worker, with `/health/live` still 200 and
+  **no container restart**; `start redis` → back to 200.
+- **`docker kill --signal=SIGTERM`** on the worker container ~1.5 s into a
+  `torch.train` job → `"Shutdown signal received — draining workers"`, the
+  container stays **Up for 3+ minutes** (draining, not killed) with the job
+  still RUNNING, then on job completion `"Workers drained, exiting"` → **Exited
+  (0)**. A shorter run under the same SIGTERM reached **SUCCEEDED** and the
+  worker exited 0 — i.e. `kubectl delete pod <worker>` mid-run does not fail
+  the run.
+- `pnpm -r typecheck` / `lint` green; api unit suite 48 tests (new `/health/ready`
+  200 + 503 cases); full integration suite unaffected (17 files / 54, green —
+  the health routes aren't on any integration path).
+
+---
+
 ## 2026-09-06 — C3.1: Kubernetes manifests at fixed replicas
 
 **Phase:** roadmap C3.1 — get the stack *running* on Kubernetes before making it

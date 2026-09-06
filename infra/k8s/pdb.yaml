@@ -1,0 +1,16 @@
+# Roadmap C3.2 — a voluntary disruption (node drain, cluster upgrade) may not
+# take both worker replicas at once. With replicas: 2 and minAvailable: 1, a
+# drain evicts one worker, waits for its replacement to become Ready, then
+# evicts the other — so there is always a worker able to pick up jobs.
+#
+# This only constrains *voluntary* evictions. A node hard-crash still takes
+# whatever was on it; that's what BullMQ's stalled-job re-delivery covers.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: worker

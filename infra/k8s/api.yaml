@@ -1,8 +1,13 @@
 # Control plane. Single replica for C3.1 (the orchestrator's QueueEvents
 # consumer and the scheduler worker are safe to run singly; multi-replica
-# api is a later concern). C3.2 splits /health into /health/live +
-# /health/ready with a real Postgres+Redis reachability check — for now the
-# existing always-200 /health backs both probes.
+# api is a later concern).
+#
+# C3.2 probes:
+#   livenessProbe  -> /health/live   (process up; no dependency check, so a
+#                     transient Postgres/Redis blip can't trigger a restart loop)
+#   readinessProbe -> /health/ready  (Postgres AND Redis reachable, and not
+#                     mid-SIGTERM-drain; failure only pulls the pod from the
+#                     Service — no restart)
 apiVersion: v1
 kind: Service
 metadata:
@@ -63,20 +68,25 @@ spec:
           volumeMounts:
             - name: artifacts
               mountPath: /data/artifacts
-          # tsx transpiles on boot, so the server binds a few seconds after the
-          # container starts — a short readiness delay just logs a spurious
-          # "connection refused" warning before the first success.
+          # startupProbe covers the tsx transpile-on-boot delay (the server
+          # binds a few seconds after the container starts); liveness/readiness
+          # don't begin until it first succeeds, so their own delays stay short.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 3001
+            periodSeconds: 3
+            failureThreshold: 20 # up to 60s to come up
           readinessProbe:
             httpGet:
-              path: /health
+              path: /health/ready
               port: 3001
-            initialDelaySeconds: 15
             periodSeconds: 5
+            timeoutSeconds: 3
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health/live
               port: 3001
-            initialDelaySeconds: 30
             periodSeconds: 10
           resources:
             requests:

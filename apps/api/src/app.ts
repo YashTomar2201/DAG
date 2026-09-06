@@ -7,6 +7,10 @@ import { errorHandler } from './middleware/errorHandler';
 import { requireApiKey } from './middleware/auth';
 import { requireMetricsToken } from './middleware/metricsAuth';
 import { registry, renderMetrics } from './metrics';
+import { prisma } from '@dag/db';
+import { connection } from '@dag/queue';
+import { isShuttingDown } from './lifecycle';
+import { logger } from './logger';
 
 /**
  * Creates and returns the configured Express application.
@@ -50,9 +54,51 @@ export function createApp(): Express {
   // ── Body parsing ──────────────────────────────────────────────────────────
   app.use(express.json({ limit: '1mb' }));
 
-  // ── Health check (no auth, used by Docker healthchecks) ───────────────────
-  app.get('/health', (_req, res) => {
-    res.json({ status: 'ok' });
+  // ── Health probes (no auth — Kubernetes / Docker healthchecks) ────────────
+  // roadmap C3.2:
+  //   /health/live  — is the process up? (livenessProbe — a failure restarts
+  //                   the pod, so it must NOT depend on Postgres/Redis: a
+  //                   transient DB blip shouldn't trigger a restart loop.)
+  //   /health/ready — can it serve traffic RIGHT NOW? (readinessProbe —
+  //                   Postgres AND Redis both reachable, and not mid-shutdown.
+  //                   A failure only pulls the pod from the Service, no restart.)
+  //   /health       — kept as an alias of /health/live for the existing
+  //                   docker-compose healthcheck and older manifests.
+  const live = (_req: Request, res: Response) => res.json({ status: 'ok' });
+  app.get('/health', live);
+  app.get('/health/live', live);
+
+  // A dependency check must FAIL FAST, not hang: `@dag/queue`'s `connection`
+  // is configured `maxRetriesPerRequest: null` (BullMQ needs that for its
+  // blocking commands), so a bare `connection.ping()` queues forever while
+  // Redis is down instead of rejecting. Race every check against a short
+  // timeout so a dead dependency yields a prompt 503, not a stuck request.
+  const withTimeout = <T,>(p: Promise<T>, ms: number): Promise<T> =>
+    Promise.race([
+      p,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
+    ]);
+
+  app.get('/health/ready', async (_req: Request, res: Response) => {
+    if (isShuttingDown()) {
+      res.status(503).json({ status: 'shutting_down' });
+      return;
+    }
+    const checks: Record<string, boolean> = { postgres: false, redis: false };
+    try {
+      await withTimeout(prisma.$queryRaw`SELECT 1`, 2000);
+      checks.postgres = true;
+    } catch (err) {
+      logger.warn({ err }, 'readiness: postgres check failed');
+    }
+    try {
+      const pong = await withTimeout(connection.ping(), 2000);
+      checks.redis = pong === 'PONG';
+    } catch (err) {
+      logger.warn({ err }, 'readiness: redis check failed');
+    }
+    const ok = checks.postgres && checks.redis;
+    res.status(ok ? 200 : 503).json({ status: ok ? 'ready' : 'not_ready', checks });
   });
 
   // ── Prometheus-style metrics (Phase 12) ────────────────────────────────────
