@@ -1,0 +1,56 @@
+# ─── Observability overlay (roadmap C4) ───────────────────────────────────────
+#
+# Adds Prometheus + Grafana. The API already emits everything at /metrics
+# (apps/api/src/metrics.ts) — nothing consumed it. Apply on top of the base
+# stack:
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.observability.yml \
+#     up --build -d
+#
+#   Grafana:    http://localhost:3000   (admin / admin — dev only)
+#   Prometheus: http://localhost:9090
+#
+# The Grafana datasource and the "DAG Engine" dashboard are auto-provisioned
+# (infra/grafana/provisioning/**), so there is zero click-through setup.
+# The base docker-compose.yml is untouched — this overlay is opt-in, the same
+# pattern as docker-compose.s3.yml.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus_data:
+  grafana_data:

@@ -1,0 +1,12 @@
+# Auto-provisioned datasource (roadmap C4) — Grafana picks this up on boot, so
+# there's no click-through setup. `prometheus` is the compose service name.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

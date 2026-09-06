@@ -5,6 +5,68 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-06 — C4: observability (Prometheus + Grafana)
+
+**Phase:** roadmap C4. `apps/api/src/metrics.ts` has emitted the right series
+since Phase 12 (node/run counts by status, `dag_queue_depth{queue,state}`, the
+`dag_node_duration_seconds` histogram, `dag_active_workers`, plus
+`dag_api_process_*` defaults) — nothing consumed them. This wires up the
+consumers.
+
+### What shipped
+
+- **`infra/docker-compose.observability.yml`** (new, opt-in overlay — same
+  pattern as `docker-compose.s3.yml`) — adds **Prometheus** (`:9090`) and
+  **Grafana** (`:3000`, anonymous viewer enabled, admin/admin for editing).
+  `docker compose -f infra/docker-compose.yml -f infra/docker-compose.observability.yml up -d`.
+- **`infra/prometheus/prometheus.yml`** — scrapes `api:3001/metrics` every 10s
+  with the `METRICS_TOKEN` bearer (`metricsAuth.ts`'s static secret).
+- **`infra/prometheus/alerts.yml`** — three rules:
+  - `QueueBacklog` — `>20` jobs waiting on any queue, sustained 5m.
+  - `HighNodeFailureRate` — `>10%` of node executions failing over 10m
+    (ratio of `dag_node_duration_seconds_count{outcome="failed"}` rate to
+    total rate).
+  - `StuckCluster` (critical) — jobs queued/active **and** zero completions in
+    the last 15m. The "killed all workers / deadlocked orchestrator" signal.
+    The 15m window is deliberate debounce — a brief lull is not an outage.
+- **`infra/grafana/provisioning/**`** — datasource (`uid: prometheus`, set
+  default) and a dashboard provider, both auto-loaded on boot (zero
+  click-through).
+- **`infra/grafana/dashboards/dag-engine.json`** — 9 panels: node throughput
+  (completions/min by outcome), queue depth (waiting/active) by queue, node
+  duration p50/p95/p99 by node type, node success rate (5m stat), active
+  workers by queue, NodeRuns-by-status and Runs-by-status bar gauges, API
+  process memory + event-loop lag, cumulative completions succeeded vs failed.
+- **`infra/k8s/servicemonitor.yaml`** (new, not in the base kustomization —
+  needs the Prometheus Operator CRD) + a `name: http` on the api Service's
+  port so the ServiceMonitor can target it.
+
+### Verification (compose base + observability overlay)
+
+- Both Prometheus targets **up** (`dag-api http://api:3001/metrics -> up` —
+  bearer auth works). Fired 8 runs of a 3-node graph → Prometheus had
+  `dag_node_duration_seconds_count{outcome="succeeded"} = 24`
+  (8×3), `dag_active_workers{io,cpu,gpu} = 1`, queue depth back to 0.
+- Grafana: datasource + "DAG Engine" dashboard (9 panels) auto-provisioned;
+  `POST /api/ds/query` returns real data through Grafana's proxy (throughput
+  query → `54` after 18 runs).
+- All three alert rules **loaded** (`inactive`, not `error`). With the worker
+  stopped and a run fired: `sum(dag_active_workers) = 0`,
+  `sum(dag_queue_depth{state=~"waiting|active"}) = 1` — the `StuckCluster`
+  inputs are correct; the full expr stays `False` only because the recent
+  completions keep `increase(...[15m]) != 0` (the intended 15-minute debounce),
+  and flips `True` once that window clears with work still stuck.
+- `kubectl kustomize infra/k8s` still clean.
+
+### Still open (the remaining C4 piece)
+
+Distributed tracing — roadmap C4 step 4 (OpenTelemetry, run id as trace id, one
+span tree API → queue → worker → Python). Not built; it's a cross-cutting
+instrumentation change across `apps/api` + `apps/worker` + the Python bridge
+plus a collector/backend, so it's its own unit of work.
+
+---
+
 ## 2026-09-06 — D2: server-backed run history
 
 **Phase:** roadmap D2. `RunHistory` reconstructed its list from whatever runs

@@ -1,0 +1,27 @@
+# Prometheus Operator ServiceMonitor (roadmap C4). NOT in the base
+# kustomization — it needs the `monitoring.coreos.com` CRD (kube-prometheus /
+# Prometheus Operator installed). Apply it only on a cluster that has that:
+#
+#   kubectl apply -f infra/k8s/servicemonitor.yaml
+#
+# The bearer token must be in a Secret the Operator can read; `dag-secrets`
+# already carries METRICS_TOKEN.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: dag-api
+  labels:
+    app.kubernetes.io/part-of: dag-engine
+spec:
+  selector:
+    matchLabels:
+      app: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      authorization:
+        type: Bearer
+        credentials:
+          name: dag-secrets
+          key: METRICS_TOKEN

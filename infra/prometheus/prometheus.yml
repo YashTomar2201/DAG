@@ -1,0 +1,26 @@
+# Prometheus scrape config for the DAG Engine (roadmap C4).
+#
+# The API's /metrics is behind a static bearer token (METRICS_TOKEN) —
+# `metricsAuth.ts` explains why it's a shared secret, not a per-tenant key.
+# The value here must match the `api` service's METRICS_TOKEN in
+# docker-compose.yml (dev default: local-dev-metrics-token).
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: dag-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: local-dev-metrics-token
+    static_configs:
+      - targets: ["api:3001"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,57 @@
+# Alert rules (roadmap C4). Three signals that a human should look at:
+#   1. a queue is backing up faster than workers drain it
+#   2. runs are failing at an abnormal rate
+#   3. the cluster is stuck — work is queued but nothing is completing
+#
+# Backed by the metrics apps/api/src/metrics.ts already emits:
+#   dag_queue_depth{queue,state}       gauge
+#   dag_node_runs_by_status{status}    gauge
+#   dag_node_duration_seconds_count{outcome}  histogram count (a completion counter)
+#   dag_active_workers{queue}          gauge
+
+groups:
+  - name: dag-engine
+    rules:
+      - alert: QueueBacklog
+        # More than 20 jobs waiting on any queue, sustained for 5 minutes —
+        # i.e. not a momentary burst, an actual capacity shortfall.
+        expr: max by (queue) (dag_queue_depth{state="waiting"}) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue {{ $labels.queue }} has a sustained backlog"
+          description: "{{ $value }} jobs waiting on queue:{{ $labels.queue }} for over 5 minutes. Scale workers or investigate slow nodes."
+
+      - alert: HighNodeFailureRate
+        # >10% of node executions failing over the last 10 minutes.
+        expr: |
+          (
+            sum(rate(dag_node_duration_seconds_count{outcome="failed"}[10m]))
+            /
+            clamp_min(sum(rate(dag_node_duration_seconds_count[10m])), 0.001)
+          ) > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node failure rate above 10%"
+          description: "{{ $value | humanizePercentage }} of node executions have failed over the last 10 minutes."
+
+      - alert: StuckCluster
+        # Work is queued (or running) but nothing has completed in 15 minutes.
+        # This is the "killed all workers / deadlocked orchestrator" signal.
+        expr: |
+          (
+            sum(dag_queue_depth{state=~"waiting|active"}) > 0
+          )
+          and
+          (
+            sum(increase(dag_node_duration_seconds_count[15m])) == 0
+          )
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cluster appears stuck"
+          description: "Jobs are queued/active but no node has completed in 15 minutes. Check that workers are running and connected."

@@ -1658,3 +1658,51 @@ terminal state the component refetches the list once, so the persisted row
 picks up its final `nodeCounts` (which a freshly-created store entry doesn't
 have). This keeps the "it updates in real time" feel while making reload-safety
 free.
+
+---
+
+## Roadmap C4 — Observability
+
+### Decision: An Opt-In Compose Overlay, Not Prometheus/Grafana in the Base Stack
+
+**Why:** The base `docker-compose.yml` is what `pnpm test:integration` and every
+"does it run" check spins up. Prometheus + Grafana are ~1 GB of images and two
+more long-lived containers that have nothing to do with whether the pipeline
+works — folding them into the base would make every developer pay that cost on
+every `up`. `docker-compose.observability.yml` layers on top exactly the way
+`docker-compose.s3.yml` does for the S3 backend: the base is untouched, the
+overlay is one extra `-f` flag when you actually want the dashboards.
+
+### Decision: `StuckCluster` Requires 15 Minutes of Zero Completions, Not Just "Queue > 0 and Workers == 0"
+
+**Why:** The naive "stuck" signal — a non-empty queue with no active workers —
+fires on every rolling restart, every scale-to-zero, every brief worker
+redeploy. Those are normal operations, not incidents. The real "the cluster is
+broken" condition is: there is work to do (`dag_queue_depth{state=~"waiting|active"} > 0`)
+**and** nothing has actually completed for a long time
+(`increase(dag_node_duration_seconds_count[15m]) == 0`). That combination can't
+be produced by a healthy cluster doing a deploy — it means jobs are queued and
+genuinely not moving. The cost is that the alert takes up to ~15 minutes to
+fire after a hard failure; for a "page a human" alert that latency is the right
+trade against crying wolf on every routine restart.
+
+### Decision: Reuse the Existing `dag_node_duration_seconds` Histogram as the Throughput/Failure-Rate Source
+
+**Why:** A `Histogram`'s `_count` child is itself a monotonic counter of
+observations — one per node completion, already labelled `outcome`
+(`succeeded`/`failed`). So `rate(dag_node_duration_seconds_count[1m])` is node
+throughput and `rate(...{outcome="failed"}) / rate(...)` is the failure rate,
+with no new metric to add and no new call site to instrument. The histogram was
+built (Phase 12) for latency percentiles; it doubles as the completion counter
+for free.
+
+### Known gap: OpenTelemetry tracing is deferred
+
+Roadmap C4 step 4 (a single trace spanning API dispatch → queue wait → worker
+execution → Python subprocess, keyed by run id) is not built. It is a genuinely
+cross-cutting change — the OTel SDK and context propagation have to be threaded
+through `apps/api`'s dispatch path, `apps/worker`'s `processJob`, and across the
+stdio boundary into the Python scripts, plus a collector (Tempo/Jaeger) to
+receive it — so it is its own piece of work rather than something to bolt on at
+the end of the metrics PR. The metrics half of C4 (what a dashboard shows, what
+pages a human) stands on its own.

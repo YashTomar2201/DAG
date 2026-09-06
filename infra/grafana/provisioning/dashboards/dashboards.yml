@@ -1,0 +1,15 @@
+# Tells Grafana to load every dashboard JSON in the mounted folder on boot
+# (roadmap C4). The dashboard itself is infra/grafana/dashboards/dag-engine.json.
+apiVersion: 1
+
+providers:
+  - name: dag-engine
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

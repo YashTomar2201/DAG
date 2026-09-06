@@ -1,0 +1,110 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "10s",
+  "title": "DAG Engine",
+  "uid": "dag-engine",
+  "schemaVersion": 39,
+  "tags": ["dag-engine"],
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Node throughput (completions/min, by outcome)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "cpm", "custom": { "drawStyle": "line", "fillOpacity": 15, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (outcome) (rate(dag_node_duration_seconds_count[1m])) * 60", "legendFormat": "{{outcome}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth (waiting) by queue",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "dag_queue_depth{state=\"waiting\"}", "legendFormat": "{{queue}} waiting" },
+        { "refId": "B", "expr": "dag_queue_depth{state=\"active\"}", "legendFormat": "{{queue}} active" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Node duration by type — p50 / p95 / p99",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le, nodeType) (rate(dag_node_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{nodeType}}" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le, nodeType) (rate(dag_node_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{nodeType}}" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le, nodeType) (rate(dag_node_duration_seconds_bucket[5m])))", "legendFormat": "p99 {{nodeType}}" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Node success rate (5m)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "orange", "value": 0.8 }, { "color": "green", "value": 0.95 } ] } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(dag_node_duration_seconds_count{outcome=\"succeeded\"}[5m])) / clamp_min(sum(rate(dag_node_duration_seconds_count[5m])), 0.001)" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active workers by queue",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "dag_active_workers", "legendFormat": "{{queue}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "NodeRuns by status (current)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "displayMode": "gradient", "orientation": "horizontal" },
+      "targets": [
+        { "refId": "A", "expr": "dag_node_runs_by_status", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "bargauge",
+      "title": "Runs by status (current)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "displayMode": "gradient", "orientation": "horizontal" },
+      "targets": [
+        { "refId": "A", "expr": "dag_runs_by_status", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "API process — memory & event-loop lag",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [ { "matcher": { "id": "byName", "options": "event loop lag p99" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "custom.axisPlacement", "value": "right" } ] }, { "matcher": { "id": "byName", "options": "resident memory" }, "properties": [ { "id": "unit", "value": "bytes" } ] } ] },
+      "targets": [
+        { "refId": "A", "expr": "dag_api_process_process_resident_memory_bytes", "legendFormat": "resident memory" },
+        { "refId": "B", "expr": "dag_api_process_nodejs_eventloop_lag_p99_seconds", "legendFormat": "event loop lag p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cumulative node completions (succeeded vs failed)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (outcome) (dag_node_duration_seconds_count)", "legendFormat": "{{outcome}}" }
+      ]
+    }
+  ]
+}

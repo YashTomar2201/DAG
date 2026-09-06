@@ -307,16 +307,25 @@ migration, which is how a running DB can drift out of sync with the history.
 
 ---
 
-## 10. No Access Control on the `/metrics` Endpoint
+## 10. `/metrics` Access Control + Nothing Consuming the Metrics — ✅ CLOSED (roadmap A3 + C4)
 
-**What exists:** `GET /metrics` is public — any caller can read internal throughput, queue
-depth, and worker count data.
+**Access control (A3):** `GET /metrics` is behind a static bearer token (`METRICS_TOKEN`, checked
+by `apps/api/src/middleware/metricsAuth.ts`) — a shared secret Prometheus configures once, not a
+per-tenant API key (metrics aren't tenant data). A missing/wrong token is a 401.
 
-**What is missing:** Authentication on the scrape endpoint. In a real deployment, exposing queue
-depth and worker counts to unauthenticated callers leaks information about cluster capacity and
-current load.
+**Consumption (C4):** `apps/api/src/metrics.ts` emitted the right series all along (node/run
+counts by status, queue depth by type/state, `dag_node_duration_seconds` histogram, active
+workers, plus `dag_api_process_*` defaults) but nothing scraped them. Now:
+`infra/docker-compose.observability.yml` (an opt-in overlay, same pattern as
+`docker-compose.s3.yml`) adds **Prometheus** (scrape config + alert rules in `infra/prometheus/`)
+and **Grafana** (auto-provisioned datasource + a "DAG Engine" dashboard in `infra/grafana/` —
+throughput, queue depth, p50/p95/p99 node duration by type, success rate, active workers, status
+breakdowns, API process health). Three alert rules: `QueueBacklog` (>20 waiting for 5m),
+`HighNodeFailureRate` (>10% over 10m), `StuckCluster` (jobs queued/active but zero completions in
+15m — the "killed all workers" signal). A k8s `ServiceMonitor` (`infra/k8s/servicemonitor.yaml`,
+applied separately — needs the Prometheus Operator CRD) covers the cluster case.
 
-**To close it:** Add a shared-secret bearer token check on the `/metrics` route (Prometheus
-supports configuring a `bearer_token` in its scrape config), or restrict the endpoint to an
-internal network interface only (not the public-facing port). The latter is the simpler fix for
-a Kubernetes deployment where the Prometheus scraper already runs on the internal cluster network.
+**Still open (the remaining C4 piece):** distributed tracing. Roadmap C4 step 4 wants
+OpenTelemetry with the run id as trace id — one span tree from API dispatch → queue wait → worker
+execution → Python subprocess. Not built; it's a cross-cutting instrumentation change across
+`apps/api`, `apps/worker`, and the Python bridge plus a collector, so it's its own piece of work.
