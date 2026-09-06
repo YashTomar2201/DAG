@@ -5,6 +5,52 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-06 — D3 (batch 1): editor polish — minimap, auto-layout, node search, JSON export/import
+
+**Phase:** roadmap D3, which is a grab-bag of small opportunistic editor
+improvements ("sprinkle throughout"). This is the first batch — four
+self-contained ones.
+
+### Changes
+
+- **Minimap** — `<MiniMap pannable zoomable />` from `@xyflow/react` in the
+  canvas, themed to the dark surface. Free (already a dep).
+- **Auto-layout ("Tidy" button)** — new `@dagrejs/dagre` dep (web bundle only;
+  `@dag/graph-core` stays zero-dep). `graphSlice.autoLayout()` runs a
+  left-to-right dagre layout (`layoutLR` helper, node footprint ~190×68,
+  `nodesep 40 / ranksep 90`), pushes an undo snapshot, marks dirty. Read-only
+  no-op.
+- **Node search (Ctrl+K)** — new `apps/web/src/components/NodeSearch.tsx`: a
+  centred overlay, filter by label / key / type, ↑/↓ + Enter or click to jump.
+  Picking a node `selectNode`s it and pans the canvas to it via
+  `useReactFlow().setCenter`.
+- **Export / Import JSON** — toolbar buttons. Export downloads
+  `<workflowName>.json` (the `toGraph()` output — already the wire format).
+  Import reads a file, `GraphSchema.safeParse`s it (a clear error notice on
+  mismatch), and `graphSlice.replaceGraph()` swaps the whole canvas in place
+  (keeps workflow identity, undoable, marks dirty). Read-only no-op.
+
+### Verification
+
+- `apps/web/src/store/graphSlice.test.ts` gains 4 cases: `autoLayout`
+  repositions but preserves keys/edges and the source ends up left of the
+  target, undoable; `replaceGraph` swaps the canvas, marks dirty, undoable;
+  both are no-ops on a read-only version. Web unit suite 19 tests (was 15).
+- Browser (Vite dev, no API): minimap renders and tracks the graph; dragged a
+  node out of line → "Tidy" snapped all four back into a clean LR row with
+  edges intact; Ctrl+K → overlay opens, `train` filters to one row, ArrowDown
+  ×2 + Enter selected "Train model" and centred the canvas on it, click-to-pick
+  also works. No console errors.
+- `pnpm -r typecheck` / `lint` green (7/7).
+
+### Not in this batch (remaining D3 items)
+
+Live validation panel, copy/paste/duplicate nodes (Ctrl+C/V/D), run comparison
+(two Gantt charts side by side), and the "start from a template" empty state —
+each still small, each its own follow-up.
+
+---
+
 ## 2026-09-06 — C4: observability (Prometheus + Grafana)
 
 **Phase:** roadmap C4. `apps/api/src/metrics.ts` has emitted the right series

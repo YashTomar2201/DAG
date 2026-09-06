@@ -11,13 +11,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@dag/contracts": "workspace:*",
+    "@dag/graph-core": "workspace:*",
+    "@dagrejs/dagre": "^3.1.1",
     "@xyflow/react": "^12.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "zustand": "^4.5.4",
     "zod": "^3.23.8",
-    "@dag/contracts": "workspace:*",
-    "@dag/graph-core": "workspace:*"
+    "zustand": "^4.5.4"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",

@@ -4,6 +4,7 @@ import {
   ReactFlowProvider,
   Background,
   Controls,
+  MiniMap,
   MarkerType,
   useReactFlow,
   type Connection,
@@ -13,6 +14,7 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { useGraphStore, type GraphSnapshot, type DagEdgeData } from './store/graphSlice';
+import { NodeSearch } from './components/NodeSearch';
 import { useRunStore } from './store/runSlice';
 import { summarizeCondition } from './lib/condition';
 import { CustomNode } from './components/CustomNode';
@@ -25,7 +27,7 @@ import { FanOutPanel } from './components/FanOutPanel';
 import { WorkflowMenu } from './components/WorkflowMenu';
 import { VersionMenu } from './components/VersionMenu';
 
-import type { Graph } from '@dag/contracts';
+import { GraphSchema, type Graph } from '@dag/contracts';
 import {
   createWorkflow,
   saveWorkflowVersion,
@@ -80,6 +82,8 @@ function AppCanvas() {
   const undo = useGraphStore((s) => s.undo);
   const redo = useGraphStore((s) => s.redo);
   const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
+  const autoLayout = useGraphStore((s) => s.autoLayout);
+  const replaceGraph = useGraphStore((s) => s.replaceGraph);
   const canUndo = useGraphStore((s) => s.past.length > 0);
   const canRedo = useGraphStore((s) => s.future.length > 0);
 
@@ -128,6 +132,8 @@ function AppCanvas() {
   // Bumped after any save / rename / delete so the WorkflowMenu list refetches.
   const [workflowsRefreshKey, setWorkflowsRefreshKey] = useState(0);
   const [nameDraft, setNameDraft] = useState(workflowName);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const importInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => setNameDraft(workflowName), [workflowName]);
 
   // Auto-dismiss success toasts; errors stay until the user acts or dismisses.
@@ -152,11 +158,43 @@ function AppCanvas() {
       } else if ((key === 'z' && e.shiftKey) || key === 'y') {
         e.preventDefault();
         redo();
+      } else if (key === 'k') {
+        e.preventDefault();
+        setSearchOpen((v) => !v);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [undo, redo]);
+
+  // ── Editor polish (D3): export / import the graph as JSON ─────────────────
+  const handleExportJson = useCallback(() => {
+    const graph = toGraph();
+    const blob = new Blob([JSON.stringify(graph, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${(workflowName || 'workflow').replace(/[^\w.-]+/g, '_')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [toGraph, workflowName]);
+
+  const handleImportJson = useCallback(
+    async (file: File) => {
+      try {
+        const parsed = GraphSchema.safeParse(JSON.parse(await file.text()));
+        if (!parsed.success) {
+          setNotice({ kind: 'error', text: `Not a valid workflow graph: ${parsed.error.issues[0]?.message ?? 'schema mismatch'}` });
+          return;
+        }
+        replaceGraph(parsed.data);
+        setNotice({ kind: 'success', text: `Imported ${parsed.data.nodes.length} node(s) — review and save.` });
+      } catch {
+        setNotice({ kind: 'error', text: 'Could not read that file as JSON.' });
+      }
+    },
+    [replaceGraph],
+  );
 
   const onConnect = useCallback(
     (connection: Connection) => onConnectStore(connection),
@@ -639,6 +677,46 @@ function AppCanvas() {
               <IconRedo size={17} />
             </button>
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 2, marginRight: 4 }}>
+            <button
+              className="btn-ghost"
+              style={{ height: 32, fontSize: 12, padding: '0 8px', color: 'var(--color-body)' }}
+              onClick={autoLayout}
+              disabled={isReadOnly || nodes.length === 0}
+              title="Auto-layout (dagre, left → right)"
+            >
+              Tidy
+            </button>
+            <button
+              className="btn-ghost"
+              style={{ height: 32, fontSize: 12, padding: '0 8px', color: 'var(--color-body)' }}
+              onClick={handleExportJson}
+              disabled={nodes.length === 0}
+              title="Export this graph as JSON"
+            >
+              Export
+            </button>
+            <button
+              className="btn-ghost"
+              style={{ height: 32, fontSize: 12, padding: '0 8px', color: 'var(--color-body)' }}
+              onClick={() => importInputRef.current?.click()}
+              disabled={isReadOnly}
+              title="Import a graph from a JSON file"
+            >
+              Import
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleImportJson(f);
+                e.target.value = '';
+              }}
+            />
+          </div>
           <button
             className="btn-secondary"
             onClick={handleSave}
@@ -796,6 +874,16 @@ function AppCanvas() {
           <RunHistory workflowId={workflowId} />
           <AutomationPanel workflowId={workflowId} />
           <FanOutPanel />
+          {searchOpen && (
+            <NodeSearch
+              nodes={nodes}
+              onClose={() => setSearchOpen(false)}
+              onPick={(id) => {
+                selectNode(id);
+                setSearchOpen(false);
+              }}
+            />
+          )}
 
           {/* Product Surface: DAG Canvas */}
           <div
@@ -835,6 +923,13 @@ function AppCanvas() {
             >
               <Background color="var(--color-surface-dark-elevated)" gap={18} size={1.5} />
               <Controls style={{ background: 'var(--color-surface-dark)', border: '1px solid var(--color-surface-dark-elevated)' }} />
+              <MiniMap
+                pannable
+                zoomable
+                style={{ background: 'var(--color-surface-dark)', border: '1px solid var(--color-surface-dark-elevated)' }}
+                maskColor="rgba(20,20,19,0.6)"
+                nodeColor="var(--color-primary)"
+              />
             </ReactFlow>
           </div>
 

@@ -23,9 +23,28 @@
 import { create } from 'zustand';
 import { applyNodeChanges, applyEdgeChanges, MarkerType } from '@xyflow/react';
 import type { Node, Edge, NodeChange, EdgeChange, Connection } from '@xyflow/react';
+import Dagre from '@dagrejs/dagre';
 import { detectCycle } from '@dag/graph-core';
 import type { Graph, Condition } from '@dag/contracts';
 import { serializeCondition } from '../lib/condition';
+
+// Rough on-canvas footprint of a CustomNode — dagre needs a size to space by.
+const NODE_W = 190;
+const NODE_H = 68;
+
+/** Left-to-right dagre layout. Pure — returns new position-only-changed nodes. */
+function layoutLR<T extends Node>(nodes: T[], edges: Edge[]): T[] {
+  const g = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
+  g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 90 });
+  nodes.forEach((n) => g.setNode(n.id, { width: NODE_W, height: NODE_H }));
+  edges.forEach((e) => g.setEdge(e.source, e.target));
+  Dagre.layout(g);
+  return nodes.map((n) => {
+    const p = g.node(n.id);
+    // dagre gives the node centre; nodeOrigin is [0.5,0.5] so that's what we want.
+    return { ...n, position: { x: p.x, y: p.y } };
+  });
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -114,6 +133,12 @@ export interface GraphState {
   clearCycleHighlight: () => void;
   markSaved: () => void;
   toGraph: () => Graph;
+
+  // ── Editor polish (D3) ───────────────────────────────────────────────────
+  /** Tidy the graph with a left-to-right dagre layout. Undoable. */
+  autoLayout: () => void;
+  /** Replace the whole canvas with an imported graph, keeping workflow identity. Undoable. */
+  replaceGraph: (graph: Graph) => void;
 
   // ── Workflow identity actions (D1.2) ──────────────────────────────────────
   /** Load a stored workflow: rebuild the canvas from `graph` and set identity. */
@@ -548,6 +573,30 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   clearCycleHighlight: () => set({ cycleHighlight: [] }),
   markSaved: () => set({ isDirty: false }),
+
+  // ── Editor polish (D3) ─────────────────────────────────────────────────────
+  autoLayout: () => {
+    if (get().isReadOnly) return;
+    set((s) => ({
+      ...withHistory(s),
+      nodes: layoutLR(s.nodes, s.edges),
+      isDirty: true,
+    }));
+  },
+
+  replaceGraph: (graph) => {
+    if (get().isReadOnly) return;
+    const { nodes, edges } = graphToFlow(graph);
+    set((s) => ({
+      ...withHistory(s),
+      nodes,
+      edges,
+      selectedNodeId: null,
+      selectedEdgeId: null,
+      cycleHighlight: [],
+      isDirty: true,
+    }));
+  },
 
   // ── Workflow identity (D1.2) ────────────────────────────────────────────────
 

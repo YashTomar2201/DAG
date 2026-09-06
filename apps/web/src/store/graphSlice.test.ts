@@ -161,3 +161,58 @@ describe('retry policy (B5)', () => {
     expect(firstNode(useGraphStore.getState().toGraph())).not.toHaveProperty('retryPolicy');
   });
 });
+
+describe('editor polish (D3)', () => {
+  it('autoLayout repositions nodes but preserves keys and edges', () => {
+    load(TWO_NODE_GRAPH);
+    // Stack both nodes at the origin so the layout must move at least one.
+    useGraphStore.setState({
+      nodes: useGraphStore.getState().nodes.map((n) => ({ ...n, position: { x: 0, y: 0 } })),
+    });
+    useGraphStore.getState().autoLayout();
+    const g = useGraphStore.getState().toGraph();
+    expect(g.nodes.map((n) => n.key).sort()).toEqual(['a', 'b']);
+    expect(g.edges).toEqual([{ from: 'a', to: 'b' }]);
+    // LR layout: 'a' (source) ends up left of 'b' (target).
+    const ax = g.nodes.find((n) => n.key === 'a')!.position.x;
+    const bx = g.nodes.find((n) => n.key === 'b')!.position.x;
+    expect(ax).toBeLessThan(bx);
+    expect(useGraphStore.getState().isDirty).toBe(true);
+    // Undoable — restores the pre-layout (stacked) positions.
+    useGraphStore.getState().undo();
+    expect(useGraphStore.getState().nodes.map((n) => n.position.x)).toEqual([0, 0]);
+  });
+
+  it('autoLayout is a no-op on a read-only version', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.setState({ isReadOnly: true, isDirty: false });
+    useGraphStore.getState().autoLayout();
+    expect(useGraphStore.getState().isDirty).toBe(false);
+  });
+
+  it('replaceGraph swaps the whole canvas, marks dirty, and is undoable', () => {
+    load(TWO_NODE_GRAPH);
+    const three = {
+      nodes: [
+        { key: 'x', label: 'X', type: 'data.source', config: {}, position: { x: 0, y: 0 } },
+        { key: 'y', label: 'Y', type: 'pandas.preprocess', config: {}, position: { x: 1, y: 0 } },
+        { key: 'z', label: 'Z', type: 'model.evaluate', config: {}, position: { x: 2, y: 0 } },
+      ],
+      edges: [{ from: 'x', to: 'y' }, { from: 'y', to: 'z' }],
+    } as unknown as Graph;
+    useGraphStore.getState().replaceGraph(three);
+    const g = useGraphStore.getState().toGraph();
+    expect(g.nodes.map((n) => n.key).sort()).toEqual(['x', 'y', 'z']);
+    expect(g.edges).toHaveLength(2);
+    expect(useGraphStore.getState().isDirty).toBe(true);
+    useGraphStore.getState().undo();
+    expect(useGraphStore.getState().toGraph().nodes.map((n) => n.key).sort()).toEqual(['a', 'b']);
+  });
+
+  it('replaceGraph is a no-op on a read-only version', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.setState({ isReadOnly: true });
+    useGraphStore.getState().replaceGraph({ nodes: [], edges: [] } as unknown as Graph);
+    expect(useGraphStore.getState().toGraph().nodes.map((n) => n.key).sort()).toEqual(['a', 'b']);
+  });
+});
