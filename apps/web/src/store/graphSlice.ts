@@ -32,6 +32,44 @@ import { serializeCondition } from '../lib/condition';
 const NODE_W = 190;
 const NODE_H = 68;
 
+/**
+ * Copy-paste / duplicate core (D3): re-key `srcNodes` (+ the edges among them)
+ * with fresh ids, nudge them down-right, select them, and append to the state.
+ * Undoable. Used by both `pasteClipboard` and `duplicateSelection`.
+ */
+function insertCopies(
+  s: GraphState,
+  srcNodes: Node<NodeData>[],
+  srcEdges: Edge[],
+): Partial<GraphState> {
+  const remap = new Map<string, string>();
+  const newNodes: Node<NodeData>[] = srcNodes.map((n) => {
+    const id = nextId();
+    remap.set(n.id, id);
+    return {
+      ...n,
+      id,
+      position: { x: n.position.x + 40, y: n.position.y + 40 },
+      selected: true,
+      data: { ...n.data, config: { ...n.data.config }, status: 'PENDING' },
+    };
+  });
+  const newEdges: Edge[] = srcEdges.map((e) => ({
+    ...e,
+    id: `e-${remap.get(e.source)}-${remap.get(e.target)}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    source: remap.get(e.source)!,
+    target: remap.get(e.target)!,
+  }));
+  return {
+    ...withHistory(s),
+    nodes: [...s.nodes.map((n) => ({ ...n, selected: false })), ...newNodes],
+    edges: [...s.edges, ...newEdges],
+    selectedNodeId: newNodes[0]?.id ?? s.selectedNodeId,
+    selectedEdgeId: null,
+    isDirty: true,
+  };
+}
+
 /** Left-to-right dagre layout. Pure — returns new position-only-changed nodes. */
 function layoutLR<T extends Node>(nodes: T[], edges: Edge[]): T[] {
   const g = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
@@ -139,6 +177,14 @@ export interface GraphState {
   autoLayout: () => void;
   /** Replace the whole canvas with an imported graph, keeping workflow identity. Undoable. */
   replaceGraph: (graph: Graph) => void;
+  /** Node/edge clipboard for copy-paste (Ctrl+C / Ctrl+V). */
+  clipboard: { nodes: Node<NodeData>[]; edges: Edge[] } | null;
+  /** Copy the currently-selected nodes (and edges between them) to the clipboard. */
+  copySelection: () => void;
+  /** Paste the clipboard onto the canvas, offset and re-keyed. Undoable. Selects the new nodes. */
+  pasteClipboard: () => void;
+  /** Copy + paste the current selection in one step (Ctrl+D). Undoable. */
+  duplicateSelection: () => void;
 
   // ── Workflow identity actions (D1.2) ──────────────────────────────────────
   /** Load a stored workflow: rebuild the canvas from `graph` and set identity. */
@@ -596,6 +642,38 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       cycleHighlight: [],
       isDirty: true,
     }));
+  },
+
+  clipboard: null,
+
+  copySelection: () => {
+    const { nodes, edges } = get();
+    const picked = nodes.filter((n) => n.selected);
+    if (picked.length === 0) return;
+    const ids = new Set(picked.map((n) => n.id));
+    set({
+      clipboard: {
+        nodes: picked.map((n) => ({ ...n, data: { ...n.data } })),
+        edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)),
+      },
+    });
+  },
+
+  pasteClipboard: () => {
+    if (get().isReadOnly) return;
+    const clip = get().clipboard;
+    if (!clip || clip.nodes.length === 0) return;
+    set((s) => insertCopies(s, clip.nodes, clip.edges));
+  },
+
+  duplicateSelection: () => {
+    if (get().isReadOnly) return;
+    const { nodes, edges } = get();
+    const picked = nodes.filter((n) => n.selected);
+    if (picked.length === 0) return;
+    const ids = new Set(picked.map((n) => n.id));
+    const innerEdges = edges.filter((e) => ids.has(e.source) && ids.has(e.target));
+    set((s) => insertCopies(s, picked, innerEdges));
   },
 
   // ── Workflow identity (D1.2) ────────────────────────────────────────────────

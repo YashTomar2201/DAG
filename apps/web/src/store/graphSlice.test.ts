@@ -216,3 +216,42 @@ describe('editor polish (D3)', () => {
     expect(useGraphStore.getState().toGraph().nodes.map((n) => n.key).sort()).toEqual(['a', 'b']);
   });
 });
+
+describe('copy / paste / duplicate (D3)', () => {
+  it('copySelection + pasteClipboard adds re-keyed copies of the selected nodes', () => {
+    load(TWO_NODE_GRAPH);
+    // Select both nodes (React Flow's `selected` flag).
+    useGraphStore.setState({ nodes: useGraphStore.getState().nodes.map((nd) => ({ ...nd, selected: true })) });
+    useGraphStore.getState().copySelection();
+    useGraphStore.getState().pasteClipboard();
+    const g = useGraphStore.getState().toGraph();
+    expect(g.nodes).toHaveLength(4);
+    // Original keys still present; two new ones added.
+    expect(g.nodes.filter((nd) => nd.key === 'a' || nd.key === 'b')).toHaveLength(2);
+    // The internal edge was copied too (2 edges now).
+    expect(g.edges).toHaveLength(2);
+    expect(useGraphStore.getState().isDirty).toBe(true);
+    // Undoable back to the 2-node graph.
+    useGraphStore.getState().undo();
+    expect(useGraphStore.getState().toGraph().nodes).toHaveLength(2);
+  });
+
+  it('duplicateSelection copies the selection in one step', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.setState({ nodes: useGraphStore.getState().nodes.map((nd) => ({ ...nd, selected: nd.id === 'a' })) });
+    useGraphStore.getState().duplicateSelection();
+    const g = useGraphStore.getState().toGraph();
+    expect(g.nodes).toHaveLength(3); // only 'a' was selected
+  });
+
+  it('paste / duplicate are no-ops with nothing selected or on a read-only version', () => {
+    load(TWO_NODE_GRAPH);
+    useGraphStore.getState().duplicateSelection(); // nothing selected
+    expect(useGraphStore.getState().toGraph().nodes).toHaveLength(2);
+
+    useGraphStore.setState({ nodes: useGraphStore.getState().nodes.map((nd) => ({ ...nd, selected: true })), isReadOnly: true });
+    useGraphStore.getState().copySelection();
+    useGraphStore.getState().pasteClipboard();
+    expect(useGraphStore.getState().toGraph().nodes).toHaveLength(2);
+  });
+});

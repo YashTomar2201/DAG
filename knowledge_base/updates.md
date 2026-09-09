@@ -5,6 +5,56 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-10 — D3 (batch 2): editor polish — copy/paste/duplicate, live validation, template empty-state
+
+**Phase:** roadmap D3, second batch (batch 1 did minimap / auto-layout / node
+search / JSON export-import).
+
+### Changes
+
+- **Copy / paste / duplicate nodes (Ctrl+C / V / D)** — `graphSlice` gains a
+  `clipboard` + `copySelection()` / `pasteClipboard()` / `duplicateSelection()`.
+  All go through one `insertCopies()` helper: re-keys the picked nodes (and the
+  edges among them) with fresh ids, nudges them +40/+40, resets node status,
+  selects the copies, pushes an undo snapshot, marks dirty. Read-only no-op.
+  Wired into `App.tsx`'s keydown handler — Ctrl+C/D only fire with a selection,
+  Ctrl+V only when the clipboard is non-empty (otherwise the browser's own
+  paste is left alone).
+- **Live validation panel** — new `apps/web/src/lib/graphIssues.ts`
+  (`collectGraphIssues(nodes, edges) → string[]`): missing required config,
+  incomplete edge conditions (B1.2), **orphan nodes** (>1 node, touches no
+  edge), **unreachable nodes** (not reachable by BFS forward from any root).
+  `validateGraphForSave` in `App.tsx` is now a thin formatter over it. New
+  `ValidationPanel.tsx` — a bottom-left badge showing the live issue count,
+  click to expand the list, ✕ to dismiss until the issue set changes.
+- **Template empty-state** — new `EmptyCanvas.tsx`: when the canvas has zero
+  nodes (and isn't a read-only version), a centred card offers three starting
+  points — "ML pipeline" (the reference extract→preprocess→train→evaluate),
+  "Single step" (one `data.source`), "Fan-out" (a `flow.map` + merge). Picking
+  one calls `replaceGraph`.
+
+### Verification
+
+- Web unit suite **29 tests** (was 19): `graphIssues.test.ts` (7 — empty
+  canvas clean, clean linear graph clean, missing config, orphan, lone node
+  not flagged, unreachable via a detached cycle, incomplete condition);
+  `graphSlice.test.ts` +3 (copy+paste doubles the node count with re-keyed
+  copies and the internal edge, undoable; `duplicateSelection` one-step;
+  no-op with nothing selected / on a read-only version).
+- Browser (Vite dev): selected a node, **Ctrl+D** → a configured copy appeared
+  offset + selected, and the validation panel popped up with `"Preprocess" is
+  not connected to anything`; **Ctrl+Z** removed the copy and the panel
+  cleared; deleting every node showed the **template picker**, and "ML
+  pipeline" loaded a clean 4-node graph. No console errors.
+- `pnpm -r typecheck` / `lint` green (7/7).
+
+### Remaining D3
+
+**Run comparison** (two Gantt charts side by side) is the last D3 item — a
+run picker plus a split Gantt layout. Own follow-up.
+
+---
+
 ## 2026-09-06 — D3 (batch 1): editor polish — minimap, auto-layout, node search, JSON export/import
 
 **Phase:** roadmap D3, which is a grab-bag of small opportunistic editor

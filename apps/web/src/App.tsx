@@ -15,6 +15,9 @@ import '@xyflow/react/dist/style.css';
 
 import { useGraphStore, type GraphSnapshot, type DagEdgeData } from './store/graphSlice';
 import { NodeSearch } from './components/NodeSearch';
+import { ValidationPanel } from './components/ValidationPanel';
+import { EmptyCanvas } from './components/EmptyCanvas';
+import { collectGraphIssues } from './lib/graphIssues';
 import { useRunStore } from './store/runSlice';
 import { summarizeCondition } from './lib/condition';
 import { CustomNode } from './components/CustomNode';
@@ -84,6 +87,9 @@ function AppCanvas() {
   const pushSnapshot = useGraphStore((s) => s.pushSnapshot);
   const autoLayout = useGraphStore((s) => s.autoLayout);
   const replaceGraph = useGraphStore((s) => s.replaceGraph);
+  const copySelection = useGraphStore((s) => s.copySelection);
+  const pasteClipboard = useGraphStore((s) => s.pasteClipboard);
+  const duplicateSelection = useGraphStore((s) => s.duplicateSelection);
   const canUndo = useGraphStore((s) => s.past.length > 0);
   const canRedo = useGraphStore((s) => s.future.length > 0);
 
@@ -152,6 +158,7 @@ function AppCanvas() {
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
       const key = e.key.toLowerCase();
+      const hasSelectedNode = useGraphStore.getState().nodes.some((n) => n.selected);
       if (key === 'z' && !e.shiftKey) {
         e.preventDefault();
         undo();
@@ -161,11 +168,24 @@ function AppCanvas() {
       } else if (key === 'k') {
         e.preventDefault();
         setSearchOpen((v) => !v);
+      } else if (key === 'c' && hasSelectedNode) {
+        e.preventDefault();
+        copySelection();
+      } else if (key === 'v') {
+        // Only intercept when we have something to paste — otherwise leave the
+        // browser's own paste alone.
+        if (useGraphStore.getState().clipboard) {
+          e.preventDefault();
+          pasteClipboard();
+        }
+      } else if (key === 'd' && hasSelectedNode) {
+        e.preventDefault();
+        duplicateSelection();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [undo, redo]);
+  }, [undo, redo, copySelection, pasteClipboard, duplicateSelection]);
 
   // ── Editor polish (D3): export / import the graph as JSON ─────────────────
   const handleExportJson = useCallback(() => {
@@ -317,43 +337,14 @@ function AppCanvas() {
    * in packages/contracts/src/node-types.ts. Checked client-side so the user
    * gets a clear, immediate error instead of a raw 400 from the API.
    */
-  const REQUIRED_CONFIG: Record<string, string[]> = {
-    // data.source needs nothing — it defaults to the bundled dataset.
-    'registry.deploy':   ['registryUrl', 'modelTag'],
-  };
+  // D3: continuously-evaluated problem list, shown live in the ValidationPanel
+  // and re-used by handleSave as the pre-flight gate.
+  const graphIssues = useMemo(() => collectGraphIssues(nodes, edges), [nodes, edges]);
 
   function validateGraphForSave(): string | null {
-    if (nodes.length === 0) {
-      return 'Add at least one node to the canvas before saving.';
-    }
-
-    const errors: string[] = [];
-    for (const node of nodes) {
-      const required = REQUIRED_CONFIG[node.data.nodeType] ?? [];
-      const missing = required.filter(
-        (field) => !node.data.config[field] || String(node.data.config[field]).trim() === ''
-      );
-      if (missing.length > 0) {
-        errors.push(`"${node.data.label}" is missing: ${missing.join(', ')}`);
-      }
-    }
-
-    // B1.2: an edge condition that was started but left blank would 400 at the
-    // API (`left` is `.min(1)`) — catch it here with a readable message.
-    const labelOf = (id: string) => nodes.find((n) => n.id === id)?.data.label ?? id;
-    for (const edge of edges) {
-      const c = (edge.data as DagEdgeData | undefined)?.condition;
-      if (!c) continue;
-      const rightBlank =
-        c.right === '' || c.right === undefined || c.right === null ||
-        (Array.isArray(c.right) && c.right.length === 0);
-      if (!c.left.trim() || rightBlank) {
-        errors.push(`Edge ${labelOf(edge.source)} → ${labelOf(edge.target)} has an incomplete condition`);
-      }
-    }
-
-    return errors.length > 0
-      ? `Fix these nodes before saving:\n${errors.map(e => `  • ${e}`).join('\n')}`
+    if (nodes.length === 0) return 'Add at least one node to the canvas before saving.';
+    return graphIssues.length > 0
+      ? `Fix these before saving:\n${graphIssues.map((e) => `  • ${e}`).join('\n')}`
       : null;
   }
 
@@ -931,6 +922,8 @@ function AppCanvas() {
                 nodeColor="var(--color-primary)"
               />
             </ReactFlow>
+            {!isReadOnly && nodes.length === 0 && <EmptyCanvas onPick={replaceGraph} />}
+            {!isReadOnly && <ValidationPanel issues={graphIssues} />}
           </div>
 
           <LogDrawer />
