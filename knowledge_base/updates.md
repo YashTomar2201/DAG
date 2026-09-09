@@ -5,6 +5,60 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-10 — D3 (batch 3): run comparison — two runs side by side in the Gantt view
+
+**Phase:** roadmap D3, final item ("Run comparison — two runs side by side in the
+Gantt view"). This closes Track D3.
+
+### What changed
+
+- **`components/GanttChart.tsx`** — two optional props so one chart can be read
+  against another:
+  - `scaleMaxMs` — a caller-supplied time-axis length. Both charts in a
+    comparison pass the same value (`max(spanA, spanB)`), so a node that ran 2×
+    longer looks 2× wider *across both* charts, not rescaled to fill each.
+  - `compareDurations` (`nodeKey → ms` from the other run) — renders a small
+    per-row Δ (`+4.2s` red = slower here, `−1.1s` green = faster, `≈` within
+    250 ms, `—` if the node isn't in the other run).
+  - Exposes pure helpers `nodeDurationMs(nr)` and `nodeDurations(nodeRuns)`
+    (unit-tested).
+- **`components/RunComparison.tsx` (new)** — a centered modal overlay. Two
+  columns (`flex-wrap` so it degrades to stacked on a narrow canvas), each a
+  header (timestamp · status · total wall-clock) over a `GanttChart` on the
+  shared scale. The right column gets `compareDurations` from the left
+  ("baseline") run. A summary strip shows `spanA → spanB` and the signed
+  wall-clock delta. `runSpanMs` prefers the run's own `startedAt→finishedAt`,
+  falling back to the envelope of its node runs.
+- **`components/RunHistory.tsx`** — each run row gets a compare button
+  (`IconCompare`). First click sets that row as the baseline (button turns
+  primary, a hint bar appears: "Pick another run to compare against"); clicking
+  a second row `Promise.all`s `getRun` for both and opens `<RunComparison>`;
+  clicking the baseline again or "Cancel" clears it. The overlay is rendered as
+  a sibling of the panel (both branches of the return wrapped in a fragment) so
+  it fills the canvas via `position: absolute; inset: 0`, matching `NodeSearch`.
+- **`components/icons.tsx`** — `IconCompare` (two columns).
+
+### Why a modal, not an in-panel view
+
+The run-history panel is 400 px wide — two Gantt charts plus a Δ column don't
+fit. A `min(920px, 100%-48px)` overlay does, and it dims the canvas so the
+comparison is clearly a focused mode you dismiss (Esc / backdrop click / X),
+not a new permanent panel.
+
+### Verification
+
+- `pnpm --filter @dag/web typecheck` + `lint` — clean.
+- `pnpm --filter @dag/web test` — **33 passed** (was 29; +4
+  `components/GanttChart.test.ts` covering `nodeDurationMs` null/│span│/skew and
+  `nodeDurations` filtering).
+- Browser (web dev server, no API): Run history panel opens with no render error
+  from the fragment restructure; console clean apart from the expected
+  `ERR_CONNECTION_REFUSED` (API not up). The overlay itself needs live run data
+  — not stood up here (pure-frontend rendering over typed data, covered by the
+  helpers' tests).
+
+---
+
 ## 2026-09-10 — C3.3 (partial): KEDA ScaledObject for the worker fleet
 
 **Phase:** roadmap C3.3. This lands the **manifest**; the live scale-up/down run

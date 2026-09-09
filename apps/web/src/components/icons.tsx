@@ -213,6 +213,17 @@ export function IconRetry(p: IconProps) {
   );
 }
 
+// Two timelines side by side — the run-comparison view (roadmap D3).
+export function IconCompare(p: IconProps) {
+  return (
+    <svg {...base(p)}>
+      <rect x="3" y="4" width="7" height="16" rx="1.5" />
+      <rect x="14" y="4" width="7" height="16" rx="1.5" />
+      <path d="M6 9h1M6 13h1M17 9h1M17 13h1" />
+    </svg>
+  );
+}
+
 export function IconUndo(p: IconProps) {
   return (
     <svg {...base(p)}>

@@ -13,7 +13,8 @@ import { useRunStore } from '../store/runSlice';
 import { useGraphStore } from '../store/graphSlice';
 import { getRun, getWorkflowRuns, retryFailed, type RunSummary, type WorkflowRunRow } from '../api/client';
 import { GanttChart } from './GanttChart';
-import { IconHistory, IconClose, IconRetry } from './icons';
+import { RunComparison } from './RunComparison';
+import { IconHistory, IconClose, IconRetry, IconCompare } from './icons';
 
 const STATUS_COLOR: Record<string, string> = {
   SUCCEEDED: 'var(--color-success)',
@@ -49,6 +50,13 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
   const [cursor, setCursor] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>('');
   const [loadingList, setLoadingList] = useState(false);
+
+  // Run comparison (roadmap D3): pick a baseline row, then a second row.
+  const [compareBaseId, setCompareBaseId] = useState<string | null>(null);
+  const [comparison, setComparison] = useState<
+    { a: RunSummary; b: RunSummary; labelA: string; labelB: string } | null
+  >(null);
+  const [comparing, setComparing] = useState(false);
 
   const runs = useRunStore(s => s.runs);
   const upsertRun = useRunStore(s => s.upsertRun);
@@ -155,28 +163,65 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
     }
   }
 
+  function labelForRun(run: DisplayRun): string {
+    const v = run.version != null ? `v${run.version}` : versionLabel[run.workflowVersionId];
+    return `${v ? `${v} · ` : ''}${formatRunTime(run.startedAt)}`;
+  }
+
+  // Baseline picked, second row clicked → pull both full runs and open the overlay.
+  async function handleCompareWith(target: DisplayRun) {
+    if (!compareBaseId || compareBaseId === target.id) return;
+    const base = displayRuns.find(r => r.id === compareBaseId);
+    if (!base) { setCompareBaseId(null); return; }
+    setComparing(true);
+    try {
+      const [a, b] = await Promise.all([getRun(compareBaseId), getRun(target.id)]);
+      setComparison({ a, b, labelA: labelForRun(base), labelB: labelForRun(target) });
+      setCompareBaseId(null);
+    } catch (e) {
+      console.error('Failed to load runs for comparison:', e);
+    } finally {
+      setComparing(false);
+    }
+  }
+
+  const comparisonOverlay = comparison && (
+    <RunComparison
+      runA={comparison.a}
+      runB={comparison.b}
+      labelA={comparison.labelA}
+      labelB={comparison.labelB}
+      nodeLabels={nodeLabels}
+      onClose={() => setComparison(null)}
+    />
+  );
+
   if (!isOpen) {
     return (
-      <button
-        onClick={() => setIsOpen(true)}
-        className="btn-secondary"
-        style={{
-          position: 'absolute',
-          top: 20,
-          right: 20,
-          zIndex: 10,
-          fontSize: 13,
-          background: 'var(--color-canvas)',
-          boxShadow: '0 4px 14px rgba(20,20,19,0.12)',
-        }}
-      >
-        <IconHistory size={15} />
-        Run history{runs.length > 0 ? ` · ${runs.length}` : ''}
-      </button>
+      <>
+        <button
+          onClick={() => setIsOpen(true)}
+          className="btn-secondary"
+          style={{
+            position: 'absolute',
+            top: 20,
+            right: 20,
+            zIndex: 10,
+            fontSize: 13,
+            background: 'var(--color-canvas)',
+            boxShadow: '0 4px 14px rgba(20,20,19,0.12)',
+          }}
+        >
+          <IconHistory size={15} />
+          Run history{runs.length > 0 ? ` · ${runs.length}` : ''}
+        </button>
+        {comparisonOverlay}
+      </>
     );
   }
 
   return (
+    <>
     <div className="animate-in" style={{
       position: 'absolute',
       top: 20,
@@ -227,6 +272,22 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
           </button>
         </div>
       </div>
+
+      {compareBaseId && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+          padding: '8px 20px', fontSize: 11, color: 'var(--color-ink)',
+          background: 'var(--color-surface-card)', borderBottom: '1px solid var(--color-hairline)',
+        }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <IconCompare size={13} />
+            {comparing ? 'Loading comparison…' : 'Pick another run to compare against'}
+          </span>
+          <button className="btn-ghost" style={{ fontSize: 11 }} onClick={() => setCompareBaseId(null)}>
+            Cancel
+          </button>
+        </div>
+      )}
 
       <div style={{ flex: 1, overflowY: 'auto', padding: '24px' }}>
         {!workflowId ? (
@@ -285,23 +346,49 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
                       </span>
                     )}
                   </span>
-                  <span style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 6,
-                    fontSize: 11,
-                    fontWeight: 600,
-                    letterSpacing: '0.03em',
-                    color: STATUS_COLOR[run.status] ?? 'var(--color-muted)',
-                  }}>
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <button
+                      className="btn-ghost"
+                      aria-label={compareBaseId === run.id ? 'Cancel comparison baseline' : 'Compare this run'}
+                      title={
+                        compareBaseId == null
+                          ? 'Compare with…'
+                          : compareBaseId === run.id
+                            ? 'Baseline — pick another run'
+                            : 'Compare against the baseline'
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (compareBaseId == null) setCompareBaseId(run.id);
+                        else if (compareBaseId === run.id) setCompareBaseId(null);
+                        else handleCompareWith(run);
+                      }}
+                      style={{
+                        padding: 3,
+                        color: compareBaseId === run.id ? 'var(--color-primary)' : 'var(--color-muted-soft)',
+                        background: compareBaseId === run.id ? 'var(--color-surface-soft)' : 'transparent',
+                      }}
+                    >
+                      <IconCompare size={14} />
+                    </button>
                     <span style={{
-                      width: 7,
-                      height: 7,
-                      borderRadius: '50%',
-                      background: STATUS_COLOR[run.status] ?? 'var(--color-muted)',
-                      animation: run.id === activeRunId && run.status === 'RUNNING' ? 'pulse 1.2s ease-in-out infinite' : 'none',
-                    }} />
-                    {run.status}{run.id === activeRunId ? ' · live' : ''}
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      letterSpacing: '0.03em',
+                      color: STATUS_COLOR[run.status] ?? 'var(--color-muted)',
+                    }}>
+                      <span style={{
+                        width: 7,
+                        height: 7,
+                        borderRadius: '50%',
+                        background: STATUS_COLOR[run.status] ?? 'var(--color-muted)',
+                        animation: run.id === activeRunId && run.status === 'RUNNING' ? 'pulse 1.2s ease-in-out infinite' : 'none',
+                      }} />
+                      {run.status}{run.id === activeRunId ? ' · live' : ''}
+                    </span>
                   </span>
                 </div>
 
@@ -351,5 +438,7 @@ export function RunHistory({ workflowId }: { workflowId: string | null }) {
         )}
       </div>
     </div>
+    {comparisonOverlay}
+    </>
   );
 }
