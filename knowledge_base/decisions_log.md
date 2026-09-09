@@ -1706,3 +1706,53 @@ stdio boundary into the Python scripts, plus a collector (Tempo/Jaeger) to
 receive it — so it is its own piece of work rather than something to bolt on at
 the end of the metrics PR. The metrics half of C4 (what a dashboard shows, what
 pages a human) stands on its own.
+
+---
+
+## Phase C3.3 — KEDA autoscaling (manifest only)
+
+### Decision: One `ScaledObject` on the worker Deployment, three Redis triggers
+
+**Why:** The `worker` Deployment is a single fleet that drains all three BullMQ
+queues (io / cpu / gpu — `apps/worker/src/worker.ts` starts one `Worker` per
+queue in the same process). Scaling on one queue's depth would under-provision
+whenever the load is on another. KEDA emits one external metric per trigger and
+the HPA scales on whichever is highest, which is the right behaviour for a
+shared fleet. gpu gets `listLength: "4"` (not 20) because those jobs are heavy
+and run at concurrency 1 — a shorter target queue per replica makes a burst of
+training jobs actually fan out.
+
+**Trade-off:** Three separate worker Deployments (one per queue) would allow
+per-queue replica ceilings and node pools (real GPU nodes for `torch.train`).
+That is the correct shape for a production GPU cluster but a large structural
+change to the manifests, the image, and `worker.ts`'s startup — out of scope
+for "prove horizontal scaling works".
+
+### Decision: Keep the ScaledObject out of the kustomize base
+
+**Why:** `keda.sh/v1alpha1` is a CRD that only exists after `helm install keda`.
+Folding `keda-scaledobject.yaml` into `kustomization.yaml` would make a plain
+`kubectl apply -k infra/k8s` fail on any cluster without KEDA — including the
+single-node kind path in the README. Same call already made for
+`servicemonitor.yaml` (needs the Prometheus Operator CRD). It is applied with a
+standalone `kubectl apply -f`.
+
+### Decision: Scale-down safety is C3.2's job, not the ScaledObject's
+
+**Why:** Neither KEDA nor the HPA can tell which replica is running a job, so
+scale-down can and will target a busy pod. Rather than try to encode "don't
+evict busy pods" into the autoscaler (KEDA has no such primitive), the pod's
+own SIGTERM path handles it: `worker.close()` stops new-job polling and
+`terminationGracePeriodSeconds: 3600` holds off SIGKILL until the in-flight job
+finishes. The `scaleDown` stabilization window (300s) and `cooldownPeriod` only
+damp thrashing. Documented inline in the manifest so the next reader doesn't go
+looking for eviction-guard config that isn't there.
+
+### Known gap: not verified on a live cluster
+
+The 500-run scale-up, the scale-down-doesn't-drop-work check, and the A4
+benchmark re-run on separate machines all need a real multi-node cluster with
+headroom for KEDA + the stack + ~10 worker pods. The 8 GB dev box can't host
+it. `infra/k8s/README.md` carries the verification commands and an Oracle Cloud
+Always-Free (2×2-OCPU/12 GB Arm k3s) bring-up sketch for when a cluster is
+available. `KNOWN_LIMITATIONS.md` §7 tracks it as "C3.3 partial".

@@ -137,6 +137,55 @@ kubectl -n dag-engine drain <node> --dry-run=server --ignore-daemonsets   # woul
 
 ---
 
+## C3.3 — KEDA autoscaling
+
+`infra/k8s/keda-scaledobject.yaml` drives the `worker` Deployment off the
+combined Redis backlog (`bull:{cpu,io,gpu}:wait` list length): `minReplicaCount:
+1`, `maxReplicaCount: 20`, target 20 waiting jobs per replica. It is **not** in
+`kustomization.yaml` — the `keda.sh` CRDs only exist after KEDA is installed —
+so apply it on its own.
+
+```bash
+# 1. Install KEDA (once per cluster).
+helm repo add kedacore https://kedacore.github.io/charts && helm repo update
+helm install keda kedacore/keda -n keda --create-namespace
+kubectl -n keda rollout status deploy/keda-operator
+
+# 2. Apply the ScaledObject. KEDA creates an HPA named keda-hpa-worker.
+kubectl apply -f infra/k8s/keda-scaledobject.yaml
+kubectl -n dag-engine get scaledobject,hpa
+
+# 3. Scale-up: fire a batch of runs and watch the fleet grow.
+#    (reuse $KEY / $VID from the smoke test above)
+for i in $(seq 1 500); do
+  curl -s -XPOST localhost:3001/runs -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' -d "{\"workflowVersionId\":\"$VID\"}" >/dev/null
+done
+kubectl -n dag-engine get hpa keda-hpa-worker -w   # REPLICAS climbs 1 -> ~10 within a poll or two
+kubectl -n dag-engine get pods -l app=worker -o wide   # spread across nodes on a multi-node cluster
+
+# 4. Scale-down never kills running work. While the backlog drains, note a
+#    worker pod that is mid-job (its logs show an active runId), then wait for
+#    KEDA's 5-min scaleDown window: that pod goes Terminating but stays Up until
+#    its job finishes (grace period + worker.close() drain), and the run still
+#    reaches SUCCEEDED. After cooldownPeriod the HPA settles back to 1.
+kubectl -n dag-engine get hpa keda-hpa-worker -w   # REPLICAS falls back to 1
+
+# Remove KEDA's control and restore worker.yaml's replicas: 2
+kubectl delete -f infra/k8s/keda-scaledobject.yaml
+```
+
+`benchmarks/` — re-run the A4 harness against this cluster (workers on separate
+nodes) to replace the single-host `docker compose --scale` curve. Needs a
+cluster with headroom for KEDA + the stack + ~10 worker pods; the 8 GB dev box
+can't, but Oracle Cloud Always-Free (4 Arm OCPU / 24 GB, up to 4 VMs → a 2-node
+k3s cluster) can. Sketch: provision 2 `VM.Standard.A1.Flex` (2 OCPU / 12 GB)
+Ubuntu VMs, `curl -sfL https://get.k3s.io | sh -` on the first, join the second
+with `K3S_URL`/`K3S_TOKEN`, build the images for `linux/arm64`, then follow the
+steps above.
+
+---
+
 ## Multi-node / S3
 
 ```bash

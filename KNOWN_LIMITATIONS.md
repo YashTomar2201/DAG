@@ -232,7 +232,7 @@ Full write-ups in [`knowledge_base/updates.md`](knowledge_base/updates.md).
 
 ---
 
-## 7. No Horizontal Scaling Proven Across Multiple Machines — 🟡 IN PROGRESS (roadmap C3.1 + C3.2 done, C3.3 open)
+## 7. No Horizontal Scaling Proven Across Multiple Machines — 🟡 IN PROGRESS (roadmap C3.1 + C3.2 done, C3.3 partial)
 
 **What exists:** `docker compose up --scale worker=4` starts four worker containers on the *same
 Docker host* sharing the same CPU. The scale test confirms the dispatch/queue architecture is
@@ -265,11 +265,23 @@ on docker-compose: `stop redis` → `/health/ready` 503 in ~2s on both api and w
 container stays Up 3+ min draining, job keeps running, then Exited (0); the run completes. Full
 write-up in `knowledge_base/updates.md`'s C3.2 entry.
 
+**C3.3 (partial — manifest only):** `infra/k8s/keda-scaledobject.yaml` is a committed KEDA
+`ScaledObject` on the `worker` Deployment — three `redis` triggers on `bull:{cpu,io,gpu}:wait`
+list length, `minReplicaCount: 1`, `maxReplicaCount: 20`, a `scaleDown` stabilization window, and
+`fallback` replicas if Redis metrics go unreadable. It is kept out of `kustomization.yaml`'s
+`resources:` (the `keda.sh/v1alpha1` CRDs only exist once KEDA is `helm install`ed) and applied
+separately; bring-up steps and the scale-up/scale-down verification commands are in
+`infra/k8s/README.md`'s "C3.3 — KEDA autoscaling" section.
+
 **What is still missing (C3.3):**
-- KEDA `ScaledObject` on Redis list length (`bull:cpu:wait`) driving `worker` replicas 1→N
-  automatically, verified for scale-up *and* scale-down (scale-down never killing running work —
-  which is what C3.2's grace period + PDB now buy), plus the A4 benchmark re-run on genuinely
-  separate machines for a real horizontal-scaling curve.
+- A **live run** of that `ScaledObject`: submit ~500 runs, watch KEDA take `worker` from 1 → ~10
+  and back to 1, and confirm a scale-down target pod drains its in-flight job instead of dropping
+  it (the grace period + PDB from C3.2 are what make this safe — the manifest just triggers it).
+- The **A4 benchmark re-run on genuinely separate machines** for a real horizontal-scaling curve
+  to replace the single-host `docker compose --scale` numbers the README currently cites.
+- Both need a real multi-node cluster with headroom for KEDA + the stack + ~10 worker pods
+  (~more than the 8 GB dev box has). Oracle Cloud's Always-Free tier (4 Arm OCPU / 24 GB across up
+  to 4 VMs) is enough for it; steps are sketched in `infra/k8s/README.md`.
 
 ---
 

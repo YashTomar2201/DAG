@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# KEDA autoscaling for the worker fleet (roadmap C3.3).
+#
+# NOT in kustomization.yaml's `resources:` — the `keda.sh/v1alpha1` CRDs only
+# exist on a cluster where KEDA is installed, so a plain `kubectl apply -k
+# infra/k8s` on a bare cluster must not fail on this file. Apply it separately,
+# after KEDA:
+#
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm install keda kedacore/keda -n keda --create-namespace
+#   kubectl apply -f infra/k8s/keda-scaledobject.yaml
+#
+# ── What it does ────────────────────────────────────────────────────────────
+# The `worker` Deployment (infra/k8s/worker.yaml) is a single fleet that drains
+# all three BullMQ queues (io / cpu / gpu). This ScaledObject drives its replica
+# count off the *combined* backlog: KEDA publishes one external metric per
+# trigger and the HPA scales on whichever is highest. A queue's waiting jobs
+# live in the Redis list `bull:<queue>:wait` (default BullMQ prefix `bull`, no
+# custom prefix is set in packages/queue/src/queues.ts).
+#
+# listLength "20" = target 20 waiting jobs per replica, so:
+#   backlog   40 ->  2 replicas
+#   backlog  200 -> 10 replicas
+#   backlog >=400 -> 20 replicas (maxReplicaCount cap)
+#
+# ── Scale-down safety ──────────────────────────────────────────────────────
+# HPA/KEDA can't see which pods hold running jobs, so scale-down may target a
+# busy one. That pod is not "killed mid-job": it gets SIGTERM, worker.close()
+# stops new-job polling and lets the in-flight job finish, and
+# terminationGracePeriodSeconds: 3600 (worker.yaml) holds off SIGKILL until it
+# does. This is exactly what roadmap C3.2 bought. cooldownPeriod + the scaleDown
+# stabilization window below just damp thrashing on a bursty queue.
+#
+# ── Tuning for long jobs ───────────────────────────────────────────────────
+# cooldownPeriod (300s here) is the wait after the last trigger fires before
+# KEDA returns to minReplicaCount. torch.train's hard ceiling is 4h
+# (apps/worker/src/executors.ts); an environment that routinely runs multi-hour
+# jobs and wants scale-down to wait them out (rather than lean on the grace
+# period) should raise cooldownPeriod toward 14400 and lengthen
+# terminationGracePeriodSeconds to match.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+  namespace: dag-engine
+  labels:
+    app: worker
+    app.kubernetes.io/part-of: dag-engine
+spec:
+  scaleTargetRef:
+    name: worker
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  # How often KEDA polls the Redis lists.
+  pollingInterval: 15
+  # Idle period after the last active trigger before scaling back to min.
+  cooldownPeriod: 300
+  # If Redis is unreachable when KEDA tries to read the metric, hold the fleet
+  # at 3 rather than letting the HPA go stale / flap.
+  fallback:
+    failureThreshold: 3
+    replicas: 3
+  advanced:
+    # On `kubectl delete scaledobject worker`, put the Deployment back to the
+    # replica count it had before KEDA took over (worker.yaml's `replicas: 2`).
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          # React fast to a backlog: allow doubling every 30s.
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 30
+            - type: Pods
+              value: 5
+              periodSeconds: 30
+          selectPolicy: Max
+        scaleDown:
+          # Only shrink once the backlog has stayed low for 5 min, then at most
+          # 25% of the fleet per minute — a drained pod still takes its grace
+          # period to exit, so there's no value in yanking many at once.
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Percent
+              value: 25
+              periodSeconds: 60
+  triggers:
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: bull:cpu:wait
+        listLength: "20"
+        activationListLength: "0"
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: bull:io:wait
+        listLength: "20"
+        activationListLength: "0"
+    - type: redis
+      metadata:
+        address: redis:6379
+        listName: bull:gpu:wait
+        # GPU jobs are heavy and usually run at worker concurrency 1; target a
+        # shorter queue per replica so a burst of training jobs still fans out.
+        listLength: "4"
+        activationListLength: "0"

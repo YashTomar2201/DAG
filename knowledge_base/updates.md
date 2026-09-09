@@ -5,6 +5,52 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-10 — C3.3 (partial): KEDA ScaledObject for the worker fleet
+
+**Phase:** roadmap C3.3. This lands the **manifest**; the live scale-up/down run
+and the multi-machine benchmark stay open (they need a real cluster the 8 GB dev
+box can't host — see `KNOWN_LIMITATIONS.md` §7).
+
+### What changed
+
+- **`infra/k8s/keda-scaledobject.yaml` (new).** A KEDA `ScaledObject` targeting
+  the `worker` Deployment with three `redis` triggers on `bull:{cpu,io,gpu}:wait`
+  list length. `minReplicaCount: 1`, `maxReplicaCount: 20`, `listLength: "20"`
+  (cpu/io) / `"4"` (gpu — heavier jobs, concurrency 1). `pollingInterval: 15`,
+  `cooldownPeriod: 300`. `advanced.horizontalPodAutoscalerConfig.behavior`:
+  `scaleUp` reacts immediately (100%/30s or +5 pods), `scaleDown` waits a 5-min
+  stabilization window then trims ≤25%/min. `fallback` holds 3 replicas if the
+  Redis metric goes unreadable; `restoreToOriginalReplicaCount: true` puts the
+  Deployment back to `replicas: 2` on delete.
+- **One fleet, combined backlog.** The `worker` Deployment drains all three
+  BullMQ queues, so scaling on any single queue would under-provision. KEDA
+  publishes one external metric per trigger and the HPA scales on the max —
+  correct for a shared fleet.
+- **Not in `kustomization.yaml`.** Same rule as `servicemonitor.yaml`: the
+  `keda.sh/v1alpha1` CRDs only exist once KEDA is `helm install`ed, so a bare
+  `kubectl apply -k infra/k8s` must not choke on it. Applied separately.
+- **`infra/k8s/README.md`** — new "C3.3 — KEDA autoscaling" section: install
+  KEDA, apply the ScaledObject, a 500-run scale-up loop, watching
+  `keda-hpa-worker`, the scale-down-doesn't-kill-work check, teardown, and the
+  Oracle-Cloud Always-Free sketch for the multi-node benchmark.
+- **`KNOWN_LIMITATIONS.md` §7** — retitled "C3.3 partial"; records the manifest
+  as done and names exactly what a cluster is still needed for.
+
+### Scale-down safety (unchanged, worth restating)
+
+KEDA/HPA can't see which pods hold running jobs. A pod picked for scale-down
+gets SIGTERM → `worker.close()` stops new-job polling → the in-flight job
+finishes under `terminationGracePeriodSeconds: 3600` before SIGKILL. That is
+the C3.2 machinery; the ScaledObject only pulls its trigger.
+
+### Verification
+
+- `python -c "import yaml; yaml.safe_load(open(...))"` — parses; triggers resolve
+  to `bull:cpu:wait` / `bull:io:wait` / `bull:gpu:wait`.
+- **Not** applied to a live cluster — deferred with the benchmark.
+
+---
+
 ## 2026-09-10 — D3 (batch 2): editor polish — copy/paste/duplicate, live validation, template empty-state
 
 **Phase:** roadmap D3, second batch (batch 1 did minimap / auto-layout / node
