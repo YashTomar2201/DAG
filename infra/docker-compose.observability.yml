@@ -1,23 +1,54 @@
 # ─── Observability overlay (roadmap C4) ───────────────────────────────────────
 #
-# Adds Prometheus + Grafana. The API already emits everything at /metrics
-# (apps/api/src/metrics.ts) — nothing consumed it. Apply on top of the base
-# stack:
+# Adds Prometheus + Grafana (metrics) and Jaeger (distributed tracing). The API
+# already emits everything at /metrics (apps/api/src/metrics.ts) — nothing
+# consumed it; tracing (roadmap C4 step 4) is off in the base stack and this
+# overlay switches it on by pointing api + worker at the Jaeger collector.
+# Apply on top of the base stack:
 #
 #   docker compose -f infra/docker-compose.yml -f infra/docker-compose.observability.yml \
 #     up --build -d
 #
-#   Grafana:    http://localhost:3000   (admin / admin — dev only)
+#   Grafana:    http://localhost:3000    (admin / admin — dev only)
 #   Prometheus: http://localhost:9090
+#   Jaeger UI:  http://localhost:16686
 #
 # The Grafana datasource and the "DAG Engine" dashboard are auto-provisioned
 # (infra/grafana/provisioning/**), so there is zero click-through setup.
 # The base docker-compose.yml is untouched — this overlay is opt-in, the same
-# pattern as docker-compose.s3.yml.
+# pattern as docker-compose.s3.yml. Tracing is opt-in the same way: without
+# OTEL_EXPORTER_OTLP_ENDPOINT (set only here) `@dag/otel` is a no-op.
 #
 # ──────────────────────────────────────────────────────────────────────────────
 
 services:
+  # Turn tracing on for the control plane + data plane by pointing them at
+  # Jaeger's OTLP/HTTP receiver. These `environment` keys merge onto the base
+  # service definitions.
+  api:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: dag-api
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  worker:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_SERVICE_NAME: dag-worker
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # web UI
+      - "4318:4318"      # OTLP/HTTP (api, worker, and the Python subprocess)
   prometheus:
     image: prom/prometheus:v3.1.0
     restart: unless-stopped

@@ -7,10 +7,12 @@
  *   3. Bind to the configured port and log the address.
  *   4. Handle graceful shutdown on SIGTERM / SIGINT.
  */
+import './tracing'; // must be first — patches http/express/pg/ioredis before they load
 import { env } from './env';
 import { createApp } from './app';
 import { logger } from './logger';
 import { prisma } from '@dag/db';
+import { stopTracing } from '@dag/otel';
 import { startQueueEventListeners } from './worker-events';
 import { startSchedulerWorker } from './scheduler-worker';
 import { sweepBlockedDispatches } from './services/orchestrator.service';
@@ -64,6 +66,7 @@ async function shutdown(signal: string) {
   // 3. Stop accepting new connections; let in-flight requests finish.
   server.close(async () => {
     await prisma.$disconnect();
+    await stopTracing();
     logger.info('Server closed, Prisma disconnected');
     process.exit(0);
   });

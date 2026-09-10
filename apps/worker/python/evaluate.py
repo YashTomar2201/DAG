@@ -114,4 +114,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from otel_trace import traced
+
+    with traced("evaluate.py"):
+        main()

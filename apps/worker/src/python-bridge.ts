@@ -22,6 +22,7 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import { logger } from './logger';
 import { UnrecoverableError } from 'bullmq';
+import { withSpan, traceparentEnv, SpanKind } from '@dag/otel';
 
 const PYTHON_DIR = path.resolve(process.cwd(), 'python');
 const RESULT_PREFIX = '::RESULT::';
@@ -50,23 +51,31 @@ export class PythonCancelledError extends Error {
 
 export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
   const { scriptPath, input, timeoutMs = DEFAULT_TIMEOUT_MS, signal, onLog } = opts;
+  const absPath = path.isAbsolute(scriptPath)
+    ? scriptPath
+    : path.join(PYTHON_DIR, scriptPath);
 
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new PythonCancelledError(scriptPath));
-      return;
-    }
-    const absPath = path.isAbsolute(scriptPath)
-      ? scriptPath
-      : path.join(PYTHON_DIR, scriptPath);
+  // A span for the subprocess (roadmap C4), child of the worker's execution
+  // span. `TRACEPARENT` in the child env lets an instrumented script continue
+  // the same trace one level deeper.
+  return withSpan(
+    `python ${path.basename(absPath)}`,
+    { kind: SpanKind.CLIENT, attributes: { 'code.filepath': absPath } },
+    (span) =>
+      new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new PythonCancelledError(scriptPath));
+          return;
+        }
 
-    logger.debug({ script: absPath }, 'Spawning Python process');
+        logger.debug({ script: absPath }, 'Spawning Python process');
 
-    const child = spawn('python3', [absPath], {
-      // detached: true so we can kill the entire process GROUP on timeout
-      detached: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+        const child = spawn('python3', [absPath], {
+          // detached: true so we can kill the entire process GROUP on timeout
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...process.env, ...traceparentEnv() },
+        });
 
     // ── Write input to stdin ────────────────────────────────────────────────
     child.stdin.write(JSON.stringify(input) + '\n');
@@ -128,6 +137,7 @@ export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
     child.on('close', (code) => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
+      span.setAttribute('process.exit_code', code ?? -1);
 
       if (code !== 0) {
         const tail = stderrLines.slice(-20).join('\n');
@@ -185,5 +195,6 @@ export async function runPython(opts: PythonBridgeOptions): Promise<unknown> {
         reject(err);
       }
     });
-  });
+    }),
+  );
 }

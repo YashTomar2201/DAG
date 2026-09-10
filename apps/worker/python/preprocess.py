@@ -179,4 +179,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from otel_trace import traced
+
+    with traced("preprocess.py"):
+        main()

@@ -1696,16 +1696,11 @@ with no new metric to add and no new call site to instrument. The histogram was
 built (Phase 12) for latency percentiles; it doubles as the completion counter
 for free.
 
-### Known gap: OpenTelemetry tracing is deferred
+### Known gap: OpenTelemetry tracing is deferred → CLOSED 2026-09-10 (see below)
 
 Roadmap C4 step 4 (a single trace spanning API dispatch → queue wait → worker
-execution → Python subprocess, keyed by run id) is not built. It is a genuinely
-cross-cutting change — the OTel SDK and context propagation have to be threaded
-through `apps/api`'s dispatch path, `apps/worker`'s `processJob`, and across the
-stdio boundary into the Python scripts, plus a collector (Tempo/Jaeger) to
-receive it — so it is its own piece of work rather than something to bolt on at
-the end of the metrics PR. The metrics half of C4 (what a dashboard shows, what
-pages a human) stands on its own.
+execution → Python subprocess, keyed by run id) was split out of the metrics PR
+as its own cross-cutting change. It shipped 2026-09-10 — decisions below.
 
 ---
 
@@ -1756,3 +1751,73 @@ headroom for KEDA + the stack + ~10 worker pods. The 8 GB dev box can't host
 it. `infra/k8s/README.md` carries the verification commands and an Oracle Cloud
 Always-Free (2×2-OCPU/12 GB Arm k3s) bring-up sketch for when a cluster is
 available. `KNOWN_LIMITATIONS.md` §7 tracks it as "C3.3 partial".
+
+---
+
+## Phase C4 step 4 — OpenTelemetry distributed tracing
+
+### Decision: The run id IS the trace id (deterministic, not a lookup)
+
+**Why:** The roadmap asks for "the run id as trace id". A real OTel trace id is
+16 bytes / 32 hex; a run id is a cuid. Rather than store a run→trace mapping, or
+override the global `IdGenerator` (which takes no arguments, so it can't see the
+run id), `runTraceId(runId) = sha256(runId).hex[:32]` and every span for the run
+starts under `runContext(runId)` — a `trace.setSpanContext` context holding a
+non-recording *remote* parent pinned to that id. Any span started in that
+context inherits the id. Given a run id you compute its trace id offline and
+open it directly in Jaeger.
+
+**Trade-off:** there's no single real "root span" for the whole run — the trace's
+top-level spans are the per-node `dispatch` spans, all sharing the derived id
+via a phantom parent. Jaeger renders that fine. A true root span would need a
+process that lives for the whole run (runs span minutes-to-hours across three
+processes), which nothing here is. The phantom-parent approach is the honest
+minimum that still delivers "jump from run id to trace".
+
+### Decision: Propagate W3C context on the job payload, not via Redis keys
+
+**Why:** The API and worker are different processes with no shared span. The
+standard fix is to carry `traceparent` across the boundary. BullMQ job data is
+already a JSON blob the worker reads first thing, so `JobPayload.otel` (a W3C
+carrier) rides along for free — `dispatchNode` calls `injectContext()` inside
+its `dispatch` span, `processJob` calls `extractContext(job.data.otel)` to
+parent its `execute` span. No new Redis keys, no coupling to the tenant-key
+scheme from C2.2.
+
+### Decision: Tracing is opt-in, gated purely on `OTEL_EXPORTER_OTLP_ENDPOINT`
+
+**Why:** Same posture as the metrics half of C4 and `docker-compose.s3.yml` —
+the base dev/compose/test setup must not change. `startTracing()` returns
+immediately when the endpoint env is unset; `withSpan` then resolves to a
+no-op tracer (callback runs, no span), and the inject/extract helpers return
+empty carriers (so `JobPayload.otel` is just absent). The observability overlay
+is the only place the endpoint is set, and it also adds the Jaeger service.
+No separate `OTEL_ENABLED` flag — presence of the endpoint is the switch.
+
+### Decision: Jaeger all-in-one, not a Tempo/collector stack
+
+**Why:** Jaeger `all-in-one:1.62.0` is one ~100 MB container with an OTLP
+receiver and a query UI built in — no separate collector, no object storage, no
+extra config. On an 8 GB box that matters. Tempo + a collector + Grafana
+datasource wiring would be the "real" production choice but buys nothing for
+"can I see the trace".
+
+### Decision: Python tracing is best-effort, in the image but never required
+
+**Why:** `otel_trace.py`'s `traced()` is a no-op unless *both* `TRACEPARENT` and
+the OTLP endpoint are in the env *and* the `opentelemetry-*` wheels import — so
+`preprocess.py` / `train.py` / `evaluate.py` run identically by hand or in a
+non-traced deployment, and `fail.py` (a test fixture) is left alone. The wheels
+(~1 MB, pure Python) are added to `requirements.txt` so a traced run *does*
+reach into the subprocess, but nothing breaks if a future slimmer image drops
+them.
+
+### Verified
+
+The Node path — SDK boot, OTLP/HTTP export, `runContext` pinning, and
+`inject`→`extract` chaining `dispatch`→`execute`→`python` into one trace at
+`sha256(runId)[:32]` — was confirmed live against a `docker run` Jaeger by a
+harness that exercises the real `@dag/otel` functions and then reads the trace
+back from Jaeger's query API. The full in-container ML pipeline with the Python
+SDK exporting its own span was not run (needs the image rebuild + full stack +
+Jaeger, over budget on this box); it's a documented best-effort.

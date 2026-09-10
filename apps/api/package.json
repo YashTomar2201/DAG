@@ -17,6 +17,7 @@
     "@dag/contracts": "workspace:*",
     "@dag/db": "workspace:*",
     "@dag/graph-core": "workspace:*",
+    "@dag/otel": "workspace:*",
     "@dag/queue": "workspace:*",
     "bullmq": "^5.8.2",
     "express": "^4.19.2",

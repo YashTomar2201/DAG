@@ -35,6 +35,12 @@ export const JobPayloadSchema = z.object({
    * carries the base delay.
    */
   retryCap: z.number().int().positive().optional(),
+  /**
+   * W3C trace-context carrier (`traceparent` / `tracestate`) injected by the
+   * API at dispatch (roadmap C4). The worker extracts it so its execution span
+   * is a child of the dispatch span. Absent when tracing is disabled.
+   */
+  otel: z.record(z.string()).optional(),
 });
 
 export type JobPayload = z.infer<typeof JobPayloadSchema>;

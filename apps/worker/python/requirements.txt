@@ -12,3 +12,10 @@ pandas==2.2.3
 scikit-learn==1.5.2
 joblib==1.4.2
 pyarrow==17.0.0
+
+# roadmap C4 step 4 — optional distributed tracing. otel_trace.py imports these
+# lazily and no-ops if they're missing or TRACEPARENT is unset, so the executor
+# scripts still run without them; they're in the image so a traced run reaches
+# into the Python subprocess. ~1 MB of pure-python wheels, no native build.
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0

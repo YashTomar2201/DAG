@@ -337,7 +337,15 @@ breakdowns, API process health). Three alert rules: `QueueBacklog` (>20 waiting 
 15m — the "killed all workers" signal). A k8s `ServiceMonitor` (`infra/k8s/servicemonitor.yaml`,
 applied separately — needs the Prometheus Operator CRD) covers the cluster case.
 
-**Still open (the remaining C4 piece):** distributed tracing. Roadmap C4 step 4 wants
-OpenTelemetry with the run id as trace id — one span tree from API dispatch → queue wait → worker
-execution → Python subprocess. Not built; it's a cross-cutting instrumentation change across
-`apps/api`, `apps/worker`, and the Python bridge plus a collector, so it's its own piece of work.
+**Distributed tracing (C4 step 4, done 2026-09-10):** `@dag/otel` wires OpenTelemetry through the
+API and worker. The **run id is the trace id** — `runTraceId(runId) = sha256(runId)[:32]`, so
+every span for a run shares one trace you can open directly from a run id. `dispatchNode` injects
+W3C `traceparent` onto the BullMQ job (`JobPayload.otel`); the worker extracts it so its
+`execute <nodeKey>` span is a child of the API's `dispatch <nodeKey>` span; the Python bridge
+passes `TRACEPARENT` to the subprocess and `apps/worker/python/otel_trace.py` continues the trace
+into `preprocess.py` / `train.py` / `evaluate.py`. All **opt-in** — no-ops unless
+`OTEL_EXPORTER_OTLP_ENDPOINT` is set, which `infra/docker-compose.observability.yml` does
+alongside a Jaeger service (`all-in-one`, UI on :16686). Verified live against Jaeger that one
+trace at the derived id spans `dispatch → execute → python`; the full in-container pipeline with
+the Python SDK's own span export wasn't run (needs the image rebuild + full stack, over budget on
+the 8 GB box). **C4 is now fully closed.**

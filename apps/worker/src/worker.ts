@@ -18,6 +18,7 @@ import { Worker, UnrecoverableError, type Job } from 'bullmq';
 import { tryTransitionNodeRun, setNodeRunError } from '@dag/db';
 import { connection, publishRunEvent, isRunCancelled } from '@dag/queue';
 import type { JobPayload } from '@dag/contracts';
+import { withSpan, extractContext, SpanKind } from '@dag/otel';
 import { env } from './env';
 import { logger } from './logger';
 import { executors } from './executors';
@@ -41,9 +42,36 @@ const CONCURRENCY = {
 
 // ─── Job processor ────────────────────────────────────────────────────────────
 
-async function processJob(job: Job<JobPayload>): Promise<unknown> {
-  const { runId, nodeKey, nodeRunId, tenantId, type, config, input, attempt } = job.data;
+/**
+ * BullMQ entry point. Opens the execution span (roadmap C4) as a child of the
+ * dispatch span the API injected onto `job.data.otel`, then runs the job. The
+ * span records the exception + ERROR status on a throw (retry or terminal
+ * failure), OK otherwise.
+ */
+function processJob(job: Job<JobPayload>): Promise<unknown> {
+  const { runId, nodeKey, type, attempt } = job.data;
   const workerId = process.env['WORKER_ID'] ?? `worker-${process.pid}`;
+  return withSpan(
+    `execute ${nodeKey}`,
+    {
+      parent: extractContext(job.data.otel),
+      kind: SpanKind.CONSUMER,
+      attributes: {
+        'dag.run.id': runId,
+        'dag.node.key': nodeKey,
+        'dag.node.type': type,
+        'dag.worker.id': workerId,
+        'dag.attempt': attempt,
+        'messaging.system': 'bullmq',
+        'messaging.operation': 'process',
+      },
+    },
+    () => runJob(job, workerId),
+  );
+}
+
+async function runJob(job: Job<JobPayload>, workerId: string): Promise<unknown> {
+  const { runId, nodeKey, nodeRunId, tenantId, type, config, input, attempt } = job.data;
 
   logger.info({ runId, nodeKey, type, attempt }, 'Worker: processing job');
 

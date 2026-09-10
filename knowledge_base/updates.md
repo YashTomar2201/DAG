@@ -5,6 +5,83 @@ initial 14-phase build. Each entry: what changed, which files, and why.
 
 ---
 
+## 2026-09-10 — C4 step 4: OpenTelemetry distributed tracing
+
+**Phase:** roadmap C4 step 4 ("OpenTelemetry tracing with the run id as trace id
+— one trace spanning API dispatch → queue wait → worker execution → Python
+subprocess"). This was the last open C4 piece; the metrics half shipped
+2026-09-06.
+
+### The two ideas that make one trace work across three processes
+
+1. **The run id IS the trace id.** `runTraceId(runId) = sha256(runId)[:32]` — a
+   deterministic 16-byte id. Every span for a run is started under
+   `runContext(runId)` (a non-recording remote parent pinned to that id), so a
+   run's spans all land in one trace and you can jump straight to it from a run
+   id with no lookup table.
+2. **W3C context on the job.** `dispatchNode` injects `traceparent` into the
+   BullMQ job payload (`JobPayload.otel`); the worker's `processJob` extracts it
+   so its `execute <nodeKey>` span is a real child of the API's
+   `dispatch <nodeKey>` span. The worker then passes `TRACEPARENT` in the Python
+   child's env, and `otel_trace.py` continues the trace one level deeper.
+
+### What changed
+
+- **`packages/otel` (new)** — `@dag/otel`: `startTracing()` / `stopTracing()`
+  (NodeSDK + OTLP/HTTP exporter + http/express/pg/ioredis instrumentation),
+  `runTraceId` / `runContext`, `withSpan(name, {parent,kind,attributes}, fn)`
+  (records exception + ERROR on throw, always ends), `injectContext` /
+  `extractContext` / `traceparentEnv`. **Opt-in:** with no
+  `OTEL_EXPORTER_OTLP_ENDPOINT` the SDK never starts, `withSpan` just runs its
+  callback, and the carriers come back empty — base dev / compose / test
+  behaviour is byte-for-byte unchanged.
+- **`apps/api`** — `src/tracing.ts` imported on `index.ts`'s first line (patches
+  modules before they load); `stopTracing()` in the shutdown sequence;
+  `dispatchNode` wraps the enqueue in a `dispatch <nodeKey>` PRODUCER span under
+  `runContext(runId)` and puts `injectContext()` on the payload.
+- **`apps/worker`** — `src/tracing.ts` first import; `stopTracing()` in the
+  drain; `processJob` is now a thin wrapper that opens the `execute <nodeKey>`
+  CONSUMER span (parent = `extractContext(job.data.otel)`) around the renamed
+  `runJob`; `python-bridge.ts` wraps each subprocess in a `python <script>`
+  CLIENT span and adds `...traceparentEnv()` to the child's env.
+- **`packages/contracts` + `packages/queue`** — `JobPayload.otel?:
+  Record<string,string>`.
+- **Python** — `apps/worker/python/otel_trace.py`: a best-effort `traced(name)`
+  context manager (reads `TRACEPARENT` + endpoint from env, exports one span
+  over OTLP/HTTP; a plain no-op if either is unset or the libs are missing).
+  `preprocess.py` / `train.py` / `evaluate.py` wrap `main()` in it.
+  `requirements.txt` gains `opentelemetry-sdk` + `-exporter-otlp-proto-http`
+  (~1 MB pure-python, no native build). `fail.py` untouched.
+- **`infra/docker-compose.observability.yml`** — a `jaeger`
+  (`all-in-one:1.62.0`, UI :16686, OTLP :4318) service, and `OTEL_*` env merged
+  onto `api` + `worker` so the overlay is what turns tracing on — same opt-in
+  shape as the Prometheus/Grafana half and `docker-compose.s3.yml`.
+
+### Verification
+
+- `pnpm -r typecheck` + `pnpm -r lint` — clean (9 packages).
+- Unit: `@dag/otel` **7 new tests** (deterministic id, `runContext` pinning,
+  inject/extract no-op when off, `withSpan` passthrough + rethrow); contracts 20,
+  api 48/2-skip, queue 5-skip — all unchanged/green.
+- **Live against a real Jaeger** (`docker run … all-in-one:1.62.0`): a harness
+  that drives the real `@dag/otel` path — `startTracing` → dispatch span under
+  `runContext` → `injectContext` → `extractContext` → execute span → python span
+  → `stopTracing` flush — then queried `GET /api/traces/<sha256(runId)[:32]>`
+  and got back **one trace at exactly that id** with all three spans, `execute`
+  a child of `dispatch`, and a valid `TRACEPARENT` handed to the "python child".
+  So: SDK boot, OTLP export, run-id-as-trace-id, and cross-process chaining are
+  all confirmed end to end.
+- **Not** run: the full in-container ML pipeline with the Python SDK exporting
+  its own span — needs the api/worker image rebuild + the full stack + Jaeger,
+  more than the 3.5 GB Docker VM on this box comfortably holds. The Node path is
+  proven; the Python span is a documented best-effort that the image now carries
+  the libs for.
+
+`KNOWN_LIMITATIONS.md` §10 — the "distributed tracing still open" note is
+removed; C4 is now fully closed.
+
+---
+
 ## 2026-09-10 — D3 (batch 3): run comparison — two runs side by side in the Gantt view
 
 **Phase:** roadmap D3, final item ("Run comparison — two runs side by side in the

@@ -16,6 +16,8 @@ export interface JobPayload {
   attempt: number;
   /** Backoff ceiling (ms) from the node's `retryPolicy.cap` — read by the backoff strategy. */
   retryCap?: number;
+  /** W3C trace-context carrier injected at dispatch (roadmap C4). Absent when tracing is off. */
+  otel?: Record<string, string>;
 }
 
 // ─── Queue Definitions ────────────────────────────────────────────────────────

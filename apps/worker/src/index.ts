@@ -3,11 +3,13 @@
  * Boots the BullMQ workers and handles graceful shutdown.
  */
 
+import './tracing'; // must be first — patches pg/ioredis/http before they load
 import { logger } from './logger';
 import { createWorkers } from './worker';
 import { env } from './env';
 import { prisma } from '@dag/db';
 import { connection } from '@dag/queue';
+import { stopTracing } from '@dag/otel';
 import { startHealthServer, markWorkerShuttingDown } from './health-server';
 
 logger.info({ pid: process.pid, nodeEnv: env.NODE_ENV }, 'Worker process starting');
@@ -34,6 +36,7 @@ async function shutdown(signal: string) {
   // `worker.close()` stops new job polling; waits for active jobs to finish.
   await Promise.all(workers.map((w) => w.close()));
   healthServer?.close();
+  await stopTracing();
   await prisma.$disconnect();
   await connection.quit().catch(() => {});
 

@@ -37,6 +37,7 @@ import {
   popBlockedDispatch,
   listBlockedTenantIds,
 } from '@dag/queue';
+import { withSpan, runContext, injectContext, SpanKind } from '@dag/otel';
 import { logger } from '../logger';
 import { NotFoundError } from '../errors';
 import { cancelChildRunsOf } from './cancel.service';
@@ -359,24 +360,45 @@ export async function dispatchNode(
   const baseDelay = rp?.baseDelay ?? 2000;
   const cap = rp?.cap ?? 30_000;
 
-  const payload = {
-    runId,
-    nodeKey,
-    nodeRunId: nr.id,
-    tenantId,
-    type: node.type as NodeType,
-    config: node.config,
-    input: resolvedInput,
-    attempt: nr.attempt,
-    retryCap: cap,
-  };
+  // 3. Add to BullMQ, inside a span parented to the run's deterministic trace
+  //    (roadmap C4). `injectContext()` puts this span's `traceparent` on the
+  //    payload so the worker's execution span is a real child of it.
+  await withSpan(
+    `dispatch ${nodeKey}`,
+    {
+      parent: runContext(runId),
+      kind: SpanKind.PRODUCER,
+      attributes: {
+        'dag.run.id': runId,
+        'dag.node.key': nodeKey,
+        'dag.node.type': node.type,
+        'dag.tenant.id': tenantId,
+        'dag.attempt': nr.attempt,
+        'messaging.system': 'bullmq',
+        'messaging.destination.name': queue.name,
+      },
+    },
+    async () => {
+      const payload = {
+        runId,
+        nodeKey,
+        nodeRunId: nr.id,
+        tenantId,
+        type: node.type as NodeType,
+        config: node.config,
+        input: resolvedInput,
+        attempt: nr.attempt,
+        retryCap: cap,
+        otel: injectContext(),
+      };
 
-  // 3. Add to BullMQ
-  await queue.add(node.type, payload, {
-    jobId,
-    attempts,
-    backoff: { type: 'exponentialJitter', delay: baseDelay },
-  });
+      await queue.add(node.type, payload, {
+        jobId,
+        attempts,
+        backoff: { type: 'exponentialJitter', delay: baseDelay },
+      });
+    },
+  );
 
   logger.info({ runId, nodeKey, jobId, queue: queue.name, attempts, baseDelay, cap }, 'Dispatched node');
   emitAndLog(runId, tenantId, 'NODE_QUEUED', { jobId, attempts }, nodeKey);
